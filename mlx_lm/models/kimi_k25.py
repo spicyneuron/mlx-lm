@@ -38,6 +38,10 @@ class LanguageModel(nn.Module):
         out = self.model(inputs, cache)
         return self.lm_head(out)
 
+    @property
+    def layers(self):
+        return self.model.pipeline_layers
+
 
 class Model(nn.Module):
     def __init__(self, config: ModelArgs):

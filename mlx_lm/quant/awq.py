@@ -45,6 +45,7 @@ class AWQConfig:
     no_clip: list[str]
     scale_configs: list[ScaleConfig]
     lm_key: str | None = None
+    return_array_mask: bool = False
 
 
 def update(cfg, **kwargs):
@@ -148,6 +149,68 @@ deepseek_v2_awq = AWQConfig(
     ],
 )
 
+deepseek_v3_awq = AWQConfig(
+    embed="embed_tokens",
+    lm_head="lm_head",
+    no_clip=["q_proj", "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa"],
+    return_array_mask=True,
+    scale_configs=[
+        ScaleConfig(
+            block="self_attn",
+            prev="input_layernorm",
+            layers=["q_proj", "kv_a_proj_with_mqa"],
+            kwargs=["mask"],
+            use_config=lambda block: "q_proj" in block.self_attn,
+        ),
+        ScaleConfig(
+            block="self_attn",
+            prev="input_layernorm",
+            layers=["q_a_proj", "kv_a_proj_with_mqa"],
+            kwargs=["mask"],
+            use_config=lambda block: "q_a_proj" in block.self_attn,
+        ),
+        ScaleConfig(
+            prev="self_attn.q_a_layernorm",
+            layers=["self_attn.q_b_proj"],
+            use_config=lambda block: "q_b_proj" in block.self_attn,
+        ),
+        ScaleConfig(
+            prev="mlp.up_proj",
+            layers=["mlp.down_proj"],
+            use_config=lambda block: not "switch_mlp" in block.mlp,
+        ),
+        ScaleConfig(
+            prev="mlp.shared_experts.up_proj",
+            layers=["mlp.shared_experts.down_proj"],
+            use_config=lambda block: "switch_mlp" in block.mlp,
+        ),
+        ScaleConfig(
+            prev="mlp.switch_mlp.up_proj",
+            layers=["mlp.switch_mlp.down_proj"],
+            use_config=lambda block: "switch_mlp" in block.mlp,
+            kwargs=["indices"],
+        ),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=["gate_proj", "up_proj"],
+            use_config=lambda block: not "switch_mlp" in block.mlp,
+        ),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=[
+                "switch_mlp.gate_proj",
+                "switch_mlp.up_proj",
+                "shared_experts.gate_proj",
+                "shared_experts.up_proj",
+                "gate",  # not quantized, just scaled
+            ],
+            use_config=lambda block: "switch_mlp" in block.mlp,
+        ),
+    ],
+)
+
 AWQ_MODEL_CONFIGS = {
     "llama": llama_awq,
     "mistral": llama_awq,
@@ -156,6 +219,9 @@ AWQ_MODEL_CONFIGS = {
     "gemma3_text": gemma3_text_awq,
     "gemma3": update(gemma3_text_awq, lm_key="language_model"),
     "deepseek_v2": deepseek_v2_awq,
+    "deepseek_v3": deepseek_v3_awq,
+    "kimi_k2": deepseek_v3_awq,
+    "kimi_k25": update(deepseek_v3_awq, lm_key="language_model"),
 }
 
 
@@ -448,7 +514,7 @@ def awq_quantize(
         wq = mx.quantize(w, bits=bits, group_size=group_size)
         return mx.dequantize(*wq, bits=bits, group_size=group_size)
 
-    mask = create_attention_mask(inputs)
+    mask = create_attention_mask(inputs, return_array=awq_config.return_array_mask)
 
     embed_key = awq_config.embed
     model.model[embed_key] = model.model[embed_key].to_quantized(
@@ -591,7 +657,7 @@ def awq_quantize_streaming(
         wq = mx.quantize(w, bits=bits, group_size=group_size)
         return mx.dequantize(*wq, bits=bits, group_size=group_size)
 
-    mask = create_attention_mask(inputs)
+    mask = create_attention_mask(inputs, return_array=awq_config.return_array_mask)
 
     embed_key = awq_config.embed
     work_model.model[embed_key] = work_model.model[embed_key].to_quantized(

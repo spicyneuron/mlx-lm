@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from mlx_lm.models import llama
+from mlx_lm.models import kimi_k25, llama
 from mlx_lm.quant.awq import (
     AWQ_MODEL_CONFIGS,
     awq_quantize,
@@ -33,6 +33,37 @@ def tiny_llama(tie_word_embeddings=False):
         tie_word_embeddings=tie_word_embeddings,
     )
     model = llama.Model(args)
+    mx.eval(model.parameters())
+    return model, args
+
+
+def tiny_kimi_k25():
+    cfg = {
+        "model_type": "kimi_k25",
+        "text_config": {
+            "model_type": "kimi_k2",
+            "vocab_size": 256,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "moe_intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "n_shared_experts": 1,
+            "n_routed_experts": 4,
+            "num_experts_per_tok": 2,
+            "first_k_dense_replace": 1,
+            "moe_layer_freq": 1,
+            "kv_lora_rank": 32,
+            "q_lora_rank": 32,
+            "qk_rope_head_dim": 32,
+            "qk_nope_head_dim": 32,
+            "v_head_dim": 32,
+            "max_position_embeddings": 128,
+        },
+    }
+    args = kimi_k25.ModelArgs.from_dict(cfg)
+    model = kimi_k25.Model(args)
     mx.eval(model.parameters())
     return model, args
 
@@ -698,6 +729,70 @@ class TestAWQStreaming(unittest.TestCase):
                 config=model_config(model),
                 max_file_size_gb=0.0,
             )
+
+    def test_kimi_k25_awq_quantizes_lm_head(self):
+        """Kimi K2.5 AWQ target should quantize embed and lm_head."""
+        model, _ = tiny_kimi_k25()
+        data = make_calibration_data(256, num_samples=2, seq_len=16)
+        awq_config = AWQ_MODEL_CONFIGS["kimi_k25"]
+
+        self.assertEqual(awq_config.lm_key, "language_model")
+        self.assertTrue(awq_config.return_array_mask)
+
+        awq_quantize(
+            model,
+            data,
+            awq_config,
+            bits=4,
+            group_size=32,
+            embed_bits=4,
+            embed_group_size=32,
+            n_grid=2,
+        )
+
+        self.assertTrue(hasattr(model.language_model.model.embed_tokens, "bits"))
+        self.assertTrue(hasattr(model.language_model.lm_head, "bits"))
+
+    def test_kimi_k25_streaming_quantizes_lm_head(self):
+        """Kimi K2.5 streaming AWQ should write quantized embed and lm_head."""
+        model, _ = tiny_kimi_k25()
+        data = make_calibration_data(256, num_samples=2, seq_len=16)
+        awq_config = AWQ_MODEL_CONFIGS["kimi_k25"]
+        output_path = self.test_dir / "kimi_k25_streaming"
+        output_path.mkdir(exist_ok=True)
+
+        from mlx_lm.quant.awq import awq_quantize_streaming
+
+        config = {
+            "model_type": "kimi_k25",
+            "vocab_size": 256,
+            "text_config": {"model_type": "kimi_k2"},
+        }
+        awq_quantize_streaming(
+            model,
+            data,
+            awq_config,
+            output_path=output_path,
+            config=config,
+            bits=4,
+            group_size=32,
+            embed_bits=4,
+            embed_group_size=32,
+            n_grid=2,
+        )
+
+        weights = {}
+        for f in sorted(output_path.glob("*.safetensors")):
+            weights.update(mx.load(str(f)))
+
+        self.assertTrue(
+            any(k.startswith("language_model.model.embed_tokens.") for k in weights),
+            "Streaming output missing quantized embed weights",
+        )
+        self.assertTrue(
+            any(k.startswith("language_model.lm_head.") for k in weights),
+            "Streaming output missing quantized lm_head weights",
+        )
 
 
 if __name__ == "__main__":
