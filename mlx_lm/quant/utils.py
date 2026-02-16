@@ -15,7 +15,7 @@ def load_data(tokenizer, num_samples: int, sequence_length: int) -> mx.array:
         request.urlretrieve(url, save_dir)
     with open(save_dir) as fid:
         texts = fid.read()
-    tokens = tokenizer.encode(texts, return_tensors="mlx")[0]
+    tokens = mx.array(tokenizer.encode(texts))
 
     # select random non-overlapping chunks
     tokens = tokens[: (tokens.size // sequence_length) * sequence_length]
