@@ -229,6 +229,27 @@ def mse(x, y):
     return ((x - y).astype(mx.float32)) ** 2
 
 
+def _loss_value(loss):
+    if hasattr(loss, "item"):
+        return float(loss.item())
+    return float(loss)
+
+
+def _log_awq_block_loss(
+    block_idx: int,
+    before_loss: float,
+    after_loss: float,
+    fallback: bool,
+):
+    ratio = after_loss / before_loss if before_loss != 0.0 else float("inf")
+    tqdm.write(
+        "awq block="
+        f"{block_idx} naive_quant_loss={before_loss:.6e}"
+        f" after_awq_loss={after_loss:.6e} ratio={ratio:.6e}"
+        f" fallback={int(fallback)}"
+    )
+
+
 def submodule_from_key(module, key):
     keys = key.split(".")
     for k in keys:
@@ -565,13 +586,20 @@ def awq_quantize(
         if group is not None:
             after_loss = mx.distributed.all_sum(after_loss) / group.size()
         after_loss /= outputs.size
-        tqdm.write(f"Loss reduction: {after_loss / before_loss}")
-        if after_loss > before_loss:
+        before_loss_value = _loss_value(before_loss)
+        after_loss_value = _loss_value(after_loss)
+        fallback = after_loss_value > before_loss_value
+        if fallback:
             # Reload original weights and quantize
             block.update_modules(orig_leaves)
             block.update(orig_params)
             nn.quantize(block, group_size=group_size, bits=bits)
-            tqdm.write("Loss is not reduced, falling back to original weights.")
+        _log_awq_block_loss(
+            block_idx=e,
+            before_loss=before_loss_value,
+            after_loss=after_loss_value,
+            fallback=fallback,
+        )
 
         inputs = outputs
 
@@ -731,13 +759,20 @@ def awq_quantize_streaming(
         if group is not None:
             after_loss = mx.distributed.all_sum(after_loss) / group.size()
         after_loss /= outputs.size
-        tqdm.write(f"Loss reduction: {after_loss / before_loss}")
-        if after_loss > before_loss:
+        before_loss_value = _loss_value(before_loss)
+        after_loss_value = _loss_value(after_loss)
+        fallback = after_loss_value > before_loss_value
+        if fallback:
             # Reload original weights and quantize
             block.update_modules(orig_leaves)
             block.update(orig_params)
             nn.quantize(block, group_size=group_size, bits=bits)
-            tqdm.write("Loss is not reduced, falling back to original weights.")
+        _log_awq_block_loss(
+            block_idx=e,
+            before_loss=before_loss_value,
+            after_loss=after_loss_value,
+            fallback=fallback,
+        )
         del outputs_q
 
         inputs = outputs
