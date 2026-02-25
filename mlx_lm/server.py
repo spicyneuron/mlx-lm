@@ -29,6 +29,7 @@ from typing import (
     Tuple,
     Union,
 )
+from urllib.parse import urlsplit
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
@@ -1172,15 +1173,28 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
 
+    def _request_path(self) -> str:
+        return urlsplit(self.path).path
+
     def _set_completion_headers(self, status_code: int = 200):
         self.send_response(status_code)
         self.send_header("Content-type", "application/json")
+        if self._request_path() == "/v1/messages":
+            self.send_header("anthropic-version", "2023-06-01")
+        request_id = getattr(self, "request_id", None)
+        if request_id:
+            self.send_header("request-id", request_id)
         self._set_cors_headers()
 
     def _set_stream_headers(self, status_code: int = 200):
         self.send_response(status_code)
         self.send_header("Content-type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        if self._request_path() == "/v1/messages":
+            self.send_header("anthropic-version", "2023-06-01")
+        request_id = getattr(self, "request_id", None)
+        if request_id:
+            self.send_header("request-id", request_id)
         self._set_cors_headers()
 
     def do_OPTIONS(self):
@@ -1191,6 +1205,7 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
+        request_path = self._request_path()
         request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
@@ -1198,7 +1213,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/messages": self.handle_anthropic_messages,
         }
 
-        if self.path not in request_factories:
+        if request_path not in request_factories:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
@@ -1258,7 +1273,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Get stop sequences
         stop_words = (
             self.body.get("stop_sequences")
-            if self.path == "/v1/messages"
+            if request_path == "/v1/messages"
             else self.body.get("stop")
         )
         stop_words = stop_words or []
@@ -1266,13 +1281,13 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Create the completion request
         try:
-            request = request_factories[self.path]()
+            request = request_factories[request_path]()
         except Exception as e:
             self._set_completion_headers(400)
             self.end_headers()
             self.wfile.write(json.dumps({"error": f"{e}"}).encode())
             return
-        if self.path == "/v1/messages":
+        if request_path == "/v1/messages":
             if self.stream:
                 self.handle_anthropic_streaming_completion(request, stop_words)
                 return
@@ -1515,6 +1530,8 @@ class APIHandler(BaseHTTPRequestHandler):
             "stop_sequence": stop_sequence,
             "usage": {
                 "input_tokens": prompt_token_count,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
                 "output_tokens": completion_token_count,
             },
         }
@@ -1547,6 +1564,17 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.stream:
             # SSE comments are invisible to clients but keep connections alive.
             self._write_sse_keepalive(f"keepalive {processed_tokens}/{total_tokens}")
+
+    def _write_anthropic_ping(self):
+        try:
+            self._write_sse_event("ping", {"type": "ping"})
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _anthropic_keepalive_callback(self, processed_tokens, total_tokens):
+        logging.info(f"Prompt processing progress: {processed_tokens}/{total_tokens}")
+        if self.stream:
+            self._write_anthropic_ping()
 
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
@@ -1697,6 +1725,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         for sequence in ctx.stop_token_sequences
                     )
                 ):
+                    self._write_sse_keepalive("keepalive buffering")
                     continue
                 elif segment or tool_calls or reasoning_text:
                     response = self.generate_response(
@@ -1710,6 +1739,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning_text = ""
                     segment = ""
                     tool_calls = []
+                else:
+                    self._write_sse_keepalive("keepalive hidden")
+            elif self.stream and in_tool_call:
+                self._write_sse_keepalive("keepalive hidden")
 
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
@@ -1829,7 +1862,7 @@ class APIHandler(BaseHTTPRequestHandler):
             ctx, response = self.response_generator.generate(
                 request,
                 args,
-                progress_callback=self._keepalive_callback,
+                progress_callback=self._anthropic_keepalive_callback,
             )
         except Exception as e:
             self._set_completion_headers(404)
@@ -1854,6 +1887,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     "stop_sequence": None,
                     "usage": {
                         "input_tokens": len(ctx.prompt),
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
                         "output_tokens": 0,
                     },
                 },
@@ -1916,7 +1951,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 for sequence in ctx.stop_token_sequences
             ):
                 if not visible and not segment:
-                    self._write_sse_keepalive("keepalive hidden")
+                    self._write_anthropic_ping()
                 continue
 
             if segment:
@@ -1930,7 +1965,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 segment = ""
             elif not visible:
-                self._write_sse_keepalive("keepalive hidden")
+                self._write_anthropic_ping()
 
         if segment:
             self._write_sse_event(
@@ -2015,7 +2050,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if body.get("tools") is not None:
             raise ValueError("tools is not implemented yet for /v1/messages")
 
-        self.request_id = f"msg_{uuid.uuid4()}"
+        self.request_id = f"msg_{uuid.uuid4().hex}"
         self.object_type = "message"
 
         return CompletionRequest(
@@ -2049,9 +2084,10 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        request_path = self._request_path()
+        if request_path.startswith("/v1/models"):
             self.handle_models_request()
-        elif self.path == "/health":
+        elif request_path == "/health":
             self.handle_health_check()
         else:
             self._set_completion_headers(404)
@@ -2077,7 +2113,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
-        parts = self.path.split("/")
+        parts = self._request_path().split("/")
         filter_repo_id = None
         if len(parts) > 3:
             filter_repo_id = "/".join(parts[3:])

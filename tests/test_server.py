@@ -142,6 +142,19 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_handle_chat_completions_with_query_string(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions?api-version=2026-02-25"
+        chat_post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hello!"}],
+        }
+        response = requests.post(url, json=chat_post_data)
+        self.assertEqual(response.status_code, 200)
+        response_body = response.text
+        self.assertIn("id", response_body)
+        self.assertIn("choices", response_body)
+
     def test_handle_chat_completions_with_content_fragments(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {
@@ -222,6 +235,22 @@ class TestServer(unittest.TestCase):
         self.assertIn("usage", response_body)
         self.assertIn("input_tokens", response_body["usage"])
         self.assertIn("output_tokens", response_body["usage"])
+
+    def test_handle_anthropic_messages_with_query_string(self):
+        url = (
+            f"http://localhost:{self.port}/v1/messages"
+            "?beta=true&anthropic-version=2023-06-01"
+        )
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hello!"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        self.assertEqual(response_body["type"], "message")
+        self.assertEqual(response_body["role"], "assistant")
 
     def test_handle_anthropic_messages_with_blocks_and_system(self):
         url = f"http://localhost:{self.port}/v1/messages"
@@ -475,6 +504,74 @@ class TestServer(unittest.TestCase):
                 )
                 yield SimpleNamespace(
                     text="Hello",
+                    token=4,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+                stream=True,
+            )
+            self.assertEqual(response.status_code, 200)
+            lines = [line.decode("utf-8") for line in response.iter_lines() if line]
+
+        self.assertIn("event: ping", lines)
+        self.assertIn('data: {"type": "ping"}', lines)
+
+    def test_handle_chat_completions_streaming_hidden_keepalive(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            ctx = SimpleNamespace(
+                has_tool_calling=True,
+                tool_call_start="<tool_call>",
+                tool_call_end="</tool_call>",
+                tool_parser=lambda tool_text, tools: {"name": "x", "arguments": {}},
+                has_thinking=False,
+                think_start_id=-1,
+                think_end="",
+                think_end_id=-1,
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[1, 2, 3],
+                stop=lambda: None,
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="<tool_call>",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text='{"name":"x"}',
+                    token=2,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="</tool_call>",
+                    token=3,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="Done",
                     token=4,
                     logprob=0.0,
                     finish_reason="stop",
