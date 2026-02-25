@@ -227,7 +227,7 @@ def _anthropic_tool_use_to_openai_tool_call(block: Dict[str, Any]) -> Dict[str, 
     if tool_use_id is not None and not isinstance(tool_use_id, str):
         raise ValueError("tool_use block `id` must be a string.")
     return {
-        "id": tool_use_id or str(uuid.uuid4()),
+        "id": tool_use_id or f"toolu_{uuid.uuid4().hex}",
         "type": "function",
         "function": {
             "name": name,
@@ -1724,7 +1724,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise ValueError("Parsed tool call `id` must be a string.")
             out.append(
                 {
-                    "id": call_id or str(uuid.uuid4()),
+                    "id": call_id or f"toolu_{uuid.uuid4().hex}",
                     "name": name,
                     "input": arguments,
                 }
@@ -2240,6 +2240,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if tool_uses:
             finish_reason = "tool_calls"
         for tool_use in tool_uses:
+            partial_json = json.dumps(tool_use["input"], ensure_ascii=False)
             self._write_sse_event(
                 "content_block_start",
                 {
@@ -2249,7 +2250,18 @@ class APIHandler(BaseHTTPRequestHandler):
                         "type": "tool_use",
                         "id": tool_use["id"],
                         "name": tool_use["name"],
-                        "input": tool_use["input"],
+                        "input": {},
+                    },
+                },
+            )
+            self._write_sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": partial_json,
                     },
                 },
             )

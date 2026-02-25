@@ -405,6 +405,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual(body["stop_reason"], "tool_use")
         self.assertEqual(body["content"][0]["type"], "tool_use")
         self.assertEqual(body["content"][0]["name"], "get_weather")
+        self.assertTrue(body["content"][0]["id"].startswith("toolu_"))
         self.assertEqual(body["content"][0]["input"], {"location": "sf"})
 
     def test_handle_anthropic_messages_streaming(self):
@@ -546,7 +547,18 @@ class TestServer(unittest.TestCase):
         ]
         self.assertEqual(len(tool_starts), 1)
         self.assertEqual(tool_starts[0]["content_block"]["name"], "get_weather")
-        self.assertEqual(tool_starts[0]["content_block"]["input"], {"location": "sf"})
+        self.assertTrue(tool_starts[0]["content_block"]["id"].startswith("toolu_"))
+        self.assertEqual(tool_starts[0]["content_block"]["input"], {})
+        tool_deltas = [
+            payload
+            for event, payload in events
+            if event == "content_block_delta"
+            and payload["delta"]["type"] == "input_json_delta"
+        ]
+        self.assertEqual(len(tool_deltas), 1)
+        self.assertEqual(
+            json.loads(tool_deltas[0]["delta"]["partial_json"]), {"location": "sf"}
+        )
         message_delta = [payload for event, payload in events if event == "message_delta"][
             -1
         ]
