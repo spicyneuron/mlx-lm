@@ -232,6 +232,41 @@ def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
+@dataclass
+class AnthropicTextState:
+    in_reasoning: bool
+    in_tool_call: bool = False
+
+
+def _make_anthropic_text_state(ctx: Any) -> AnthropicTextState:
+    in_reasoning = False
+    if ctx.has_thinking:
+        for i in range(len(ctx.prompt) - 1, -1, -1):
+            if ctx.prompt[i] == ctx.think_end_id:
+                break
+            elif ctx.prompt[i] == ctx.think_start_id:
+                in_reasoning = True
+                break
+    return AnthropicTextState(in_reasoning=in_reasoning)
+
+
+def _extract_anthropic_visible_text(
+    segment: str, ctx: Any, state: AnthropicTextState
+) -> str:
+    if state.in_reasoning:
+        if segment == ctx.think_end:
+            state.in_reasoning = False
+        return ""
+    if ctx.has_tool_calling and segment == ctx.tool_call_start:
+        state.in_tool_call = True
+        return ""
+    if state.in_tool_call:
+        if segment == ctx.tool_call_end:
+            state.in_tool_call = False
+        return ""
+    return segment
+
+
 class LRUPromptCache:
 
     @dataclass
@@ -1229,13 +1264,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/messages":
             if self.stream:
-                self._set_completion_headers(400)
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps(
-                        {"error": "Streaming for /v1/messages is not implemented yet."}
-                    ).encode()
-                )
+                self.handle_anthropic_streaming_completion(request, stop_words)
                 return
             self.handle_anthropic_completion(request, stop_words)
         else:
@@ -1491,6 +1520,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 return stop_word
         return None
 
+    def _write_sse_event(self, event: str, data: Dict[str, Any]):
+        self.wfile.write(f"event: {event}\n".encode())
+        self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
+        self.wfile.flush()
+
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
@@ -1738,9 +1772,10 @@ class APIHandler(BaseHTTPRequestHandler):
         text = ""
         finish_reason = "length"
         stop_sequence = None
+        state = _make_anthropic_text_state(ctx)
 
         for gen in response:
-            text += gen.text
+            text += _extract_anthropic_visible_text(gen.text, ctx, state)
             tokens.append(gen.token)
 
             stop_condition = stopping_criteria(
@@ -1757,7 +1792,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ctx.stop()
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                text = text[: len(text) - stop_condition.trim_text_length]
+                if stop_condition.trim_text_length > 0:
+                    text = text[: max(0, len(text) - stop_condition.trim_text_length)]
                 break
 
             if gen.finish_reason is not None:
@@ -1775,6 +1811,139 @@ class APIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(response_json)
         self.wfile.flush()
+
+    def handle_anthropic_streaming_completion(
+        self, request: CompletionRequest, stop_words: List[str]
+    ):
+        args = self._make_generation_args(stop_words)
+
+        try:
+            ctx, response = self.response_generator.generate(request, args)
+        except Exception as e:
+            self._set_completion_headers(404)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+            return
+
+        self._set_stream_headers(200)
+        self.end_headers()
+
+        self._write_sse_event(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": self.request_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.requested_model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": len(ctx.prompt),
+                        "output_tokens": 0,
+                    },
+                },
+            },
+        )
+        self._write_sse_event(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+
+        tokens = []
+        segment = ""
+        finish_reason = "length"
+        stop_sequence = None
+        state = _make_anthropic_text_state(ctx)
+
+        for gen in response:
+            tokens.append(gen.token)
+            segment += _extract_anthropic_visible_text(gen.text, ctx, state)
+
+            if gen.finish_reason is not None:
+                finish_reason = gen.finish_reason
+
+            stop_condition = stopping_criteria(
+                tokens,
+                ctx.eos_token_ids,
+                ctx.stop_token_sequences,
+                stop_words,
+            )
+            if stop_condition.stop_met:
+                finish_reason = "stop"
+                if stop_condition.trim_length > 0:
+                    stop_sequence = self._matched_stop_sequence(
+                        tokens, ctx.stop_token_sequences, stop_words
+                    )
+                    tokens = tokens[: len(tokens) - stop_condition.trim_length]
+                if stop_condition.trim_text_length > 0:
+                    segment = segment[
+                        : max(0, len(segment) - stop_condition.trim_text_length)
+                    ]
+                ctx.stop()
+                if segment:
+                    self._write_sse_event(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": segment},
+                        },
+                    )
+                    segment = ""
+                break
+
+            if any(
+                sequence_overlap(tokens, sequence)
+                for sequence in ctx.stop_token_sequences
+            ):
+                continue
+
+            if segment:
+                self._write_sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": segment},
+                    },
+                )
+                segment = ""
+
+        if segment:
+            self._write_sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": segment},
+                },
+            )
+
+        self._write_sse_event(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": 0},
+        )
+        self._write_sse_event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": self._anthropic_stop_reason(
+                        finish_reason, stop_sequence
+                    ),
+                    "stop_sequence": stop_sequence,
+                },
+                "usage": {"output_tokens": len(tokens)},
+            },
+        )
+        self._write_sse_event("message_stop", {"type": "message_stop"})
 
     def completion_usage_response(
         self,

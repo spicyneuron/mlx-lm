@@ -242,7 +242,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual(response_body["role"], "assistant")
         self.assertEqual(response_body["content"][0]["type"], "text")
 
-    def test_handle_anthropic_messages_rejects_streaming_for_now(self):
+    def test_handle_anthropic_messages_streaming(self):
         url = f"http://localhost:{self.port}/v1/messages"
         post_data = {
             "model": "chat_model",
@@ -250,10 +250,50 @@ class TestServer(unittest.TestCase):
             "stream": True,
             "messages": [{"role": "user", "content": "Hello!"}],
         }
-        response = requests.post(url, json=post_data)
-        self.assertEqual(response.status_code, 400)
-        response_body = json.loads(response.text)
-        self.assertIn("error", response_body)
+        response = requests.post(url, json=post_data, stream=True)
+        self.assertEqual(response.status_code, 200)
+
+        events = []
+        current_event = None
+        for line in response.iter_lines():
+            if not line:
+                continue
+            line = line.decode("utf-8")
+            if line.startswith(":"):
+                continue
+            if line.startswith("event: "):
+                current_event = line[len("event: ") :]
+                continue
+            if line.startswith("data: "):
+                payload = json.loads(line[len("data: ") :])
+                events.append((current_event, payload))
+
+        event_names = [event for event, _ in events]
+        self.assertEqual(event_names[0], "message_start")
+        self.assertEqual(event_names[1], "content_block_start")
+        self.assertIn("content_block_stop", event_names)
+        self.assertEqual(event_names[-2], "message_delta")
+        self.assertEqual(event_names[-1], "message_stop")
+        self.assertLess(
+            event_names.index("content_block_stop"),
+            event_names.index("message_delta"),
+        )
+
+        message_start = events[0][1]
+        self.assertEqual(message_start["type"], "message_start")
+        self.assertEqual(message_start["message"]["type"], "message")
+        self.assertEqual(message_start["message"]["role"], "assistant")
+        self.assertEqual(message_start["message"]["usage"]["output_tokens"], 0)
+
+        message_delta = events[-2][1]
+        self.assertEqual(message_delta["type"], "message_delta")
+        self.assertIn(
+            message_delta["delta"]["stop_reason"],
+            {"end_turn", "max_tokens", "stop_sequence"},
+        )
+        self.assertIn("stop_sequence", message_delta["delta"])
+        self.assertIn("output_tokens", message_delta["usage"])
+        self.assertGreaterEqual(message_delta["usage"]["output_tokens"], 0)
 
     def test_handle_anthropic_messages_rejects_non_text_content(self):
         url = f"http://localhost:{self.port}/v1/messages"
@@ -304,6 +344,39 @@ class TestServer(unittest.TestCase):
         self.assertFalse(sequence_overlap([1], [2]))
         self.assertFalse(sequence_overlap([1, 2], [3, 4]))
         self.assertFalse(sequence_overlap([1, 2, 3], [4, 1, 2, 3]))
+
+    def test_anthropic_text_filtering_state_machine(self):
+        from types import SimpleNamespace
+
+        from mlx_lm.server import (
+            _extract_anthropic_visible_text,
+            _make_anthropic_text_state,
+        )
+
+        ctx = SimpleNamespace(
+            has_thinking=True,
+            think_start_id=11,
+            think_end_id=12,
+            think_end="</think>",
+            has_tool_calling=True,
+            tool_call_start="<tool_call>",
+            tool_call_end="</tool_call>",
+            prompt=[11],
+        )
+        state = _make_anthropic_text_state(ctx)
+        pieces = [
+            "internal reasoning",
+            "</think>",
+            "Hello",
+            "<tool_call>",
+            '{"name":"x"}',
+            "</tool_call>",
+            " world",
+        ]
+        filtered = [
+            _extract_anthropic_visible_text(piece, ctx, state) for piece in pieces
+        ]
+        self.assertEqual("".join(filtered), "Hello world")
 
 
 class TestServerWithDraftModel(unittest.TestCase):
