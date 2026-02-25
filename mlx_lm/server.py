@@ -1378,6 +1378,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
+        # Keep request defaults aligned across OpenAI and Anthropic endpoints.
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
@@ -1670,8 +1671,8 @@ class APIHandler(BaseHTTPRequestHandler):
             },
         }
 
+    @staticmethod
     def _matched_stop_sequence(
-        self,
         tokens: List[int],
         stop_id_sequences: List[List[int]],
         stop_words: List[str],
@@ -1681,7 +1682,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 return stop_word
         return None
 
-    def _parse_generated_tool_uses(
+    def _parse_tool_call_payloads(
         self, tool_calls: List[str], ctx: Any, tools: Optional[List[Any]]
     ) -> List[Dict[str, Any]]:
         if not tool_calls:
@@ -1714,24 +1715,23 @@ class APIHandler(BaseHTTPRequestHandler):
             call_id = parsed.get("id")
             if call_id is not None and not isinstance(call_id, str):
                 raise ValueError("Parsed tool call `id` must be a string.")
+            out.append({"id": call_id, "name": name, "arguments": arguments})
+        return out
+
+    def _parse_generated_tool_uses(
+        self, tool_calls: List[str], ctx: Any, tools: Optional[List[Any]]
+    ) -> List[Dict[str, Any]]:
+        out = []
+        for parsed_call in self._parse_tool_call_payloads(tool_calls, ctx, tools):
             out.append(
                 {
-                    "id": call_id or f"toolu_{uuid.uuid4().hex}",
-                    "name": name,
-                    "input": arguments,
+                    "type": "tool_use",
+                    "id": parsed_call["id"] or f"toolu_{uuid.uuid4().hex}",
+                    "name": parsed_call["name"],
+                    "input": parsed_call["arguments"],
                 }
             )
         return out
-
-    def _anthropic_tool_use_content_block(
-        self, tool_use: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        return {
-            "type": "tool_use",
-            "id": tool_use["id"],
-            "name": tool_use["name"],
-            "input": tool_use["input"],
-        }
 
     def _write_sse_event(self, event: str, data: Dict[str, Any]):
         self.wfile.write(f"event: {event}\n".encode())
@@ -1956,12 +1956,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
         def format_tool_call(tool_call):
             nonlocal tool_idx
-            tool_call_id = tool_call.pop("id", None) or str(uuid.uuid4())
-            tool_call["arguments"] = json.dumps(
-                tool_call["arguments"], ensure_ascii=False
-            )
+            tool_call_id = tool_call["id"] or str(uuid.uuid4())
             out = {
-                "function": tool_call,
+                "function": {
+                    "name": tool_call["name"],
+                    "arguments": json.dumps(
+                        tool_call["arguments"], ensure_ascii=False
+                    ),
+                },
                 "type": "function",
                 "id": tool_call_id,
             }
@@ -1971,16 +1973,8 @@ class APIHandler(BaseHTTPRequestHandler):
             return out
 
         def parse_tools(tool_calls):
-            if not tool_calls:
-                return []
-            result = []
-            for tool_text in tool_calls:
-                parsed = ctx.tool_parser(tool_text, request.tools)
-                if isinstance(parsed, list):
-                    result.extend(format_tool_call(tc) for tc in parsed)
-                else:
-                    result.append(format_tool_call(parsed))
-            return result
+            parsed = self._parse_tool_call_payloads(tool_calls, ctx, request.tools)
+            return [format_tool_call(tool_call) for tool_call in parsed]
 
         # Start out in reasoning if the model is a reasoning model and the
         # prompt has an open think token but no closing think token
@@ -2156,7 +2150,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 content_blocks.append({"type": "text", "text": text_segment})
 
         def append_tool_use(tool_use: Dict[str, Any]):
-            content_blocks.append(self._anthropic_tool_use_content_block(tool_use))
+            content_blocks.append(tool_use)
 
         try:
             result = self._run_anthropic_generation_loop(

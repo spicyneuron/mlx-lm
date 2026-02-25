@@ -320,6 +320,7 @@ class TestServer(unittest.TestCase):
         }
         response = requests.post(url, json=post_data)
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("anthropic-version"), "2023-06-01")
 
         response_body = json.loads(response.text)
         self.assertTrue(response_body["id"].startswith("msg_"))
@@ -440,6 +441,117 @@ class TestServer(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["stop_words"], ["take-this-stop"])
 
+    def test_handle_anthropic_messages_stop_sequences_stops_generation(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            ctx = SimpleNamespace(
+                has_thinking=False,
+                think_start_id=-1,
+                think_end_id=-1,
+                think_end="",
+                has_tool_calling=False,
+                tool_call_start="",
+                tool_call_end="",
+                eos_token_ids=set(),
+                stop_token_sequences=[[2]],
+                prompt=[1, 2, 3],
+                stop=lambda: None,
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="Hello ",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="STOP",
+                    token=2,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="ignored",
+                    token=3,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                    "stop_sequences": ["STOP"],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.text)
+        text_blocks = [
+            block["text"] for block in body["content"] if block.get("type") == "text"
+        ]
+        self.assertEqual(body["stop_reason"], "stop_sequence")
+        self.assertEqual(body["stop_sequence"], "STOP")
+        self.assertEqual("".join(text_blocks), "Hello ")
+
+    def test_handle_anthropic_messages_defaults_model_and_max_tokens(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        captured = {"model": None, "max_tokens": None}
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            captured["model"] = generation_args.model.model
+            captured["max_tokens"] = generation_args.max_tokens
+            ctx = SimpleNamespace(
+                has_thinking=False,
+                think_start_id=-1,
+                think_end_id=-1,
+                think_end="",
+                has_tool_calling=False,
+                tool_call_start="",
+                tool_call_end="",
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[1, 2, 3],
+                stop=lambda: None,
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="Hello",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.text)
+        self.assertEqual(body["model"], "default_model")
+        self.assertEqual(captured["model"], "default_model")
+        self.assertEqual(
+            captured["max_tokens"], self.response_generator.cli_args.max_tokens
+        )
+
     def test_handle_anthropic_messages_non_stream_generate_error_uses_anthropic_schema(
         self,
     ):
@@ -549,6 +661,66 @@ class TestServer(unittest.TestCase):
 
         self.assertEqual(converted[0], {"role": "system", "content": "You are concise."})
         self.assertEqual(converted[1], {"role": "user", "content": "Hello"})
+
+    def test_convert_anthropic_messages_merges_adjacent_user_messages(self):
+        from mlx_lm.server import convert_anthropic_messages
+
+        converted = convert_anthropic_messages(
+            {
+                "messages": [
+                    {"role": "user", "content": "Hello "},
+                    {"role": "user", "content": "there"},
+                    {"role": "assistant", "content": "General Kenobi"},
+                ]
+            }
+        )
+
+        self.assertEqual(
+            converted,
+            [
+                {"role": "user", "content": "Hello there"},
+                {"role": "assistant", "content": "General Kenobi"},
+            ],
+        )
+
+    def test_convert_anthropic_messages_interleaved_tool_result_and_text(self):
+        from mlx_lm.server import convert_anthropic_messages
+
+        converted = convert_anthropic_messages(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Before "},
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "Result1",
+                            },
+                            {"type": "text", "text": "After1 "},
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_2",
+                                "content": [{"type": "text", "text": "Result2"}],
+                            },
+                            {"type": "text", "text": "After2"},
+                        ],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(
+            converted,
+            [
+                {"role": "user", "content": "Before "},
+                {"role": "tool", "tool_call_id": "toolu_1", "content": "Result1"},
+                {"role": "user", "content": "After1 "},
+                {"role": "tool", "tool_call_id": "toolu_2", "content": "Result2"},
+                {"role": "user", "content": "After2"},
+            ],
+        )
 
     def test_convert_anthropic_messages_multi_turn_text(self):
         from mlx_lm.server import convert_anthropic_messages
@@ -712,31 +884,19 @@ class TestServer(unittest.TestCase):
         }
         response = requests.post(url, json=post_data, stream=True)
         self.assertEqual(response.status_code, 200)
-
-        events = []
-        current_event = None
-        for line in response.iter_lines():
-            if not line:
-                continue
-            line = line.decode("utf-8")
-            if line.startswith(":"):
-                continue
-            if line.startswith("event: "):
-                current_event = line[len("event: ") :]
-                continue
-            if line.startswith("data: "):
-                payload = json.loads(line[len("data: ") :])
-                events.append((current_event, payload))
+        self.assertEqual(response.headers.get("anthropic-version"), "2023-06-01")
+        events = self._collect_sse_events(response)
 
         event_names = [event for event, _ in events]
-        self.assertEqual(event_names[0], "message_start")
-        self.assertEqual(event_names[1], "content_block_start")
-        self.assertIn("content_block_stop", event_names)
-        self.assertEqual(event_names[-2], "message_delta")
-        self.assertEqual(event_names[-1], "message_stop")
+        visible_event_names = [event for event in event_names if event != "ping"]
+        self.assertEqual(visible_event_names[0], "message_start")
+        self.assertEqual(visible_event_names[1], "content_block_start")
+        self.assertIn("content_block_stop", visible_event_names)
+        self.assertEqual(visible_event_names[-2], "message_delta")
+        self.assertEqual(visible_event_names[-1], "message_stop")
         self.assertLess(
-            event_names.index("content_block_stop"),
-            event_names.index("message_delta"),
+            visible_event_names.index("content_block_stop"),
+            visible_event_names.index("message_delta"),
         )
 
         message_start = events[0][1]
@@ -820,18 +980,7 @@ class TestServer(unittest.TestCase):
                 stream=True,
             )
             self.assertEqual(response.status_code, 200)
-            events = []
-            current_event = None
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                line = line.decode("utf-8")
-                if line.startswith("event: "):
-                    current_event = line[len("event: ") :]
-                    continue
-                if line.startswith("data: "):
-                    payload = json.loads(line[len("data: ") :])
-                    events.append((current_event, payload))
+            events = self._collect_sse_events(response)
 
         tool_starts = [
             payload
@@ -1039,7 +1188,6 @@ class TestServer(unittest.TestCase):
 
     def test_matched_stop_sequence(self):
         matched = APIHandler._matched_stop_sequence(
-            None,
             tokens=[1, 2, 3],
             stop_id_sequences=[[9], [2, 3]],
             stop_words=["x", "STOP"],
@@ -1047,7 +1195,6 @@ class TestServer(unittest.TestCase):
         self.assertEqual(matched, "STOP")
 
         unmatched = APIHandler._matched_stop_sequence(
-            None,
             tokens=[1, 2, 3],
             stop_id_sequences=[[4, 5]],
             stop_words=["NOPE"],
