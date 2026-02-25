@@ -1361,10 +1361,10 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             self.body = json.loads(raw_body.decode())
         except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
+            logging.error("JSONDecodeError: %s - Raw body: %s", e, raw_body.decode())
             self._write_json_error(
                 400,
-                f"Invalid JSON in request body: {e}",
+                f"Invalid JSON in request body: {str(e)}",
                 anthropic_error_type="invalid_request_error",
             )
             return
@@ -1422,7 +1422,7 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             request = request_factories[request_path]()
         except Exception as e:
-            self._write_json_error(400, f"{e}")
+            self._write_json_error(400, str(e))
             return
         if request_path == "/v1/messages":
             if self.stream:
@@ -1944,7 +1944,7 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
 
         # Prepare the headers
@@ -2146,7 +2146,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=self._anthropic_keepalive_callback,
             )
         except Exception as e:
-            self._write_json_error(404, f"{e}")
+            self._write_json_error(404, str(e))
             return
 
         content_blocks = []
@@ -2173,7 +2173,7 @@ class APIHandler(BaseHTTPRequestHandler):
             )
         except Exception as e:
             self._write_json_error(
-                400, f"{e}", anthropic_error_type="invalid_request_error"
+                400, str(e), anthropic_error_type="invalid_request_error"
             )
             return
 
@@ -2206,7 +2206,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=self._anthropic_keepalive_callback,
             )
         except Exception as e:
-            self._write_json_error(404, f"{e}")
+            self._write_json_error(404, str(e))
             return
 
         self._set_stream_headers(200)

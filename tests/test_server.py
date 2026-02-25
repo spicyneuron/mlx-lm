@@ -1196,6 +1196,127 @@ class TestServer(unittest.TestCase):
         body = json.loads(response.text)
         self._assert_anthropic_error(body)
 
+    def test_convert_anthropic_tools_accepts_custom_type(self):
+        from mlx_lm.server import convert_anthropic_tools
+
+        converted = convert_anthropic_tools(
+            [
+                {
+                    "type": "custom",
+                    "name": "get_weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                    },
+                }
+            ]
+        )
+        self.assertEqual(len(converted), 1)
+        self.assertEqual(converted[0]["type"], "function")
+        self.assertEqual(converted[0]["function"]["name"], "get_weather")
+
+    def test_handle_anthropic_messages_malformed_json_returns_anthropic_error(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        response = requests.post(
+            url,
+            data=b"{not valid json",
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 400)
+        body = json.loads(response.text)
+        self._assert_anthropic_error(
+            body,
+            error_type="invalid_request_error",
+            message_substring="Invalid JSON",
+        )
+
+    def test_handle_anthropic_messages_multiple_tool_calls_non_stream(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        fake_generate = self._make_fake_tool_generate(
+            [
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"nyc"}}',
+                "</tool_call>",
+            ],
+            lambda text, tools: json.loads(text),
+        )
+
+        with patch.object(
+            self.response_generator, "generate", side_effect=fake_generate
+        ):
+            response = requests.post(url, json=self._anthropic_tool_request())
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.text)
+        tool_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
+        self.assertEqual(len(tool_blocks), 2)
+        self.assertEqual(tool_blocks[0]["input"], {"location": "sf"})
+        self.assertEqual(tool_blocks[1]["input"], {"location": "nyc"})
+        # Each tool use should have a unique ID
+        self.assertNotEqual(tool_blocks[0]["id"], tool_blocks[1]["id"])
+        self.assertEqual(body["stop_reason"], "tool_use")
+
+    def test_handle_anthropic_messages_multiple_tool_calls_streaming(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        fake_generate = self._make_fake_tool_generate(
+            [
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"nyc"}}',
+                "</tool_call>",
+            ],
+            lambda text, tools: json.loads(text),
+        )
+
+        with patch.object(
+            self.response_generator, "generate", side_effect=fake_generate
+        ):
+            response = requests.post(
+                url,
+                json=self._anthropic_tool_request(stream=True),
+                stream=True,
+            )
+            self.assertEqual(response.status_code, 200)
+            events = self._collect_sse_events(response)
+
+        tool_starts = [
+            payload
+            for event, payload in events
+            if event == "content_block_start"
+            and payload["content_block"]["type"] == "tool_use"
+        ]
+        self.assertEqual(len(tool_starts), 2)
+        self.assertEqual(tool_starts[0]["content_block"]["name"], "get_weather")
+        self.assertEqual(tool_starts[1]["content_block"]["name"], "get_weather")
+        self.assertNotEqual(
+            tool_starts[0]["content_block"]["id"],
+            tool_starts[1]["content_block"]["id"],
+        )
+
+        tool_deltas = [
+            payload
+            for event, payload in events
+            if event == "content_block_delta"
+            and payload["delta"]["type"] == "input_json_delta"
+        ]
+        self.assertEqual(len(tool_deltas), 2)
+        self.assertEqual(
+            json.loads(tool_deltas[0]["delta"]["partial_json"]), {"location": "sf"}
+        )
+        self.assertEqual(
+            json.loads(tool_deltas[1]["delta"]["partial_json"]), {"location": "nyc"}
+        )
+
+        message_delta = [
+            payload for event, payload in events if event == "message_delta"
+        ][-1]
+        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)
