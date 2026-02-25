@@ -195,6 +195,91 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_handle_anthropic_messages(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hello!"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+        response_body = json.loads(response.text)
+        self.assertTrue(response_body["id"].startswith("msg_"))
+        self.assertEqual(response_body["type"], "message")
+        self.assertEqual(response_body["role"], "assistant")
+        self.assertEqual(response_body["model"], "chat_model")
+        self.assertIsInstance(response_body["content"], list)
+        self.assertEqual(response_body["content"][0]["type"], "text")
+        self.assertIn("text", response_body["content"][0])
+        self.assertIn(
+            response_body["stop_reason"], {"end_turn", "max_tokens", "stop_sequence"}
+        )
+        self.assertIn("stop_sequence", response_body)
+        self.assertIn("usage", response_body)
+        self.assertIn("input_tokens", response_body["usage"])
+        self.assertIn("output_tokens", response_body["usage"])
+
+    def test_handle_anthropic_messages_with_blocks_and_system(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "system": [{"type": "text", "text": "You are a helpful assistant."}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Say hi."}],
+                }
+            ],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+        response_body = json.loads(response.text)
+        self.assertEqual(response_body["type"], "message")
+        self.assertEqual(response_body["role"], "assistant")
+        self.assertEqual(response_body["content"][0]["type"], "text")
+
+    def test_handle_anthropic_messages_rejects_streaming_for_now(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello!"}],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 400)
+        response_body = json.loads(response.text)
+        self.assertIn("error", response_body)
+
+    def test_handle_anthropic_messages_rejects_non_text_content(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "url": "https://example.com/a.png",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 400)
+        response_body = json.loads(response.text)
+        self.assertIn("error", response_body)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)

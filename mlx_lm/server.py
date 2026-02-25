@@ -182,6 +182,56 @@ def process_message_content(messages):
                         func["arguments"] = json.loads(args)
 
 
+def _content_to_text(content, *, field_name: str) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        text_fragments = [
+            fragment["text"] for fragment in content if fragment.get("type") == "text"
+        ]
+        if len(text_fragments) != len(content):
+            raise ValueError(f"Only 'text' content type is supported in {field_name}.")
+        return "".join(text_fragments)
+    raise ValueError(
+        f"Expected {field_name} to be a string or list of text blocks, got {type(content)}."
+    )
+
+
+def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, str]]:
+    system = body.get("system")
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("messages must be a list")
+
+    out: List[Dict[str, str]] = []
+    if system is not None:
+        out.append(
+            {
+                "role": "system",
+                "content": _content_to_text(system, field_name="system"),
+            }
+        )
+
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("Each message must be an object")
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            raise ValueError(
+                f"Unsupported role `{role}`. Anthropic messages support only `user` and `assistant`."
+            )
+        content = _content_to_text(
+            message.get("content"), field_name="messages[].content"
+        )
+        if out and out[-1]["role"] == role:
+            out[-1]["content"] += content
+        else:
+            out.append({"role": role, "content": content})
+    return out
+
+
 class LRUPromptCache:
 
     @dataclass
@@ -1100,6 +1150,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+            "/v1/messages": self.handle_anthropic_messages,
         }
 
         if self.path not in request_factories:
@@ -1160,13 +1211,35 @@ class APIHandler(BaseHTTPRequestHandler):
         self.validate_model_parameters()
 
         # Get stop sequences
-        stop_words = self.body.get("stop")
+        stop_words = (
+            self.body.get("stop_sequences")
+            if self.path == "/v1/messages"
+            else self.body.get("stop")
+        )
         stop_words = stop_words or []
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
-        self.handle_completion(request, stop_words)
+        try:
+            request = request_factories[self.path]()
+        except Exception as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+            return
+        if self.path == "/v1/messages":
+            if self.stream:
+                self._set_completion_headers(400)
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {"error": "Streaming for /v1/messages is not implemented yet."}
+                    ).encode()
+                )
+                return
+            self.handle_anthropic_completion(request, stop_words)
+        else:
+            self.handle_completion(request, stop_words)
 
     def validate_model_parameters(self):
         """
@@ -1236,6 +1309,35 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("adapter must be a string")
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError("seed must be an integer")
+
+    def _make_generation_args(self, stop_words: List[str]) -> GenerationArguments:
+        return GenerationArguments(
+            model=ModelDescription(
+                model=self.requested_model,
+                draft=self.requested_draft_model,
+                adapter=self.adapter,
+            ),
+            sampling=SamplingArguments(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                xtc_probability=self.xtc_probability,
+                xtc_threshold=self.xtc_threshold,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+            ),
+            stop_words=stop_words,
+            max_tokens=self.max_tokens,
+            num_draft_tokens=self.num_draft_tokens,
+            logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
+            seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
 
     def generate_response(
         self,
@@ -1345,6 +1447,50 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
+    def _anthropic_stop_reason(
+        self, finish_reason: Optional[str], stop_sequence: Optional[str]
+    ) -> str:
+        if finish_reason == "length":
+            return "max_tokens"
+        if finish_reason == "tool_calls":
+            return "tool_use"
+        if finish_reason == "stop":
+            return "stop_sequence" if stop_sequence is not None else "end_turn"
+        return "end_turn"
+
+    def generate_anthropic_response(
+        self,
+        text: str,
+        finish_reason: Optional[str],
+        prompt_token_count: int,
+        completion_token_count: int,
+        stop_sequence: Optional[str],
+    ) -> dict:
+        return {
+            "id": self.request_id,
+            "type": "message",
+            "role": "assistant",
+            "model": self.requested_model,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": self._anthropic_stop_reason(finish_reason, stop_sequence),
+            "stop_sequence": stop_sequence,
+            "usage": {
+                "input_tokens": prompt_token_count,
+                "output_tokens": completion_token_count,
+            },
+        }
+
+    def _matched_stop_sequence(
+        self,
+        tokens: List[int],
+        stop_id_sequences: List[List[int]],
+        stop_words: List[str],
+    ) -> Optional[str]:
+        for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
+            if len(tokens) >= len(stop_ids) and tokens[-len(stop_ids) :] == stop_ids:
+                return stop_word
+        return None
+
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
@@ -1354,33 +1500,7 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_words (List[str]): A list of stop words passed to the
                 stopping_criteria function
         """
-        args = GenerationArguments(
-            model=ModelDescription(
-                model=self.requested_model,
-                draft=self.requested_draft_model,
-                adapter=self.adapter,
-            ),
-            sampling=SamplingArguments(
-                temperature=self.temperature,
-                top_p=self.top_p,
-                top_k=self.top_k,
-                min_p=self.min_p,
-                xtc_probability=self.xtc_probability,
-                xtc_threshold=self.xtc_threshold,
-            ),
-            logits=LogitsProcessorArguments(
-                logit_bias=self.logit_bias,
-                repetition_penalty=self.repetition_penalty,
-                repetition_context_size=self.repetition_context_size,
-            ),
-            stop_words=stop_words,
-            max_tokens=self.max_tokens,
-            num_draft_tokens=self.num_draft_tokens,
-            logprobs=self.logprobs,
-            top_logprobs=self.top_logprobs,
-            seed=self.seed,
-            chat_template_kwargs=self.chat_template_kwargs,
-        )
+        args = self._make_generation_args(stop_words)
 
         # Create keepalive callback to send SSE comments during long prompt processing
         def keepalive_callback(processed_tokens, total_tokens):
@@ -1599,6 +1719,63 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(response_json)
             self.wfile.flush()
 
+    def handle_anthropic_completion(
+        self, request: CompletionRequest, stop_words: List[str]
+    ):
+        args = self._make_generation_args(stop_words)
+
+        try:
+            ctx, response = self.response_generator.generate(request, args)
+        except Exception as e:
+            self._set_completion_headers(404)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+            return
+
+        self._set_completion_headers(200)
+
+        tokens = []
+        text = ""
+        finish_reason = "length"
+        stop_sequence = None
+
+        for gen in response:
+            text += gen.text
+            tokens.append(gen.token)
+
+            stop_condition = stopping_criteria(
+                tokens,
+                ctx.eos_token_ids,
+                ctx.stop_token_sequences,
+                stop_words,
+            )
+            if stop_condition.stop_met:
+                finish_reason = "stop"
+                if stop_condition.trim_length > 0:
+                    stop_sequence = self._matched_stop_sequence(
+                        tokens, ctx.stop_token_sequences, stop_words
+                    )
+                ctx.stop()
+                tokens = tokens[: len(tokens) - stop_condition.trim_length]
+                text = text[: len(text) - stop_condition.trim_text_length]
+                break
+
+            if gen.finish_reason is not None:
+                finish_reason = gen.finish_reason
+
+        out = self.generate_anthropic_response(
+            text=text,
+            finish_reason=finish_reason,
+            prompt_token_count=len(ctx.prompt),
+            completion_token_count=len(tokens),
+            stop_sequence=stop_sequence,
+        )
+        response_json = json.dumps(out).encode()
+        self.send_header("Content-Length", str(len(response_json)))
+        self.end_headers()
+        self.wfile.write(response_json)
+        self.wfile.flush()
+
     def completion_usage_response(
         self,
         prompt_token_count: Optional[int] = None,
@@ -1644,6 +1821,24 @@ class APIHandler(BaseHTTPRequestHandler):
             body["messages"],
             body.get("tools") or None,
             body.get("role_mapping"),
+        )
+
+    def handle_anthropic_messages(self) -> CompletionRequest:
+        body = self.body
+        assert "messages" in body, "Request did not contain messages"
+
+        if body.get("tools") is not None:
+            raise ValueError("tools is not implemented yet for /v1/messages")
+
+        self.request_id = f"msg_{uuid.uuid4()}"
+        self.object_type = "message"
+
+        return CompletionRequest(
+            "chat",
+            "",
+            convert_anthropic_messages(body),
+            None,
+            None,
         )
 
     def handle_text_completions(self) -> CompletionRequest:

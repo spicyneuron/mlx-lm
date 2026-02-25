@@ -24,6 +24,10 @@ This will start a text generation server on port `8080` of the `localhost`
 using Mistral 7B instruct. The model will be downloaded from the provided
 Hugging Face repo if it is not already in the local cache.
 
+### Anthropic Compatibility (Preview)
+
+The server also supports `POST /v1/messages` in a text-only, non-streaming mode.
+
 To see a full list of options run:
 
 ```shell
