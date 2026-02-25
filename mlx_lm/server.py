@@ -1731,22 +1731,15 @@ class APIHandler(BaseHTTPRequestHandler):
             )
         return out
 
-    def _anthropic_content_blocks(
-        self, text: str, tool_uses: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        content = []
-        if text or not tool_uses:
-            content.append({"type": "text", "text": text})
-        for tool_use in tool_uses:
-            content.append(
-                {
-                    "type": "tool_use",
-                    "id": tool_use["id"],
-                    "name": tool_use["name"],
-                    "input": tool_use["input"],
-                }
-            )
-        return content
+    def _anthropic_tool_use_content_block(
+        self, tool_use: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        return {
+            "type": "tool_use",
+            "id": tool_use["id"],
+            "name": tool_use["name"],
+            "input": tool_use["input"],
+        }
 
     def _write_sse_event(self, event: str, data: Dict[str, Any]):
         self.wfile.write(f"event: {event}\n".encode())
@@ -1769,6 +1762,18 @@ class APIHandler(BaseHTTPRequestHandler):
     def _write_anthropic_ping(self):
         try:
             self._write_sse_event("ping", {"type": "ping"})
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _write_anthropic_error(self, message: str):
+        try:
+            self._write_sse_event(
+                "error",
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": message},
+                },
+            )
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
@@ -2007,33 +2012,56 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": f"{e}"}).encode())
             return
 
-        self._set_completion_headers(200)
-
         tokens = []
+        segment = ""
         text = ""
         finish_reason = "length"
         stop_sequence = None
         state = _make_anthropic_text_state(ctx)
-        tool_calls = []
         tool_text = ""
-        made_tool_call = False
+        content_blocks = []
+        has_tool_use = False
+
+        def flush_text_segment():
+            nonlocal segment, text
+            if not segment:
+                return
+            text += segment
+            if content_blocks and content_blocks[-1].get("type") == "text":
+                content_blocks[-1]["text"] += segment
+            else:
+                content_blocks.append({"type": "text", "text": segment})
+            segment = ""
 
         for gen in response:
             if state.in_reasoning:
                 if gen.text == ctx.think_end:
                     state.in_reasoning = False
             elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                made_tool_call = True
+                flush_text_segment()
                 state.in_tool_call = True
             elif state.in_tool_call:
                 if gen.text == ctx.tool_call_end:
-                    tool_calls.append(tool_text)
+                    try:
+                        parsed_tool_uses = self._parse_generated_tool_uses(
+                            [tool_text], ctx, request.tools
+                        )
+                    except Exception as e:
+                        self._set_completion_headers(400)
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+                        return
+                    for tool_use in parsed_tool_uses:
+                        has_tool_use = True
+                        content_blocks.append(
+                            self._anthropic_tool_use_content_block(tool_use)
+                        )
                     tool_text = ""
                     state.in_tool_call = False
                 else:
                     tool_text += gen.text
             else:
-                text += gen.text
+                segment += gen.text
 
             tokens.append(gen.token)
 
@@ -2044,28 +2072,42 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_words,
             )
             if stop_condition.stop_met:
-                finish_reason = "tool_calls" if made_tool_call else "stop"
+                finish_reason = "stop"
                 if stop_condition.trim_length > 0:
                     stop_sequence = self._matched_stop_sequence(
                         tokens, ctx.stop_token_sequences, stop_words
                     )
                 ctx.stop()
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                text = _trim_visible_stop_text(
-                    text, stop_sequence, stop_condition.trim_text_length
+                segment = _trim_visible_stop_text(
+                    segment, stop_sequence, stop_condition.trim_text_length
                 )
+                flush_text_segment()
                 break
 
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
 
         if state.in_tool_call and tool_text:
-            tool_calls.append(tool_text)
+            try:
+                parsed_tool_uses = self._parse_generated_tool_uses(
+                    [tool_text], ctx, request.tools
+                )
+            except Exception as e:
+                self._set_completion_headers(400)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+                return
+            for tool_use in parsed_tool_uses:
+                has_tool_use = True
+                content_blocks.append(self._anthropic_tool_use_content_block(tool_use))
 
-        tool_uses = self._parse_generated_tool_uses(tool_calls, ctx, request.tools)
-        if tool_uses:
+        flush_text_segment()
+
+        if not content_blocks:
+            content_blocks = [{"type": "text", "text": ""}]
+        if has_tool_use:
             finish_reason = "tool_calls"
-        content_blocks = self._anthropic_content_blocks(text, tool_uses)
 
         out = self.generate_anthropic_response(
             text=text,
@@ -2076,6 +2118,7 @@ class APIHandler(BaseHTTPRequestHandler):
             content_blocks=content_blocks,
         )
         response_json = json.dumps(out).encode()
+        self._set_completion_headers(200)
         self.send_header("Content-Length", str(len(response_json)))
         self.end_headers()
         self.wfile.write(response_json)
@@ -2128,9 +2171,8 @@ class APIHandler(BaseHTTPRequestHandler):
         finish_reason = "length"
         stop_sequence = None
         state = _make_anthropic_text_state(ctx)
-        tool_calls = []
         tool_text = ""
-        made_tool_call = False
+        has_tool_use = False
 
         block_index = 0
         text_block_open = False
@@ -2168,78 +2210,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 text_block_open = False
                 block_index += 1
 
-        for gen in response:
-            tokens.append(gen.token)
-            visible = ""
-            if state.in_reasoning:
-                if gen.text == ctx.think_end:
-                    state.in_reasoning = False
-            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                made_tool_call = True
-                state.in_tool_call = True
-                close_text_block()
-            elif state.in_tool_call:
-                if gen.text == ctx.tool_call_end:
-                    tool_calls.append(tool_text)
-                    tool_text = ""
-                    state.in_tool_call = False
-                else:
-                    tool_text += gen.text
-            else:
-                visible = gen.text
-            segment += visible
-
-            if gen.finish_reason is not None:
-                finish_reason = gen.finish_reason
-
-            stop_condition = stopping_criteria(
-                tokens,
-                ctx.eos_token_ids,
-                ctx.stop_token_sequences,
-                stop_words,
-            )
-            if stop_condition.stop_met:
-                finish_reason = "tool_calls" if made_tool_call else "stop"
-                if stop_condition.trim_length > 0:
-                    stop_sequence = self._matched_stop_sequence(
-                        tokens, ctx.stop_token_sequences, stop_words
-                    )
-                    tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                segment = _trim_visible_stop_text(
-                    segment, stop_sequence, stop_condition.trim_text_length
-                )
-                ctx.stop()
-                if segment:
-                    emit_text_segment(segment)
-                    segment = ""
-                break
-
-            if any(
-                sequence_overlap(tokens, sequence)
-                for sequence in ctx.stop_token_sequences
-            ):
-                if not visible and not segment:
-                    self._write_anthropic_ping()
-                continue
-
-            if segment:
-                emit_text_segment(segment)
-                segment = ""
-            elif not visible:
-                self._write_anthropic_ping()
-
-        if state.in_tool_call and tool_text:
-            tool_calls.append(tool_text)
-
-        if segment:
-            emit_text_segment(segment)
-
-        close_text_block()
-
-        tool_uses = self._parse_generated_tool_uses(tool_calls, ctx, request.tools)
-        if tool_uses:
-            finish_reason = "tool_calls"
-        for tool_use in tool_uses:
+        def emit_tool_use_block(tool_use: Dict[str, Any]):
+            nonlocal block_index, has_tool_use
+            has_tool_use = True
             partial_json = json.dumps(tool_use["input"], ensure_ascii=False)
             self._write_sse_event(
                 "content_block_start",
@@ -2270,6 +2243,94 @@ class APIHandler(BaseHTTPRequestHandler):
                 {"type": "content_block_stop", "index": block_index},
             )
             block_index += 1
+
+        for gen in response:
+            tokens.append(gen.token)
+            visible = ""
+            if state.in_reasoning:
+                if gen.text == ctx.think_end:
+                    state.in_reasoning = False
+            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
+                state.in_tool_call = True
+                close_text_block()
+            elif state.in_tool_call:
+                if gen.text == ctx.tool_call_end:
+                    try:
+                        parsed_tool_uses = self._parse_generated_tool_uses(
+                            [tool_text], ctx, request.tools
+                        )
+                    except Exception as e:
+                        self._write_anthropic_error(str(e))
+                        self._write_sse_event("message_stop", {"type": "message_stop"})
+                        return
+                    for tool_use in parsed_tool_uses:
+                        emit_tool_use_block(tool_use)
+                    tool_text = ""
+                    state.in_tool_call = False
+                else:
+                    tool_text += gen.text
+            else:
+                visible = gen.text
+            segment += visible
+
+            if gen.finish_reason is not None:
+                finish_reason = gen.finish_reason
+
+            stop_condition = stopping_criteria(
+                tokens,
+                ctx.eos_token_ids,
+                ctx.stop_token_sequences,
+                stop_words,
+            )
+            if stop_condition.stop_met:
+                finish_reason = "stop"
+                if stop_condition.trim_length > 0:
+                    stop_sequence = self._matched_stop_sequence(
+                        tokens, ctx.stop_token_sequences, stop_words
+                    )
+                    tokens = tokens[: len(tokens) - stop_condition.trim_length]
+                segment = _trim_visible_stop_text(
+                    segment, stop_sequence, stop_condition.trim_text_length
+                )
+                ctx.stop()
+                if segment:
+                    emit_text_segment(segment)
+                    segment = ""
+                break
+
+            if any(
+                sequence_overlap(tokens, sequence)
+                for sequence in ctx.stop_token_sequences
+            ):
+                if not visible and not segment:
+                    self._write_anthropic_ping()
+                continue
+
+            if segment:
+                emit_text_segment(segment)
+                segment = ""
+            elif not visible:
+                self._write_anthropic_ping()
+
+        if state.in_tool_call and tool_text:
+            try:
+                parsed_tool_uses = self._parse_generated_tool_uses(
+                    [tool_text], ctx, request.tools
+                )
+            except Exception as e:
+                self._write_anthropic_error(str(e))
+                self._write_sse_event("message_stop", {"type": "message_stop"})
+                return
+            for tool_use in parsed_tool_uses:
+                emit_tool_use_block(tool_use)
+
+        if segment:
+            emit_text_segment(segment)
+
+        close_text_block()
+
+        if has_tool_use:
+            finish_reason = "tool_calls"
 
         self._write_sse_event(
             "message_delta",

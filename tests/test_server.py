@@ -97,6 +97,80 @@ class TestServer(unittest.TestCase):
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
 
+    @staticmethod
+    def _collect_sse_events(response):
+        events = []
+        current_event = None
+        for line in response.iter_lines():
+            if not line:
+                continue
+            line = line.decode("utf-8")
+            if line.startswith(":"):
+                continue
+            if line.startswith("event: "):
+                current_event = line[len("event: ") :]
+                continue
+            if line.startswith("data: "):
+                payload = json.loads(line[len("data: ") :])
+                events.append((current_event, payload))
+        return events
+
+    @staticmethod
+    def _make_tool_ctx(tool_parser):
+        return SimpleNamespace(
+            has_thinking=False,
+            think_start_id=-1,
+            think_end_id=-1,
+            think_end="",
+            has_tool_calling=True,
+            tool_call_start="<tool_call>",
+            tool_call_end="</tool_call>",
+            tool_parser=tool_parser,
+            eos_token_ids=set(),
+            stop_token_sequences=[],
+            prompt=[1, 2, 3],
+            stop=lambda: None,
+        )
+
+    def _make_fake_tool_generate(self, chunks, tool_parser):
+        def fake_generate(request, generation_args, progress_callback=None):
+            ctx = self._make_tool_ctx(tool_parser)
+
+            def iterator():
+                final_idx = len(chunks)
+                for idx, text in enumerate(chunks, start=1):
+                    yield SimpleNamespace(
+                        text=text,
+                        token=idx,
+                        logprob=0.0,
+                        finish_reason="stop" if idx == final_idx else None,
+                        top_tokens=(),
+                    )
+
+            return ctx, iterator()
+
+        return fake_generate
+
+    @staticmethod
+    def _anthropic_tool_request(stream=False):
+        body = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Use a tool"}],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                    },
+                }
+            ],
+        }
+        if stream:
+            body["stream"] = True
+        return body
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 
@@ -563,6 +637,125 @@ class TestServer(unittest.TestCase):
             -1
         ]
         self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+
+    def test_handle_anthropic_messages_non_stream_interleaved_text_tool_order(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        fake_generate = self._make_fake_tool_generate(
+            [
+                "Before ",
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+                "After",
+            ],
+            lambda text, tools: json.loads(text),
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(url, json=self._anthropic_tool_request())
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.text)
+        self.assertEqual(
+            [block["type"] for block in body["content"]], ["text", "tool_use", "text"]
+        )
+        self.assertEqual(body["content"][0]["text"], "Before ")
+        self.assertEqual(body["content"][1]["name"], "get_weather")
+        self.assertEqual(body["content"][2]["text"], "After")
+        self.assertEqual(body["stop_reason"], "tool_use")
+
+    def test_handle_anthropic_messages_streaming_interleaved_text_tool_order(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        fake_generate = self._make_fake_tool_generate(
+            [
+                "Before ",
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+                "After",
+            ],
+            lambda text, tools: json.loads(text),
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json=self._anthropic_tool_request(stream=True),
+                stream=True,
+            )
+            self.assertEqual(response.status_code, 200)
+            events = self._collect_sse_events(response)
+
+        block_start_types = [
+            payload["content_block"]["type"]
+            for event, payload in events
+            if event == "content_block_start"
+        ]
+        self.assertEqual(block_start_types, ["text", "tool_use", "text"])
+        message_delta = [payload for event, payload in events if event == "message_delta"][
+            -1
+        ]
+        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+
+    def test_handle_anthropic_messages_non_stream_tool_parse_error_returns_400(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+
+        def bad_parser(text, tools):
+            raise ValueError("bad tool call json")
+
+        fake_generate = self._make_fake_tool_generate(
+            ["<tool_call>", "not-json", "</tool_call>"],
+            bad_parser,
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(url, json=self._anthropic_tool_request())
+
+        self.assertEqual(response.status_code, 400)
+        body = json.loads(response.text)
+        self.assertIn("error", body)
+        self.assertIn("bad tool call json", body["error"])
+
+    def test_handle_anthropic_messages_streaming_tool_parse_error_emits_error_event(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+
+        def bad_parser(text, tools):
+            raise ValueError("bad tool call json")
+
+        fake_generate = self._make_fake_tool_generate(
+            ["<tool_call>", "not-json", "</tool_call>"],
+            bad_parser,
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json=self._anthropic_tool_request(stream=True),
+                stream=True,
+            )
+            self.assertEqual(response.status_code, 200)
+            events = self._collect_sse_events(response)
+
+        self.assertTrue(any(event == "error" for event, _ in events))
+        error_payload = [payload for event, payload in events if event == "error"][-1]
+        self.assertEqual(error_payload["type"], "error")
+        self.assertIn("bad tool call json", error_payload["error"]["message"])
+        self.assertEqual(events[-1][0], "message_stop")
+
+    def test_handle_anthropic_messages_no_tool_use_stop_reason_when_tool_list_empty(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        fake_generate = self._make_fake_tool_generate(
+            ["<tool_call>", '{"name":"noop","arguments":{}}', "</tool_call>"],
+            lambda text, tools: [],
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(url, json=self._anthropic_tool_request())
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.text)
+        self.assertNotEqual(body["stop_reason"], "tool_use")
+        self.assertEqual(body["content"], [{"type": "text", "text": ""}])
 
     def test_handle_anthropic_messages_rejects_non_text_content(self):
         url = f"http://localhost:{self.port}/v1/messages"
