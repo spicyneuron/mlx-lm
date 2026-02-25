@@ -26,8 +26,8 @@ Hugging Face repo if it is not already in the local cache.
 
 ### Anthropic Compatibility (Preview)
 
-The server also supports `POST /v1/messages` in a text-only mode, including
-streaming responses.
+The server also supports `POST /v1/messages` with text content and client tool
+calling (`tool_use` / `tool_result`), including streaming responses.
 
 To see a full list of options run:
 

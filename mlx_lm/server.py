@@ -200,13 +200,64 @@ def _content_to_text(content, *, field_name: str) -> str:
     )
 
 
-def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, str]]:
+def _append_merged_text_message(
+    out: List[Dict[str, Any]], role: str, content: str
+) -> None:
+    if not content:
+        return
+    if (
+        out
+        and out[-1].get("role") == role
+        and "tool_calls" not in out[-1]
+        and out[-1].get("role") != "tool"
+    ):
+        out[-1]["content"] += content
+    else:
+        out.append({"role": role, "content": content})
+
+
+def _anthropic_tool_use_to_openai_tool_call(block: Dict[str, Any]) -> Dict[str, Any]:
+    name = block.get("name")
+    if not isinstance(name, str):
+        raise ValueError("tool_use block is missing a valid `name`.")
+    tool_input = block.get("input", {})
+    if not isinstance(tool_input, dict):
+        raise ValueError("tool_use block `input` must be an object.")
+    tool_use_id = block.get("id")
+    if tool_use_id is not None and not isinstance(tool_use_id, str):
+        raise ValueError("tool_use block `id` must be a string.")
+    return {
+        "id": tool_use_id or str(uuid.uuid4()),
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(tool_input, ensure_ascii=False),
+        },
+    }
+
+
+def _anthropic_tool_result_to_openai_tool_message(
+    block: Dict[str, Any],
+) -> Dict[str, Any]:
+    tool_use_id = block.get("tool_use_id")
+    if not isinstance(tool_use_id, str):
+        raise ValueError("tool_result block is missing a valid `tool_use_id`.")
+    return {
+        "role": "tool",
+        "tool_call_id": tool_use_id,
+        "content": _content_to_text(
+            block.get("content"), field_name="tool_result.content"
+        ),
+    }
+
+
+def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     system = body.get("system")
     messages = body.get("messages")
     if not isinstance(messages, list):
         raise ValueError("messages must be a list")
 
-    out: List[Dict[str, str]] = []
+    out: List[Dict[str, Any]] = []
     if system is not None:
         out.append(
             {
@@ -223,14 +274,102 @@ def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, str]]:
             raise ValueError(
                 f"Unsupported role `{role}`. Anthropic messages support only `user` and `assistant`."
             )
-        content = _content_to_text(
-            message.get("content"), field_name="messages[].content"
-        )
-        if out and out[-1]["role"] == role:
-            out[-1]["content"] += content
-        else:
-            out.append({"role": role, "content": content})
+
+        content = message.get("content")
+        if isinstance(content, str) or content is None:
+            _append_merged_text_message(
+                out,
+                role,
+                _content_to_text(content, field_name="messages[].content"),
+            )
+            continue
+        if not isinstance(content, list):
+            raise ValueError("messages[].content must be a string or list")
+
+        if role == "assistant":
+            assistant_text = ""
+            assistant_tool_calls = []
+            for block in content:
+                if not isinstance(block, dict):
+                    raise ValueError("messages[].content[] must be an object")
+                block_type = block.get("type")
+                if block_type == "text":
+                    text = block.get("text")
+                    if not isinstance(text, str):
+                        raise ValueError("text block is missing a valid `text` field.")
+                    assistant_text += text
+                elif block_type == "tool_use":
+                    assistant_tool_calls.append(
+                        _anthropic_tool_use_to_openai_tool_call(block)
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported content block type `{block_type}` for assistant message."
+                    )
+
+            if assistant_tool_calls:
+                out.append(
+                    {
+                        "role": "assistant",
+                        "content": assistant_text,
+                        "tool_calls": assistant_tool_calls,
+                    }
+                )
+            else:
+                _append_merged_text_message(out, "assistant", assistant_text)
+            continue
+
+        # role == "user"
+        current_user_text = ""
+        for block in content:
+            if not isinstance(block, dict):
+                raise ValueError("messages[].content[] must be an object")
+            block_type = block.get("type")
+            if block_type == "text":
+                text = block.get("text")
+                if not isinstance(text, str):
+                    raise ValueError("text block is missing a valid `text` field.")
+                current_user_text += text
+            elif block_type == "tool_result":
+                _append_merged_text_message(out, "user", current_user_text)
+                current_user_text = ""
+                out.append(_anthropic_tool_result_to_openai_tool_message(block))
+            else:
+                raise ValueError(
+                    f"Unsupported content block type `{block_type}` for user message."
+                )
+        _append_merged_text_message(out, "user", current_user_text)
     return out
+
+
+def convert_anthropic_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
+    if tools is None:
+        return None
+    if not isinstance(tools, list):
+        raise ValueError("tools must be a list")
+
+    out: List[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise ValueError("Each tool must be an object")
+        tool_type = tool.get("type")
+        if tool_type not in (None, "custom"):
+            raise ValueError(
+                f"Unsupported tool type `{tool_type}`. Only client tools are supported."
+            )
+        name = tool.get("name")
+        if not isinstance(name, str):
+            raise ValueError("Tool `name` must be a string.")
+        input_schema = tool.get("input_schema", {"type": "object", "properties": {}})
+        if not isinstance(input_schema, dict):
+            raise ValueError("Tool `input_schema` must be an object.")
+
+        function: Dict[str, Any] = {"name": name, "parameters": input_schema}
+        if isinstance(tool.get("description"), str):
+            function["description"] = tool["description"]
+        out.append({"type": "function", "function": function})
+
+    return out or None
 
 
 @dataclass
@@ -1519,13 +1658,16 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_token_count: int,
         completion_token_count: int,
         stop_sequence: Optional[str],
+        content_blocks: Optional[List[Dict[str, Any]]] = None,
     ) -> dict:
         return {
             "id": self.request_id,
             "type": "message",
             "role": "assistant",
             "model": self.requested_model,
-            "content": [{"type": "text", "text": text}],
+            "content": content_blocks
+            if content_blocks is not None
+            else [{"type": "text", "text": text}],
             "stop_reason": self._anthropic_stop_reason(finish_reason, stop_sequence),
             "stop_sequence": stop_sequence,
             "usage": {
@@ -1546,6 +1688,65 @@ class APIHandler(BaseHTTPRequestHandler):
             if len(tokens) >= len(stop_ids) and tokens[-len(stop_ids) :] == stop_ids:
                 return stop_word
         return None
+
+    def _parse_generated_tool_uses(
+        self, tool_calls: List[str], ctx: Any, tools: Optional[List[Any]]
+    ) -> List[Dict[str, Any]]:
+        if not tool_calls:
+            return []
+        if ctx.tool_parser is None:
+            raise ValueError("Model does not support tool calling.")
+
+        parsed_calls = []
+        for tool_text in tool_calls:
+            parsed = ctx.tool_parser(tool_text, tools)
+            if isinstance(parsed, list):
+                parsed_calls.extend(parsed)
+            else:
+                parsed_calls.append(parsed)
+
+        out = []
+        for parsed in parsed_calls:
+            if not isinstance(parsed, dict):
+                raise ValueError("Parsed tool call must be an object.")
+            name = parsed.get("name")
+            if not isinstance(name, str):
+                raise ValueError("Parsed tool call is missing `name`.")
+
+            arguments = parsed.get("arguments", {})
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            if not isinstance(arguments, dict):
+                raise ValueError("Parsed tool call `arguments` must be an object.")
+
+            call_id = parsed.get("id")
+            if call_id is not None and not isinstance(call_id, str):
+                raise ValueError("Parsed tool call `id` must be a string.")
+            out.append(
+                {
+                    "id": call_id or str(uuid.uuid4()),
+                    "name": name,
+                    "input": arguments,
+                }
+            )
+        return out
+
+    def _anthropic_content_blocks(
+        self, text: str, tool_uses: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        content = []
+        if text or not tool_uses:
+            content.append({"type": "text", "text": text})
+        for tool_use in tool_uses:
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": tool_use["id"],
+                    "name": tool_use["name"],
+                    "input": tool_use["input"],
+                }
+            )
+        return content
 
     def _write_sse_event(self, event: str, data: Dict[str, Any]):
         self.wfile.write(f"event: {event}\n".encode())
@@ -1813,9 +2014,27 @@ class APIHandler(BaseHTTPRequestHandler):
         finish_reason = "length"
         stop_sequence = None
         state = _make_anthropic_text_state(ctx)
+        tool_calls = []
+        tool_text = ""
+        made_tool_call = False
 
         for gen in response:
-            text += _extract_anthropic_visible_text(gen.text, ctx, state)
+            if state.in_reasoning:
+                if gen.text == ctx.think_end:
+                    state.in_reasoning = False
+            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
+                made_tool_call = True
+                state.in_tool_call = True
+            elif state.in_tool_call:
+                if gen.text == ctx.tool_call_end:
+                    tool_calls.append(tool_text)
+                    tool_text = ""
+                    state.in_tool_call = False
+                else:
+                    tool_text += gen.text
+            else:
+                text += gen.text
+
             tokens.append(gen.token)
 
             stop_condition = stopping_criteria(
@@ -1825,7 +2044,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_words,
             )
             if stop_condition.stop_met:
-                finish_reason = "stop"
+                finish_reason = "tool_calls" if made_tool_call else "stop"
                 if stop_condition.trim_length > 0:
                     stop_sequence = self._matched_stop_sequence(
                         tokens, ctx.stop_token_sequences, stop_words
@@ -1840,12 +2059,21 @@ class APIHandler(BaseHTTPRequestHandler):
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
 
+        if state.in_tool_call and tool_text:
+            tool_calls.append(tool_text)
+
+        tool_uses = self._parse_generated_tool_uses(tool_calls, ctx, request.tools)
+        if tool_uses:
+            finish_reason = "tool_calls"
+        content_blocks = self._anthropic_content_blocks(text, tool_uses)
+
         out = self.generate_anthropic_response(
             text=text,
             finish_reason=finish_reason,
             prompt_token_count=len(ctx.prompt),
             completion_token_count=len(tokens),
             stop_sequence=stop_sequence,
+            content_blocks=content_blocks,
         )
         response_json = json.dumps(out).encode()
         self.send_header("Content-Length", str(len(response_json)))
@@ -1894,24 +2122,71 @@ class APIHandler(BaseHTTPRequestHandler):
                 },
             },
         )
-        self._write_sse_event(
-            "content_block_start",
-            {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            },
-        )
 
         tokens = []
         segment = ""
         finish_reason = "length"
         stop_sequence = None
         state = _make_anthropic_text_state(ctx)
+        tool_calls = []
+        tool_text = ""
+        made_tool_call = False
+
+        block_index = 0
+        text_block_open = False
+
+        def emit_text_segment(text_segment: str):
+            nonlocal text_block_open, block_index
+            if not text_segment:
+                return
+            if not text_block_open:
+                self._write_sse_event(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
+                text_block_open = True
+            self._write_sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text_segment},
+                },
+            )
+
+        def close_text_block():
+            nonlocal text_block_open, block_index
+            if text_block_open:
+                self._write_sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block_index},
+                )
+                text_block_open = False
+                block_index += 1
 
         for gen in response:
             tokens.append(gen.token)
-            visible = _extract_anthropic_visible_text(gen.text, ctx, state)
+            visible = ""
+            if state.in_reasoning:
+                if gen.text == ctx.think_end:
+                    state.in_reasoning = False
+            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
+                made_tool_call = True
+                state.in_tool_call = True
+                close_text_block()
+            elif state.in_tool_call:
+                if gen.text == ctx.tool_call_end:
+                    tool_calls.append(tool_text)
+                    tool_text = ""
+                    state.in_tool_call = False
+                else:
+                    tool_text += gen.text
+            else:
+                visible = gen.text
             segment += visible
 
             if gen.finish_reason is not None:
@@ -1924,7 +2199,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_words,
             )
             if stop_condition.stop_met:
-                finish_reason = "stop"
+                finish_reason = "tool_calls" if made_tool_call else "stop"
                 if stop_condition.trim_length > 0:
                     stop_sequence = self._matched_stop_sequence(
                         tokens, ctx.stop_token_sequences, stop_words
@@ -1935,14 +2210,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 ctx.stop()
                 if segment:
-                    self._write_sse_event(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": segment},
-                        },
-                    )
+                    emit_text_segment(segment)
                     segment = ""
                 break
 
@@ -1955,32 +2223,42 @@ class APIHandler(BaseHTTPRequestHandler):
                 continue
 
             if segment:
-                self._write_sse_event(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": segment},
-                    },
-                )
+                emit_text_segment(segment)
                 segment = ""
             elif not visible:
                 self._write_anthropic_ping()
 
+        if state.in_tool_call and tool_text:
+            tool_calls.append(tool_text)
+
         if segment:
+            emit_text_segment(segment)
+
+        close_text_block()
+
+        tool_uses = self._parse_generated_tool_uses(tool_calls, ctx, request.tools)
+        if tool_uses:
+            finish_reason = "tool_calls"
+        for tool_use in tool_uses:
             self._write_sse_event(
-                "content_block_delta",
+                "content_block_start",
                 {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": segment},
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_use["id"],
+                        "name": tool_use["name"],
+                        "input": tool_use["input"],
+                    },
                 },
             )
+            self._write_sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_index},
+            )
+            block_index += 1
 
-        self._write_sse_event(
-            "content_block_stop",
-            {"type": "content_block_stop", "index": 0},
-        )
         self._write_sse_event(
             "message_delta",
             {
@@ -2047,9 +2325,6 @@ class APIHandler(BaseHTTPRequestHandler):
         body = self.body
         assert "messages" in body, "Request did not contain messages"
 
-        if body.get("tools") is not None:
-            raise ValueError("tools is not implemented yet for /v1/messages")
-
         self.request_id = f"msg_{uuid.uuid4().hex}"
         self.object_type = "message"
 
@@ -2057,7 +2332,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "chat",
             "",
             convert_anthropic_messages(body),
-            None,
+            convert_anthropic_tools(body.get("tools")),
             None,
         )
 

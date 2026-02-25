@@ -252,6 +252,70 @@ class TestServer(unittest.TestCase):
         self.assertEqual(response_body["type"], "message")
         self.assertEqual(response_body["role"], "assistant")
 
+    def test_convert_anthropic_messages_with_tool_blocks(self):
+        from mlx_lm.server import convert_anthropic_messages
+
+        converted = convert_anthropic_messages(
+            {
+                "messages": [
+                    {"role": "user", "content": "Check weather."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Looking it up."},
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "get_weather",
+                                "input": {"location": "sf"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "72F",
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(converted[0], {"role": "user", "content": "Check weather."})
+        self.assertEqual(converted[1]["role"], "assistant")
+        self.assertEqual(converted[1]["content"], "Looking it up.")
+        self.assertEqual(converted[1]["tool_calls"][0]["id"], "toolu_1")
+        self.assertEqual(
+            converted[1]["tool_calls"][0]["function"]["name"], "get_weather"
+        )
+        self.assertEqual(converted[2]["role"], "tool")
+        self.assertEqual(converted[2]["tool_call_id"], "toolu_1")
+        self.assertEqual(converted[2]["content"], "72F")
+
+    def test_convert_anthropic_tools(self):
+        from mlx_lm.server import convert_anthropic_tools
+
+        converted = convert_anthropic_tools(
+            [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                }
+            ]
+        )
+        self.assertEqual(converted[0]["type"], "function")
+        self.assertEqual(converted[0]["function"]["name"], "get_weather")
+        self.assertIn("parameters", converted[0]["function"])
+
     def test_handle_anthropic_messages_with_blocks_and_system(self):
         url = f"http://localhost:{self.port}/v1/messages"
         post_data = {
@@ -272,6 +336,76 @@ class TestServer(unittest.TestCase):
         self.assertEqual(response_body["type"], "message")
         self.assertEqual(response_body["role"], "assistant")
         self.assertEqual(response_body["content"][0]["type"], "text")
+
+    def test_handle_anthropic_messages_with_tools_non_stream(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            ctx = SimpleNamespace(
+                has_thinking=False,
+                think_start_id=-1,
+                think_end_id=-1,
+                think_end="",
+                has_tool_calling=True,
+                tool_call_start="<tool_call>",
+                tool_call_end="</tool_call>",
+                tool_parser=lambda text, tools: json.loads(text),
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[1, 2, 3],
+                stop=lambda: None,
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="<tool_call>",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text='{"name":"get_weather","arguments":{"location":"sf"}}',
+                    token=2,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="</tool_call>",
+                    token=3,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Use a tool"}],
+                    "tools": [
+                        {
+                            "name": "get_weather",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"location": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.text)
+        self.assertEqual(body["stop_reason"], "tool_use")
+        self.assertEqual(body["content"][0]["type"], "tool_use")
+        self.assertEqual(body["content"][0]["name"], "get_weather")
+        self.assertEqual(body["content"][0]["input"], {"location": "sf"})
 
     def test_handle_anthropic_messages_streaming(self):
         url = f"http://localhost:{self.port}/v1/messages"
@@ -325,6 +459,98 @@ class TestServer(unittest.TestCase):
         self.assertIn("stop_sequence", message_delta["delta"])
         self.assertIn("output_tokens", message_delta["usage"])
         self.assertGreaterEqual(message_delta["usage"]["output_tokens"], 0)
+
+    def test_handle_anthropic_messages_streaming_tool_use(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            ctx = SimpleNamespace(
+                has_thinking=False,
+                think_start_id=-1,
+                think_end_id=-1,
+                think_end="",
+                has_tool_calling=True,
+                tool_call_start="<tool_call>",
+                tool_call_end="</tool_call>",
+                tool_parser=lambda text, tools: json.loads(text),
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[1, 2, 3],
+                stop=lambda: None,
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="<tool_call>",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text='{"name":"get_weather","arguments":{"location":"sf"}}',
+                    token=2,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="</tool_call>",
+                    token=3,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Use a tool"}],
+                    "tools": [
+                        {
+                            "name": "get_weather",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"location": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+                stream=True,
+            )
+            self.assertEqual(response.status_code, 200)
+            events = []
+            current_event = None
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                line = line.decode("utf-8")
+                if line.startswith("event: "):
+                    current_event = line[len("event: ") :]
+                    continue
+                if line.startswith("data: "):
+                    payload = json.loads(line[len("data: ") :])
+                    events.append((current_event, payload))
+
+        tool_starts = [
+            payload
+            for event, payload in events
+            if event == "content_block_start"
+            and payload["content_block"]["type"] == "tool_use"
+        ]
+        self.assertEqual(len(tool_starts), 1)
+        self.assertEqual(tool_starts[0]["content_block"]["name"], "get_weather")
+        self.assertEqual(tool_starts[0]["content_block"]["input"], {"location": "sf"})
+        message_delta = [payload for event, payload in events if event == "message_delta"][
+            -1
+        ]
+        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
 
     def test_handle_anthropic_messages_rejects_non_text_content(self):
         url = f"http://localhost:{self.port}/v1/messages"
