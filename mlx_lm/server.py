@@ -1385,6 +1385,8 @@ class APIHandler(BaseHTTPRequestHandler):
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
         )
         self.adapter = self.body.get("adapters", None)
+        # Anthropic API requires max_tokens; we intentionally fall through to
+        # the CLI default so local callers aren't forced to send it.
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
             self.max_tokens = self.body.get(
@@ -1677,6 +1679,8 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_id_sequences: List[List[int]],
         stop_words: List[str],
     ) -> Optional[str]:
+        # stop_id_sequences and stop_words are parallel lists built by the
+        # generation infrastructure; indices must stay in sync.
         for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
             if len(tokens) >= len(stop_ids) and tokens[-len(stop_ids) :] == stop_ids:
                 return stop_word
@@ -1790,11 +1794,17 @@ class APIHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
+    # Shares shape with _keepalive_callback but writes a proper SSE ping
+    # event instead of an SSE comment. Could be unified if more formats land.
     def _anthropic_keepalive_callback(self, processed_tokens, total_tokens):
         logging.info(f"Prompt processing progress: {processed_tokens}/{total_tokens}")
         if self.stream:
             self._write_anthropic_ping()
 
+    # NOTE: This loop parallels handle_completion's token loop. They share
+    # ~80% of logic (stop checking, tool parsing, reasoning state) but
+    # diverge on output formatting. A shared generation core with
+    # format-specific callbacks is a worthwhile follow-up refactor.
     def _run_anthropic_generation_loop(
         self,
         request: CompletionRequest,
@@ -2306,7 +2316,6 @@ class APIHandler(BaseHTTPRequestHandler):
             )
         except Exception as e:
             self._write_anthropic_error(str(e), error_type="invalid_request_error")
-            self._write_sse_event("message_stop", {"type": "message_stop"})
             return
 
         close_text_block()

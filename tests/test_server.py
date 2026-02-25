@@ -1112,7 +1112,9 @@ class TestServer(unittest.TestCase):
         error_payload = [payload for event, payload in events if event == "error"][-1]
         self.assertEqual(error_payload["type"], "error")
         self.assertIn("bad tool call json", error_payload["error"]["message"])
-        self.assertEqual(events[-1][0], "message_stop")
+        # Stream terminates on error without a trailing message_stop, matching
+        # the real Anthropic API behavior.
+        self.assertNotEqual(events[-1][0], "message_stop")
 
     def test_handle_anthropic_messages_no_tool_use_stop_reason_when_tool_list_empty(self):
         url = f"http://localhost:{self.port}/v1/messages"
@@ -1153,6 +1155,46 @@ class TestServer(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         response_body = json.loads(response.text)
         self._assert_anthropic_error(response_body, error_type="invalid_request_error")
+
+    def test_handle_anthropic_messages_non_stream_text_completion(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        response = requests.post(
+            url,
+            json={
+                "model": "chat_model",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "Hello!"}],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.text)
+        self.assertEqual(body["type"], "message")
+        self.assertEqual(body["role"], "assistant")
+        self.assertIn("content", body)
+        self.assertGreater(len(body["content"]), 0)
+        self.assertEqual(body["content"][0]["type"], "text")
+        self.assertIsInstance(body["content"][0]["text"], str)
+        self.assertIn(body["stop_reason"], {"end_turn", "max_tokens", "stop_sequence"})
+        self.assertIn("usage", body)
+        self.assertIn("input_tokens", body["usage"])
+        self.assertIn("output_tokens", body["usage"])
+
+    def test_handle_anthropic_messages_malformed_request_returns_anthropic_error(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        # Missing required "messages" field triggers an error during request
+        # construction; verify we get back an Anthropic-shaped error envelope.
+        response = requests.post(
+            url,
+            json={
+                "model": "chat_model",
+                "max_tokens": 10,
+            },
+        )
+
+        self.assertIn(response.status_code, {400, 404})
+        body = json.loads(response.text)
+        self._assert_anthropic_error(body)
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
