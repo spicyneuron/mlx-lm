@@ -267,6 +267,16 @@ def _extract_anthropic_visible_text(
     return segment
 
 
+def _trim_visible_stop_text(
+    text: str, stop_sequence: Optional[str], trim_text_length: int
+) -> str:
+    if trim_text_length <= 0 or not stop_sequence:
+        return text
+    if not text.endswith(stop_sequence):
+        return text
+    return text[: max(0, len(text) - trim_text_length)]
+
+
 class LRUPromptCache:
 
     @dataclass
@@ -1525,6 +1535,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
         self.wfile.flush()
 
+    def _keepalive_callback(self, processed_tokens, total_tokens):
+        logging.info(f"Prompt processing progress: {processed_tokens}/{total_tokens}")
+        if self.stream:
+            try:
+                # SSE comments are invisible to clients but keep connections alive.
+                self.wfile.write(
+                    f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                )
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
@@ -1536,28 +1558,12 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         args = self._make_generation_args(stop_words)
 
-        # Create keepalive callback to send SSE comments during long prompt processing
-        def keepalive_callback(processed_tokens, total_tokens):
-            logging.info(
-                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
-            )
-            if self.stream:
-                try:
-                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
-                    self.wfile.write(
-                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                    )
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    # Client disconnected, ignore
-                    pass
-
         # Create the token generator
         try:
             ctx, response = self.response_generator.generate(
                 request,
                 args,
-                progress_callback=keepalive_callback,
+                progress_callback=self._keepalive_callback,
             )
         except Exception as e:
             self._set_completion_headers(404)
@@ -1792,8 +1798,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ctx.stop()
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                if stop_condition.trim_text_length > 0:
-                    text = text[: max(0, len(text) - stop_condition.trim_text_length)]
+                text = _trim_visible_stop_text(
+                    text, stop_sequence, stop_condition.trim_text_length
+                )
                 break
 
             if gen.finish_reason is not None:
@@ -1818,7 +1825,11 @@ class APIHandler(BaseHTTPRequestHandler):
         args = self._make_generation_args(stop_words)
 
         try:
-            ctx, response = self.response_generator.generate(request, args)
+            ctx, response = self.response_generator.generate(
+                request,
+                args,
+                progress_callback=self._keepalive_callback,
+            )
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
@@ -1882,10 +1893,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         tokens, ctx.stop_token_sequences, stop_words
                     )
                     tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                if stop_condition.trim_text_length > 0:
-                    segment = segment[
-                        : max(0, len(segment) - stop_condition.trim_text_length)
-                    ]
+                segment = _trim_visible_stop_text(
+                    segment, stop_sequence, stop_condition.trim_text_length
+                )
                 ctx.stop()
                 if segment:
                     self._write_sse_event(

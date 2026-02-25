@@ -5,6 +5,8 @@ import io
 import json
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -345,9 +347,14 @@ class TestServer(unittest.TestCase):
         self.assertFalse(sequence_overlap([1, 2], [3, 4]))
         self.assertFalse(sequence_overlap([1, 2, 3], [4, 1, 2, 3]))
 
-    def test_anthropic_text_filtering_state_machine(self):
-        from types import SimpleNamespace
+    def test_trim_visible_stop_text(self):
+        from mlx_lm.server import _trim_visible_stop_text
 
+        self.assertEqual(_trim_visible_stop_text("hello STOP", "STOP", 4), "hello ")
+        self.assertEqual(_trim_visible_stop_text("hello", "STOP", 4), "hello")
+        self.assertEqual(_trim_visible_stop_text("hello", None, 4), "hello")
+
+    def test_anthropic_text_filtering_state_machine(self):
         from mlx_lm.server import (
             _extract_anthropic_visible_text,
             _make_anthropic_text_state,
@@ -377,6 +384,55 @@ class TestServer(unittest.TestCase):
             _extract_anthropic_visible_text(piece, ctx, state) for piece in pieces
         ]
         self.assertEqual("".join(filtered), "Hello world")
+
+    def test_handle_anthropic_messages_streaming_uses_progress_callback(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        captured = {"called": False, "has_callback": False}
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            captured["called"] = True
+            captured["has_callback"] = progress_callback is not None
+            ctx = SimpleNamespace(
+                has_thinking=False,
+                think_start_id=-1,
+                think_end_id=-1,
+                think_end="",
+                has_tool_calling=False,
+                tool_call_start="",
+                tool_call_end="",
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[1, 2, 3],
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="Hello",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+                stream=True,
+            )
+            self.assertEqual(response.status_code, 200)
+            for _ in response.iter_lines():
+                pass
+
+        self.assertTrue(captured["called"])
+        self.assertTrue(captured["has_callback"])
 
 
 class TestServerWithDraftModel(unittest.TestCase):
@@ -531,25 +587,14 @@ class TestKeepalive(unittest.TestCase):
         """Test keepalive callback sends SSE comments and handles errors"""
         from unittest.mock import Mock
 
-        # Mock handler
+        # Mock handler-like object
         mock_wfile = io.BytesIO()
-        handler = Mock()
+        handler = Mock(spec=["stream", "wfile"])
         handler.wfile = mock_wfile
-
-        # Test callback logic (same as in server.py)
-        def keepalive_callback(processed_tokens, total_tokens):
-            if handler.stream:
-                try:
-                    handler.wfile.write(
-                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                    )
-                    handler.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
 
         # Test streaming enabled
         handler.stream = True
-        keepalive_callback(1024, 4096)
+        APIHandler._keepalive_callback(handler, 1024, 4096)
 
         output = mock_wfile.getvalue().decode("utf-8")
         self.assertEqual(output, ": keepalive 1024/4096\n\n")
@@ -558,7 +603,7 @@ class TestKeepalive(unittest.TestCase):
         handler.stream = False
         mock_wfile.seek(0)
         mock_wfile.truncate(0)
-        keepalive_callback(2048, 4096)
+        APIHandler._keepalive_callback(handler, 2048, 4096)
 
         output = mock_wfile.getvalue().decode("utf-8")
         self.assertEqual(output, "")
@@ -570,7 +615,7 @@ class TestKeepalive(unittest.TestCase):
 
         # Should not raise exception
         try:
-            keepalive_callback(3072, 4096)
+            APIHandler._keepalive_callback(handler, 3072, 4096)
         except Exception as e:
             self.fail(f"Callback should handle BrokenPipeError: {e}")
 
