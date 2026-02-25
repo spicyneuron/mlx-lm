@@ -434,6 +434,71 @@ class TestServer(unittest.TestCase):
         self.assertTrue(captured["called"])
         self.assertTrue(captured["has_callback"])
 
+    def test_handle_anthropic_messages_streaming_hidden_keepalive(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            ctx = SimpleNamespace(
+                has_thinking=False,
+                think_start_id=-1,
+                think_end_id=-1,
+                think_end="",
+                has_tool_calling=True,
+                tool_call_start="<tool_call>",
+                tool_call_end="</tool_call>",
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[1, 2, 3],
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="<tool_call>",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text='{"name":"x"}',
+                    token=2,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="</tool_call>",
+                    token=3,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="Hello",
+                    token=4,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+                stream=True,
+            )
+            self.assertEqual(response.status_code, 200)
+            lines = [line.decode("utf-8") for line in response.iter_lines() if line]
+
+        self.assertTrue(any(line.startswith(": keepalive hidden") for line in lines))
+
 
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod
@@ -589,8 +654,11 @@ class TestKeepalive(unittest.TestCase):
 
         # Mock handler-like object
         mock_wfile = io.BytesIO()
-        handler = Mock(spec=["stream", "wfile"])
+        handler = Mock(spec=["stream", "wfile", "_write_sse_keepalive"])
         handler.wfile = mock_wfile
+        handler._write_sse_keepalive = lambda message: APIHandler._write_sse_keepalive(
+            handler, message
+        )
 
         # Test streaming enabled
         handler.stream = True

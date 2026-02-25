@@ -1535,17 +1535,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
         self.wfile.flush()
 
+    def _write_sse_keepalive(self, message: str):
+        try:
+            self.wfile.write(f": {message}\n\n".encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def _keepalive_callback(self, processed_tokens, total_tokens):
         logging.info(f"Prompt processing progress: {processed_tokens}/{total_tokens}")
         if self.stream:
-            try:
-                # SSE comments are invisible to clients but keep connections alive.
-                self.wfile.write(
-                    f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                )
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+            # SSE comments are invisible to clients but keep connections alive.
+            self._write_sse_keepalive(f"keepalive {processed_tokens}/{total_tokens}")
 
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
@@ -1875,7 +1876,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
         for gen in response:
             tokens.append(gen.token)
-            segment += _extract_anthropic_visible_text(gen.text, ctx, state)
+            visible = _extract_anthropic_visible_text(gen.text, ctx, state)
+            segment += visible
 
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
@@ -1913,6 +1915,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 sequence_overlap(tokens, sequence)
                 for sequence in ctx.stop_token_sequences
             ):
+                if not visible and not segment:
+                    self._write_sse_keepalive("keepalive hidden")
                 continue
 
             if segment:
@@ -1925,6 +1929,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     },
                 )
                 segment = ""
+            elif not visible:
+                self._write_sse_keepalive("keepalive hidden")
 
         if segment:
             self._write_sse_event(
