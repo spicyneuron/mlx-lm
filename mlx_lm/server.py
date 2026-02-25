@@ -189,11 +189,22 @@ def _content_to_text(content, *, field_name: str) -> str:
     if content is None:
         return ""
     if isinstance(content, list):
-        text_fragments = [
-            fragment["text"] for fragment in content if fragment.get("type") == "text"
-        ]
-        if len(text_fragments) != len(content):
-            raise ValueError(f"Only 'text' content type is supported in {field_name}.")
+        text_fragments = []
+        for fragment in content:
+            if not isinstance(fragment, dict):
+                raise ValueError(
+                    f"Expected {field_name} content blocks to be objects."
+                )
+            if fragment.get("type") != "text":
+                raise ValueError(
+                    f"Only 'text' content type is supported in {field_name}."
+                )
+            text = fragment.get("text")
+            if not isinstance(text, str):
+                raise ValueError(
+                    f"text block is missing a valid `text` field in {field_name}."
+                )
+            text_fragments.append(text)
         return "".join(text_fragments)
     raise ValueError(
         f"Expected {field_name} to be a string or list of text blocks, got {type(content)}."
@@ -205,12 +216,7 @@ def _append_merged_text_message(
 ) -> None:
     if not content:
         return
-    if (
-        out
-        and out[-1].get("role") == role
-        and "tool_calls" not in out[-1]
-        and out[-1].get("role") != "tool"
-    ):
+    if out and out[-1].get("role") == role and "tool_calls" not in out[-1]:
         out[-1]["content"] += content
     else:
         out.append({"role": role, "content": content})
@@ -369,13 +375,21 @@ def convert_anthropic_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
             function["description"] = tool["description"]
         out.append({"type": "function", "function": function})
 
-    return out or None
+    return out
 
 
 @dataclass
 class AnthropicTextState:
     in_reasoning: bool
     in_tool_call: bool = False
+
+
+@dataclass
+class AnthropicGenerationResult:
+    tokens: List[int]
+    finish_reason: str
+    stop_sequence: Optional[str]
+    has_tool_use: bool
 
 
 def _make_anthropic_text_state(ctx: Any) -> AnthropicTextState:
@@ -388,23 +402,6 @@ def _make_anthropic_text_state(ctx: Any) -> AnthropicTextState:
                 in_reasoning = True
                 break
     return AnthropicTextState(in_reasoning=in_reasoning)
-
-
-def _extract_anthropic_visible_text(
-    segment: str, ctx: Any, state: AnthropicTextState
-) -> str:
-    if state.in_reasoning:
-        if segment == ctx.think_end:
-            state.in_reasoning = False
-        return ""
-    if ctx.has_tool_calling and segment == ctx.tool_call_start:
-        state.in_tool_call = True
-        return ""
-    if state.in_tool_call:
-        if segment == ctx.tool_call_end:
-            state.in_tool_call = False
-        return ""
-    return segment
 
 
 def _trim_visible_stop_text(
@@ -1365,18 +1362,18 @@ class APIHandler(BaseHTTPRequestHandler):
             self.body = json.loads(raw_body.decode())
         except json.JSONDecodeError as e:
             logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+            self._write_json_error(
+                400,
+                f"Invalid JSON in request body: {e}",
+                anthropic_error_type="invalid_request_error",
             )
             return
 
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
-        assert isinstance(
-            self.body, dict
-        ), f"Request should be dict, but got {type(self.body)}"
+        if not isinstance(self.body, dict):
+            self._write_json_error(400, "Request body must be a JSON object")
+            return
 
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
@@ -1422,9 +1419,7 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             request = request_factories[request_path]()
         except Exception as e:
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+            self._write_json_error(400, f"{e}")
             return
         if request_path == "/v1/messages":
             if self.stream:
@@ -1653,21 +1648,18 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def generate_anthropic_response(
         self,
-        text: str,
         finish_reason: Optional[str],
         prompt_token_count: int,
         completion_token_count: int,
         stop_sequence: Optional[str],
-        content_blocks: Optional[List[Dict[str, Any]]] = None,
+        content_blocks: List[Dict[str, Any]],
     ) -> dict:
         return {
             "id": self.request_id,
             "type": "message",
             "role": "assistant",
             "model": self.requested_model,
-            "content": content_blocks
-            if content_blocks is not None
-            else [{"type": "text", "text": text}],
+            "content": content_blocks,
             "stop_reason": self._anthropic_stop_reason(finish_reason, stop_sequence),
             "stop_sequence": stop_sequence,
             "usage": {
@@ -1765,14 +1757,35 @@ class APIHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
-    def _write_anthropic_error(self, message: str):
+    def _anthropic_error_payload(self, message: str, error_type: str) -> Dict[str, Any]:
+        return {
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        }
+
+    def _write_json_error(
+        self,
+        status_code: int,
+        message: str,
+        anthropic_error_type: Optional[str] = None,
+    ):
+        self._set_completion_headers(status_code)
+        self.end_headers()
+
+        if self._request_path() == "/v1/messages":
+            error_type = anthropic_error_type or (
+                "invalid_request_error" if status_code == 400 else "api_error"
+            )
+            payload = self._anthropic_error_payload(message, error_type)
+        else:
+            payload = {"error": message}
+
+        self.wfile.write(json.dumps(payload).encode())
+
+    def _write_anthropic_error(self, message: str, error_type: str = "api_error"):
         try:
             self._write_sse_event(
-                "error",
-                {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": message},
-                },
+                "error", self._anthropic_error_payload(message, error_type)
             )
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
@@ -1781,6 +1794,124 @@ class APIHandler(BaseHTTPRequestHandler):
         logging.info(f"Prompt processing progress: {processed_tokens}/{total_tokens}")
         if self.stream:
             self._write_anthropic_ping()
+
+    def _run_anthropic_generation_loop(
+        self,
+        request: CompletionRequest,
+        ctx: Any,
+        response: Any,
+        stop_words: List[str],
+        on_text_segment: Callable[[str], None],
+        on_tool_use: Callable[[Dict[str, Any]], None],
+        on_hidden_progress: Optional[Callable[[], None]] = None,
+        on_tool_call_start: Optional[Callable[[], None]] = None,
+    ) -> AnthropicGenerationResult:
+        tokens: List[int] = []
+        segment = ""
+        finish_reason = "length"
+        stop_sequence = None
+        state = _make_anthropic_text_state(ctx)
+        tool_text = ""
+        has_tool_use = False
+        if on_hidden_progress is None:
+            def noop_hidden_progress():
+                return
+
+            on_hidden_progress = noop_hidden_progress
+        if on_tool_call_start is None:
+            def noop_tool_call_start():
+                return
+
+            on_tool_call_start = noop_tool_call_start
+
+        def flush_segment():
+            nonlocal segment
+            if not segment:
+                return
+            on_text_segment(segment)
+            segment = ""
+
+        def emit_tool_uses(raw_tool_text: str):
+            nonlocal has_tool_use
+            parsed_tool_uses = self._parse_generated_tool_uses(
+                [raw_tool_text], ctx, request.tools
+            )
+            for tool_use in parsed_tool_uses:
+                has_tool_use = True
+                on_tool_use(tool_use)
+
+        for gen in response:
+            tokens.append(gen.token)
+            visible = ""
+
+            if state.in_reasoning:
+                if gen.text == ctx.think_end:
+                    state.in_reasoning = False
+            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
+                flush_segment()
+                on_tool_call_start()
+                state.in_tool_call = True
+            elif state.in_tool_call:
+                if gen.text == ctx.tool_call_end:
+                    emit_tool_uses(tool_text)
+                    tool_text = ""
+                    state.in_tool_call = False
+                else:
+                    tool_text += gen.text
+            else:
+                visible = gen.text
+
+            segment += visible
+
+            if gen.finish_reason is not None:
+                finish_reason = gen.finish_reason
+
+            stop_condition = stopping_criteria(
+                tokens,
+                ctx.eos_token_ids,
+                ctx.stop_token_sequences,
+                stop_words,
+            )
+            if stop_condition.stop_met:
+                finish_reason = "stop"
+                if stop_condition.trim_length > 0:
+                    stop_sequence = self._matched_stop_sequence(
+                        tokens, ctx.stop_token_sequences, stop_words
+                    )
+                    tokens = tokens[: len(tokens) - stop_condition.trim_length]
+                segment = _trim_visible_stop_text(
+                    segment, stop_sequence, stop_condition.trim_text_length
+                )
+                ctx.stop()
+                flush_segment()
+                break
+
+            if any(
+                sequence_overlap(tokens, sequence) for sequence in ctx.stop_token_sequences
+            ):
+                if not visible and not segment:
+                    on_hidden_progress()
+                continue
+
+            if segment:
+                flush_segment()
+            elif not visible:
+                on_hidden_progress()
+
+        if state.in_tool_call and tool_text:
+            emit_tool_uses(tool_text)
+
+        flush_segment()
+
+        if has_tool_use:
+            finish_reason = "tool_calls"
+
+        return AnthropicGenerationResult(
+            tokens=tokens,
+            finish_reason=finish_reason,
+            stop_sequence=stop_sequence,
+            has_tool_use=has_tool_use,
+        )
 
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
@@ -2005,116 +2136,51 @@ class APIHandler(BaseHTTPRequestHandler):
         args = self._make_generation_args(stop_words)
 
         try:
-            ctx, response = self.response_generator.generate(request, args)
+            ctx, response = self.response_generator.generate(
+                request,
+                args,
+                progress_callback=self._anthropic_keepalive_callback,
+            )
         except Exception as e:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+            self._write_json_error(404, f"{e}")
             return
 
-        tokens = []
-        segment = ""
-        text = ""
-        finish_reason = "length"
-        stop_sequence = None
-        state = _make_anthropic_text_state(ctx)
-        tool_text = ""
         content_blocks = []
-        has_tool_use = False
 
-        def flush_text_segment():
-            nonlocal segment, text
-            if not segment:
+        def append_text_segment(text_segment: str):
+            if not text_segment:
                 return
-            text += segment
             if content_blocks and content_blocks[-1].get("type") == "text":
-                content_blocks[-1]["text"] += segment
+                content_blocks[-1]["text"] += text_segment
             else:
-                content_blocks.append({"type": "text", "text": segment})
-            segment = ""
+                content_blocks.append({"type": "text", "text": text_segment})
 
-        for gen in response:
-            if state.in_reasoning:
-                if gen.text == ctx.think_end:
-                    state.in_reasoning = False
-            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                flush_text_segment()
-                state.in_tool_call = True
-            elif state.in_tool_call:
-                if gen.text == ctx.tool_call_end:
-                    try:
-                        parsed_tool_uses = self._parse_generated_tool_uses(
-                            [tool_text], ctx, request.tools
-                        )
-                    except Exception as e:
-                        self._set_completion_headers(400)
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": f"{e}"}).encode())
-                        return
-                    for tool_use in parsed_tool_uses:
-                        has_tool_use = True
-                        content_blocks.append(
-                            self._anthropic_tool_use_content_block(tool_use)
-                        )
-                    tool_text = ""
-                    state.in_tool_call = False
-                else:
-                    tool_text += gen.text
-            else:
-                segment += gen.text
+        def append_tool_use(tool_use: Dict[str, Any]):
+            content_blocks.append(self._anthropic_tool_use_content_block(tool_use))
 
-            tokens.append(gen.token)
-
-            stop_condition = stopping_criteria(
-                tokens,
-                ctx.eos_token_ids,
-                ctx.stop_token_sequences,
-                stop_words,
+        try:
+            result = self._run_anthropic_generation_loop(
+                request=request,
+                ctx=ctx,
+                response=response,
+                stop_words=stop_words,
+                on_text_segment=append_text_segment,
+                on_tool_use=append_tool_use,
             )
-            if stop_condition.stop_met:
-                finish_reason = "stop"
-                if stop_condition.trim_length > 0:
-                    stop_sequence = self._matched_stop_sequence(
-                        tokens, ctx.stop_token_sequences, stop_words
-                    )
-                ctx.stop()
-                tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                segment = _trim_visible_stop_text(
-                    segment, stop_sequence, stop_condition.trim_text_length
-                )
-                flush_text_segment()
-                break
-
-            if gen.finish_reason is not None:
-                finish_reason = gen.finish_reason
-
-        if state.in_tool_call and tool_text:
-            try:
-                parsed_tool_uses = self._parse_generated_tool_uses(
-                    [tool_text], ctx, request.tools
-                )
-            except Exception as e:
-                self._set_completion_headers(400)
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": f"{e}"}).encode())
-                return
-            for tool_use in parsed_tool_uses:
-                has_tool_use = True
-                content_blocks.append(self._anthropic_tool_use_content_block(tool_use))
-
-        flush_text_segment()
+        except Exception as e:
+            self._write_json_error(
+                400, f"{e}", anthropic_error_type="invalid_request_error"
+            )
+            return
 
         if not content_blocks:
             content_blocks = [{"type": "text", "text": ""}]
-        if has_tool_use:
-            finish_reason = "tool_calls"
 
         out = self.generate_anthropic_response(
-            text=text,
-            finish_reason=finish_reason,
+            finish_reason=result.finish_reason,
             prompt_token_count=len(ctx.prompt),
-            completion_token_count=len(tokens),
-            stop_sequence=stop_sequence,
+            completion_token_count=len(result.tokens),
+            stop_sequence=result.stop_sequence,
             content_blocks=content_blocks,
         )
         response_json = json.dumps(out).encode()
@@ -2136,9 +2202,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=self._anthropic_keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
+            self._write_json_error(404, f"{e}")
             return
 
         self._set_stream_headers(200)
@@ -2165,14 +2229,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 },
             },
         )
-
-        tokens = []
-        segment = ""
-        finish_reason = "length"
-        stop_sequence = None
-        state = _make_anthropic_text_state(ctx)
-        tool_text = ""
-        has_tool_use = False
 
         block_index = 0
         text_block_open = False
@@ -2211,8 +2267,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 block_index += 1
 
         def emit_tool_use_block(tool_use: Dict[str, Any]):
-            nonlocal block_index, has_tool_use
-            has_tool_use = True
+            nonlocal block_index
             partial_json = json.dumps(tool_use["input"], ensure_ascii=False)
             self._write_sse_event(
                 "content_block_start",
@@ -2244,93 +2299,23 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             block_index += 1
 
-        for gen in response:
-            tokens.append(gen.token)
-            visible = ""
-            if state.in_reasoning:
-                if gen.text == ctx.think_end:
-                    state.in_reasoning = False
-            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                state.in_tool_call = True
-                close_text_block()
-            elif state.in_tool_call:
-                if gen.text == ctx.tool_call_end:
-                    try:
-                        parsed_tool_uses = self._parse_generated_tool_uses(
-                            [tool_text], ctx, request.tools
-                        )
-                    except Exception as e:
-                        self._write_anthropic_error(str(e))
-                        self._write_sse_event("message_stop", {"type": "message_stop"})
-                        return
-                    for tool_use in parsed_tool_uses:
-                        emit_tool_use_block(tool_use)
-                    tool_text = ""
-                    state.in_tool_call = False
-                else:
-                    tool_text += gen.text
-            else:
-                visible = gen.text
-            segment += visible
-
-            if gen.finish_reason is not None:
-                finish_reason = gen.finish_reason
-
-            stop_condition = stopping_criteria(
-                tokens,
-                ctx.eos_token_ids,
-                ctx.stop_token_sequences,
-                stop_words,
+        try:
+            result = self._run_anthropic_generation_loop(
+                request=request,
+                ctx=ctx,
+                response=response,
+                stop_words=stop_words,
+                on_text_segment=emit_text_segment,
+                on_tool_use=emit_tool_use_block,
+                on_hidden_progress=self._write_anthropic_ping,
+                on_tool_call_start=close_text_block,
             )
-            if stop_condition.stop_met:
-                finish_reason = "stop"
-                if stop_condition.trim_length > 0:
-                    stop_sequence = self._matched_stop_sequence(
-                        tokens, ctx.stop_token_sequences, stop_words
-                    )
-                    tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                segment = _trim_visible_stop_text(
-                    segment, stop_sequence, stop_condition.trim_text_length
-                )
-                ctx.stop()
-                if segment:
-                    emit_text_segment(segment)
-                    segment = ""
-                break
-
-            if any(
-                sequence_overlap(tokens, sequence)
-                for sequence in ctx.stop_token_sequences
-            ):
-                if not visible and not segment:
-                    self._write_anthropic_ping()
-                continue
-
-            if segment:
-                emit_text_segment(segment)
-                segment = ""
-            elif not visible:
-                self._write_anthropic_ping()
-
-        if state.in_tool_call and tool_text:
-            try:
-                parsed_tool_uses = self._parse_generated_tool_uses(
-                    [tool_text], ctx, request.tools
-                )
-            except Exception as e:
-                self._write_anthropic_error(str(e))
-                self._write_sse_event("message_stop", {"type": "message_stop"})
-                return
-            for tool_use in parsed_tool_uses:
-                emit_tool_use_block(tool_use)
-
-        if segment:
-            emit_text_segment(segment)
+        except Exception as e:
+            self._write_anthropic_error(str(e), error_type="invalid_request_error")
+            self._write_sse_event("message_stop", {"type": "message_stop"})
+            return
 
         close_text_block()
-
-        if has_tool_use:
-            finish_reason = "tool_calls"
 
         self._write_sse_event(
             "message_delta",
@@ -2338,11 +2323,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 "type": "message_delta",
                 "delta": {
                     "stop_reason": self._anthropic_stop_reason(
-                        finish_reason, stop_sequence
+                        result.finish_reason, result.stop_sequence
                     ),
-                    "stop_sequence": stop_sequence,
+                    "stop_sequence": result.stop_sequence,
                 },
-                "usage": {"output_tokens": len(tokens)},
+                "usage": {"output_tokens": len(result.tokens)},
             },
         )
         self._write_sse_event("message_stop", {"type": "message_stop"})
@@ -2380,7 +2365,8 @@ class APIHandler(BaseHTTPRequestHandler):
             mx.array: A mx.array of the tokenized prompt from the request body
         """
         body = self.body
-        assert "messages" in body, "Request did not contain messages"
+        if "messages" not in body:
+            raise ValueError("Request did not contain messages")
 
         # Determine response type
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -2396,7 +2382,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def handle_anthropic_messages(self) -> CompletionRequest:
         body = self.body
-        assert "messages" in body, "Request did not contain messages"
+        if "messages" not in body:
+            raise ValueError("Request did not contain messages")
 
         self.request_id = f"msg_{uuid.uuid4().hex}"
         self.object_type = "message"
@@ -2419,7 +2406,8 @@ class APIHandler(BaseHTTPRequestHandler):
         # Determine response type
         self.request_id = f"cmpl-{uuid.uuid4()}"
         self.object_type = "text_completion"
-        assert "prompt" in self.body, "Request did not contain a prompt"
+        if "prompt" not in self.body:
+            raise ValueError("Request did not contain a prompt")
         return CompletionRequest(
             "text",
             self.body["prompt"],

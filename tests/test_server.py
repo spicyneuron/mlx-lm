@@ -171,6 +171,17 @@ class TestServer(unittest.TestCase):
             body["stream"] = True
         return body
 
+    def _assert_anthropic_error(
+        self, body, error_type=None, message_substring=None
+    ):
+        self.assertEqual(body["type"], "error")
+        self.assertIn("error", body)
+        self.assertIsInstance(body["error"], dict)
+        if error_type is not None:
+            self.assertEqual(body["error"]["type"], error_type)
+        if message_substring is not None:
+            self.assertIn(message_substring, body["error"]["message"])
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 
@@ -198,6 +209,14 @@ class TestServer(unittest.TestCase):
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
 
+    def test_handle_completions_requires_prompt(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        response = requests.post(url, json={"model": "default_model", "max_tokens": 10})
+        self.assertEqual(response.status_code, 400)
+        body = json.loads(response.text)
+        self.assertIn("error", body)
+        self.assertIn("prompt", body["error"])
+
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {
@@ -215,6 +234,14 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
+    def test_handle_chat_completions_requires_messages(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        response = requests.post(url, json={"model": "chat_model", "max_tokens": 10})
+        self.assertEqual(response.status_code, 400)
+        response_body = json.loads(response.text)
+        self.assertIn("error", response_body)
+        self.assertIn("messages", response_body["error"])
 
     def test_handle_chat_completions_with_query_string(self):
         url = f"http://localhost:{self.port}/v1/chat/completions?api-version=2026-02-25"
@@ -310,6 +337,28 @@ class TestServer(unittest.TestCase):
         self.assertIn("input_tokens", response_body["usage"])
         self.assertIn("output_tokens", response_body["usage"])
 
+    def test_handle_anthropic_messages_requires_messages(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        response = requests.post(url, json={"model": "chat_model", "max_tokens": 10})
+        self.assertEqual(response.status_code, 400)
+        response_body = json.loads(response.text)
+        self._assert_anthropic_error(
+            response_body,
+            error_type="invalid_request_error",
+            message_substring="messages",
+        )
+
+    def test_handle_anthropic_messages_requires_object_body(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        response = requests.post(url, json=["not", "an", "object"])
+        self.assertEqual(response.status_code, 400)
+        body = json.loads(response.text)
+        self._assert_anthropic_error(
+            body,
+            error_type="invalid_request_error",
+            message_substring="JSON object",
+        )
+
     def test_handle_anthropic_messages_with_query_string(self):
         url = (
             f"http://localhost:{self.port}/v1/messages"
@@ -325,6 +374,124 @@ class TestServer(unittest.TestCase):
         response_body = json.loads(response.text)
         self.assertEqual(response_body["type"], "message")
         self.assertEqual(response_body["role"], "assistant")
+
+    def test_handle_anthropic_messages_rejects_text_block_missing_text_field(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        response = requests.post(
+            url,
+            json={
+                "model": "chat_model",
+                "max_tokens": 10,
+                "system": [{"type": "text"}],
+                "messages": [{"role": "user", "content": "Hello!"}],
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        response_body = json.loads(response.text)
+        self._assert_anthropic_error(
+            response_body,
+            error_type="invalid_request_error",
+            message_substring="valid `text`",
+        )
+
+    def test_handle_anthropic_messages_uses_stop_sequences_field(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        captured = {"stop_words": None}
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            captured["stop_words"] = generation_args.stop_words
+            ctx = SimpleNamespace(
+                has_thinking=False,
+                think_start_id=-1,
+                think_end_id=-1,
+                think_end="",
+                has_tool_calling=False,
+                tool_call_start="",
+                tool_call_end="",
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[1, 2, 3],
+                stop=lambda: None,
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="Hello",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                    "stop": ["ignored-stop"],
+                    "stop_sequences": ["take-this-stop"],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured["stop_words"], ["take-this-stop"])
+
+    def test_handle_anthropic_messages_non_stream_generate_error_uses_anthropic_schema(
+        self,
+    ):
+        url = f"http://localhost:{self.port}/v1/messages"
+        with patch.object(
+            self.response_generator,
+            "generate",
+            side_effect=RuntimeError("generation failed"),
+        ):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 404)
+        body = json.loads(response.text)
+        self._assert_anthropic_error(
+            body,
+            error_type="api_error",
+            message_substring="generation failed",
+        )
+
+    def test_handle_anthropic_messages_stream_generate_error_uses_anthropic_schema(
+        self,
+    ):
+        url = f"http://localhost:{self.port}/v1/messages"
+        with patch.object(
+            self.response_generator,
+            "generate",
+            side_effect=RuntimeError("generation failed"),
+        ):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 404)
+        body = json.loads(response.text)
+        self._assert_anthropic_error(
+            body,
+            error_type="api_error",
+            message_substring="generation failed",
+        )
 
     def test_convert_anthropic_messages_with_tool_blocks(self):
         from mlx_lm.server import convert_anthropic_messages
@@ -370,6 +537,41 @@ class TestServer(unittest.TestCase):
         self.assertEqual(converted[2]["tool_call_id"], "toolu_1")
         self.assertEqual(converted[2]["content"], "72F")
 
+    def test_convert_anthropic_messages_with_system_string(self):
+        from mlx_lm.server import convert_anthropic_messages
+
+        converted = convert_anthropic_messages(
+            {
+                "system": "You are concise.",
+                "messages": [{"role": "user", "content": "Hello"}],
+            }
+        )
+
+        self.assertEqual(converted[0], {"role": "system", "content": "You are concise."})
+        self.assertEqual(converted[1], {"role": "user", "content": "Hello"})
+
+    def test_convert_anthropic_messages_multi_turn_text(self):
+        from mlx_lm.server import convert_anthropic_messages
+
+        converted = convert_anthropic_messages(
+            {
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": "Hello"},
+                    {"role": "user", "content": "How are you?"},
+                ]
+            }
+        )
+
+        self.assertEqual(
+            converted,
+            [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello"},
+                {"role": "user", "content": "How are you?"},
+            ],
+        )
+
     def test_convert_anthropic_tools(self):
         from mlx_lm.server import convert_anthropic_tools
 
@@ -389,6 +591,24 @@ class TestServer(unittest.TestCase):
         self.assertEqual(converted[0]["type"], "function")
         self.assertEqual(converted[0]["function"]["name"], "get_weather")
         self.assertIn("parameters", converted[0]["function"])
+
+    def test_convert_anthropic_tools_none(self):
+        from mlx_lm.server import convert_anthropic_tools
+
+        self.assertIsNone(convert_anthropic_tools(None))
+
+    def test_convert_anthropic_tools_empty_list(self):
+        from mlx_lm.server import convert_anthropic_tools
+
+        self.assertEqual(convert_anthropic_tools([]), [])
+
+    def test_convert_anthropic_tools_rejects_unsupported_type(self):
+        from mlx_lm.server import convert_anthropic_tools
+
+        with self.assertRaisesRegex(ValueError, "Unsupported tool type"):
+            convert_anthropic_tools(
+                [{"type": "server", "name": "get_weather", "input_schema": {}}]
+            )
 
     def test_handle_anthropic_messages_with_blocks_and_system(self):
         url = f"http://localhost:{self.port}/v1/messages"
@@ -713,8 +933,11 @@ class TestServer(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         body = json.loads(response.text)
-        self.assertIn("error", body)
-        self.assertIn("bad tool call json", body["error"])
+        self._assert_anthropic_error(
+            body,
+            error_type="invalid_request_error",
+            message_substring="bad tool call json",
+        )
 
     def test_handle_anthropic_messages_streaming_tool_parse_error_emits_error_event(self):
         url = f"http://localhost:{self.port}/v1/messages"
@@ -780,7 +1003,7 @@ class TestServer(unittest.TestCase):
         response = requests.post(url, json=post_data)
         self.assertEqual(response.status_code, 400)
         response_body = json.loads(response.text)
-        self.assertIn("error", response_body)
+        self._assert_anthropic_error(response_body, error_type="invalid_request_error")
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
@@ -814,36 +1037,22 @@ class TestServer(unittest.TestCase):
         self.assertEqual(_trim_visible_stop_text("hello", "STOP", 4), "hello")
         self.assertEqual(_trim_visible_stop_text("hello", None, 4), "hello")
 
-    def test_anthropic_text_filtering_state_machine(self):
-        from mlx_lm.server import (
-            _extract_anthropic_visible_text,
-            _make_anthropic_text_state,
+    def test_matched_stop_sequence(self):
+        matched = APIHandler._matched_stop_sequence(
+            None,
+            tokens=[1, 2, 3],
+            stop_id_sequences=[[9], [2, 3]],
+            stop_words=["x", "STOP"],
         )
+        self.assertEqual(matched, "STOP")
 
-        ctx = SimpleNamespace(
-            has_thinking=True,
-            think_start_id=11,
-            think_end_id=12,
-            think_end="</think>",
-            has_tool_calling=True,
-            tool_call_start="<tool_call>",
-            tool_call_end="</tool_call>",
-            prompt=[11],
+        unmatched = APIHandler._matched_stop_sequence(
+            None,
+            tokens=[1, 2, 3],
+            stop_id_sequences=[[4, 5]],
+            stop_words=["NOPE"],
         )
-        state = _make_anthropic_text_state(ctx)
-        pieces = [
-            "internal reasoning",
-            "</think>",
-            "Hello",
-            "<tool_call>",
-            '{"name":"x"}',
-            "</tool_call>",
-            " world",
-        ]
-        filtered = [
-            _extract_anthropic_visible_text(piece, ctx, state) for piece in pieces
-        ]
-        self.assertEqual("".join(filtered), "Hello world")
+        self.assertIsNone(unmatched)
 
     def test_handle_anthropic_messages_streaming_uses_progress_callback(self):
         url = f"http://localhost:{self.port}/v1/messages"
@@ -894,6 +1103,183 @@ class TestServer(unittest.TestCase):
         self.assertTrue(captured["called"])
         self.assertTrue(captured["has_callback"])
 
+    def test_handle_anthropic_messages_non_stream_uses_progress_callback(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+        captured = {"called": False, "has_callback": False, "callback_name": None}
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            captured["called"] = True
+            captured["has_callback"] = progress_callback is not None
+            captured["callback_name"] = getattr(progress_callback, "__name__", None)
+            ctx = SimpleNamespace(
+                has_thinking=False,
+                think_start_id=-1,
+                think_end_id=-1,
+                think_end="",
+                has_tool_calling=False,
+                tool_call_start="",
+                tool_call_end="",
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[1, 2, 3],
+                stop=lambda: None,
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="Hello",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+
+        self.assertTrue(captured["called"])
+        self.assertTrue(captured["has_callback"])
+        self.assertEqual(captured["callback_name"], "_anthropic_keepalive_callback")
+
+    def test_handle_anthropic_messages_non_stream_hides_thinking_text(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            ctx = SimpleNamespace(
+                has_thinking=True,
+                think_start_id=11,
+                think_end_id=12,
+                think_end="</think>",
+                has_tool_calling=False,
+                tool_call_start="",
+                tool_call_end="",
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[11],
+                stop=lambda: None,
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="internal reasoning",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="</think>",
+                    token=2,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="Hello",
+                    token=3,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        text_blocks = [
+            block["text"]
+            for block in response_body["content"]
+            if block.get("type") == "text"
+        ]
+        self.assertEqual("".join(text_blocks), "Hello")
+        self.assertNotIn("internal reasoning", "".join(text_blocks))
+
+    def test_handle_anthropic_messages_streaming_hides_thinking_text(self):
+        url = f"http://localhost:{self.port}/v1/messages"
+
+        def fake_generate(request, generation_args, progress_callback=None):
+            ctx = SimpleNamespace(
+                has_thinking=True,
+                think_start_id=11,
+                think_end_id=12,
+                think_end="</think>",
+                has_tool_calling=False,
+                tool_call_start="",
+                tool_call_end="",
+                eos_token_ids=set(),
+                stop_token_sequences=[],
+                prompt=[11],
+                stop=lambda: None,
+            )
+
+            def iterator():
+                yield SimpleNamespace(
+                    text="internal reasoning",
+                    token=1,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="</think>",
+                    token=2,
+                    logprob=0.0,
+                    finish_reason=None,
+                    top_tokens=(),
+                )
+                yield SimpleNamespace(
+                    text="Hello",
+                    token=3,
+                    logprob=0.0,
+                    finish_reason="stop",
+                    top_tokens=(),
+                )
+
+            return ctx, iterator()
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "max_tokens": 10,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Hello!"}],
+                },
+                stream=True,
+            )
+            self.assertEqual(response.status_code, 200)
+            events = self._collect_sse_events(response)
+
+        text_deltas = [
+            payload["delta"]["text"]
+            for event, payload in events
+            if event == "content_block_delta"
+            and payload.get("delta", {}).get("type") == "text_delta"
+        ]
+        self.assertEqual("".join(text_deltas), "Hello")
+        self.assertNotIn("internal reasoning", "".join(text_deltas))
+
     def test_handle_anthropic_messages_streaming_hidden_keepalive(self):
         url = f"http://localhost:{self.port}/v1/messages"
 
@@ -906,9 +1292,11 @@ class TestServer(unittest.TestCase):
                 has_tool_calling=True,
                 tool_call_start="<tool_call>",
                 tool_call_end="</tool_call>",
+                tool_parser=lambda text, tools: {"name": "x", "arguments": {}},
                 eos_token_ids=set(),
                 stop_token_sequences=[],
                 prompt=[1, 2, 3],
+                stop=lambda: None,
             )
 
             def iterator():
@@ -955,10 +1343,17 @@ class TestServer(unittest.TestCase):
                 stream=True,
             )
             self.assertEqual(response.status_code, 200)
-            lines = [line.decode("utf-8") for line in response.iter_lines() if line]
+            events = self._collect_sse_events(response)
 
-        self.assertIn("event: ping", lines)
-        self.assertIn('data: {"type": "ping"}', lines)
+        self.assertTrue(any(event == "ping" for event, _ in events))
+        self.assertFalse(any(event == "error" for event, _ in events))
+        text_deltas = [
+            payload["delta"]["text"]
+            for event, payload in events
+            if event == "content_block_delta"
+            and payload.get("delta", {}).get("type") == "text_delta"
+        ]
+        self.assertIn("Hello", "".join(text_deltas))
 
     def test_handle_chat_completions_streaming_hidden_keepalive(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
