@@ -1104,7 +1104,7 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         # Anthropic clients may append query params, so strip them for matching
         if urlsplit(self.path).path == "/v1/messages":
-            self._handle_messages_post()
+            self._handle_anthropic_messages()
             return
 
         request_factories = {
@@ -1137,27 +1137,25 @@ class APIHandler(BaseHTTPRequestHandler):
         )
 
         # Extract request parameters from the body
-        self._parse_common_params()
         self.stream_options = self.body.get("stream_options", None)
-        self.max_tokens = self.body.get("max_completion_tokens", None)
-        if self.max_tokens is None:
-            self.max_tokens = self.body.get(
+        max_tokens = self.body.get("max_completion_tokens", None)
+        if max_tokens is None:
+            max_tokens = self.body.get(
                 "max_tokens", self.response_generator.cli_args.max_tokens
             )
-        self.validate_model_parameters()
-
-        # Get stop sequences
         stop_words = normalize_stop_words(self.body.get("stop"))
+        args = self._parse_and_build_args(stop_words, max_tokens)
+        self.validate_model_parameters()
 
         # Create the completion request
         request = request_factories[self.path]()
-        self.handle_completion(request, stop_words)
+        self.handle_completion(request, args)
 
-    def _handle_messages_post(self):
+    def _handle_anthropic_messages(self):
         from . import server_anthropic as anth
 
         try:
-            anth.handle_anthropic_post(self)
+            anth.handle_post(self)
         except Exception:
             logging.exception("Unexpected error in Anthropic messages handler")
             try:
@@ -1170,8 +1168,13 @@ class APIHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
-    def _parse_common_params(self):
-        """Extract generation parameters shared across API formats from self.body."""
+    def _parse_and_build_args(self, stop_words, max_tokens):
+        """Parse common request params and return GenerationArguments.
+
+        Sets instance attributes consumed by downstream formatting (stream,
+        requested_model, etc.) and builds the GenerationArguments in one step.
+        Callers supply stop_words and max_tokens since those differ by API format.
+        """
         cli = self.response_generator.cli_args
         self.stream = self.body.get("stream", False)
         self.requested_model = self.body.get("model", "default_model")
@@ -1191,9 +1194,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        self.max_tokens = max_tokens
 
-    def _build_generation_args(self, stop_words):
-        """Build GenerationArguments from parsed request params."""
         return GenerationArguments(
             model=ModelDescription(
                 model=self.requested_model,
@@ -1214,7 +1216,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 repetition_context_size=self.repetition_context_size,
             ),
             stop_words=stop_words,
-            max_tokens=self.max_tokens,
+            max_tokens=max_tokens,
             num_draft_tokens=self.num_draft_tokens,
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
@@ -1399,16 +1401,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
-    def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
-        """
-        Generate a response to a prompt and send it to the client in a single batch.
-
-        Args:
-            prompt (List[int]): The tokenized prompt.
-            stop_words (List[str]): A list of stop words passed to the
-                stopping_criteria function
-        """
-        args = self._build_generation_args(stop_words)
+    def handle_completion(self, request: CompletionRequest, args: GenerationArguments):
 
         def write_keepalive_comment(processed_tokens, total_tokens):
             try:
@@ -1544,7 +1537,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 tokens,
                 ctx.eos_token_ids,
                 ctx.stop_token_sequences,
-                stop_words,
+                args.stop_words,
             )
             if stop_condition.stop_met:
                 finish_reason = "tool_calls" if made_tool_call else "stop"

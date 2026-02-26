@@ -221,7 +221,7 @@ def convert_anthropic_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
     return out
 
 
-def handle_anthropic_post(handler: Any) -> None:
+def handle_post(handler: Any) -> None:
     """Handle POST /v1/messages using APIHandler primitives."""
     success, decoded = load_json_body(handler)
     if not success:
@@ -247,13 +247,12 @@ def handle_anthropic_post(handler: Any) -> None:
         )
         return
 
-    handler._parse_common_params()
-    handler.max_tokens = handler.body.get(
+    # Anthropic uses stop_sequences instead of stop
+    stop_words = normalize_stop_words(handler.body.get("stop_sequences"))
+    max_tokens = handler.body.get(
         "max_tokens", handler.response_generator.cli_args.max_tokens
     )
-
-    # Anthropic uses stop_sequences instead of stop.
-    stop_words = normalize_stop_words(handler.body.get("stop_sequences"))
+    args = handler._parse_and_build_args(stop_words, max_tokens)
 
     handler.request_id = f"msg_{uuid.uuid4().hex}"
 
@@ -272,8 +271,6 @@ def handle_anthropic_post(handler: Any) -> None:
             payload=error_payload(str(e), "invalid_request_error"),
         )
         return
-
-    args = handler._build_generation_args(stop_words)
 
     def write_sse_event(event: str, data: Dict[str, Any]) -> None:
         handler.wfile.write(f"event: {event}\n".encode())

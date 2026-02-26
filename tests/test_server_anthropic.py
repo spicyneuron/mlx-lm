@@ -927,7 +927,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         url = f"http://localhost:{self.port}/v1/messages"
         with patch.object(
             server_anthropic,
-            "handle_anthropic_post",
+            "handle_post",
             side_effect=RuntimeError("unexpected"),
         ):
             response = requests.post(
