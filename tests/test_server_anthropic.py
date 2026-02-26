@@ -1,8 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
-import http
 import json
-import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,98 +8,13 @@ from unittest.mock import patch
 import requests
 
 import mlx_lm.server_anthropic as server_anthropic
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
-from mlx_lm.utils import load
+from mlx_lm.server import APIHandler
+from tests._server_test_utils import ServerAPITestBase, collect_sse_events
 
 
-class DummyModelProvider:
-    def __init__(self, with_draft=False):
-        HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
-        self.model, self.tokenizer = load(HF_MODEL_PATH)
-        self.model_key = (HF_MODEL_PATH, None)
-        self.is_batchable = True
+class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
 
-        # Add draft model support
-        self.draft_model = None
-        self.draft_model_key = None
-        self.cli_args = type(
-            "obj",
-            (object,),
-            {
-                "adapter_path": None,
-                "chat_template": None,
-                "use_default_chat_template": False,
-                "trust_remote_code": False,
-                "draft_model": None,
-                "num_draft_tokens": 3,
-                "temp": 0.0,
-                "top_p": 1.0,
-                "top_k": 0,
-                "min_p": 0.0,
-                "max_tokens": 512,
-                "chat_template_args": {},
-                "model": None,
-                "decode_concurrency": 32,
-                "prompt_concurrency": 8,
-                "prompt_cache_size": 10,
-                "prompt_cache_bytes": 1 << 63,
-                "prompt_cache_total_bytes": None,
-            },
-        )
-
-        if with_draft:
-            # Use the same model as the draft model for testing
-            self.draft_model, _ = load(HF_MODEL_PATH)
-            self.draft_model_key = HF_MODEL_PATH
-            self.cli_args.draft_model = HF_MODEL_PATH
-
-    def load(self, model, adapter=None, draft_model=None):
-        assert model in ["default_model", "chat_model"]
-        return self.model, self.tokenizer
-
-
-class TestAnthropicServer(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.response_generator = ResponseGenerator(
-            DummyModelProvider(), LRUPromptCache()
-        )
-        cls.server_address = ("localhost", 0)
-        cls.httpd = http.server.HTTPServer(
-            cls.server_address,
-            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
-        )
-        cls.port = cls.httpd.server_port
-        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
-        cls.server_thread.daemon = True
-        cls.server_thread.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        cls.server_thread.join()
-        cls.response_generator.stop_and_join()
-
-    @staticmethod
-    def _collect_sse_events(response):
-        events = []
-        current_event = None
-        for line in response.iter_lines():
-            if not line:
-                continue
-            line = line.decode("utf-8")
-            if line.startswith(":"):
-                continue
-            if line.startswith("event: "):
-                current_event = line[len("event: "):]
-                continue
-            if line.startswith("data: "):
-                payload = json.loads(line[len("data: "):])
-                events.append((current_event, payload))
-        return events
-
-    # -- Test helpers ----------------------------------------------------------
+    # Test helpers
 
     @staticmethod
     def _make_ctx(**overrides):
@@ -193,7 +106,7 @@ class TestAnthropicServer(unittest.TestCase):
         if message_substring is not None:
             self.assertIn(message_substring, body["error"]["message"])
 
-    # -- Tests -----------------------------------------------------------------
+    # Tests
 
     def test_handle_anthropic_messages(self):
         url = f"http://localhost:{self.port}/v1/messages"
@@ -356,58 +269,32 @@ class TestAnthropicServer(unittest.TestCase):
             captured["max_tokens"], self.response_generator.cli_args.max_tokens
         )
 
-    def test_handle_anthropic_messages_non_stream_generate_error_uses_anthropic_schema(
-        self,
-    ):
+    def test_handle_anthropic_messages_generate_error_uses_anthropic_schema(self):
         url = f"http://localhost:{self.port}/v1/messages"
-        with patch.object(
-            self.response_generator,
-            "generate",
-            side_effect=RuntimeError("generation failed"),
-        ):
-            response = requests.post(
-                url,
-                json={
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                request_body = {
                     "model": "chat_model",
                     "max_tokens": 10,
                     "messages": [{"role": "user", "content": "Hello!"}],
-                },
-            )
+                }
+                if stream:
+                    request_body["stream"] = True
 
-        self.assertEqual(response.status_code, 404)
-        body = json.loads(response.text)
-        self._assert_anthropic_error(
-            body,
-            error_type="api_error",
-            message_substring="generation failed",
-        )
+                with patch.object(
+                    self.response_generator,
+                    "generate",
+                    side_effect=RuntimeError("generation failed"),
+                ):
+                    response = requests.post(url, json=request_body)
 
-    def test_handle_anthropic_messages_stream_generate_error_uses_anthropic_schema(
-        self,
-    ):
-        url = f"http://localhost:{self.port}/v1/messages"
-        with patch.object(
-            self.response_generator,
-            "generate",
-            side_effect=RuntimeError("generation failed"),
-        ):
-            response = requests.post(
-                url,
-                json={
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "stream": True,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                },
-            )
-
-        self.assertEqual(response.status_code, 404)
-        body = json.loads(response.text)
-        self._assert_anthropic_error(
-            body,
-            error_type="api_error",
-            message_substring="generation failed",
-        )
+                self.assertEqual(response.status_code, 404)
+                body = json.loads(response.text)
+                self._assert_anthropic_error(
+                    body,
+                    error_type="api_error",
+                    message_substring="generation failed",
+                )
 
     def test_handle_anthropic_messages_unexpected_loop_error_is_server_error(self):
         url = f"http://localhost:{self.port}/v1/messages"
@@ -759,7 +646,7 @@ class TestAnthropicServer(unittest.TestCase):
         response = requests.post(url, json=post_data, stream=True)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get("anthropic-version"), "2023-06-01")
-        events = self._collect_sse_events(response)
+        events = collect_sse_events(response)
 
         event_names = [event for event, _ in events]
         visible_event_names = [event for event in event_names if event != "ping"]
@@ -821,7 +708,7 @@ class TestAnthropicServer(unittest.TestCase):
                 stream=True,
             )
             self.assertEqual(response.status_code, 200)
-            events = self._collect_sse_events(response)
+            events = collect_sse_events(response)
 
         tool_starts = [
             payload
@@ -894,7 +781,7 @@ class TestAnthropicServer(unittest.TestCase):
                 stream=True,
             )
             self.assertEqual(response.status_code, 200)
-            events = self._collect_sse_events(response)
+            events = collect_sse_events(response)
 
         block_start_types = [
             payload["content_block"]["type"]
@@ -947,7 +834,7 @@ class TestAnthropicServer(unittest.TestCase):
                 stream=True,
             )
             self.assertEqual(response.status_code, 200)
-            events = self._collect_sse_events(response)
+            events = collect_sse_events(response)
 
         self.assertTrue(any(event == "error" for event, _ in events))
         error_payload = [payload for event, payload in events if event == "error"][-1]
@@ -1147,7 +1034,7 @@ class TestAnthropicServer(unittest.TestCase):
                 stream=True,
             )
             self.assertEqual(response.status_code, 200)
-            events = self._collect_sse_events(response)
+            events = collect_sse_events(response)
 
         tool_starts = [
             payload
@@ -1312,7 +1199,7 @@ class TestAnthropicServer(unittest.TestCase):
                 stream=True,
             )
             self.assertEqual(response.status_code, 200)
-            events = self._collect_sse_events(response)
+            events = collect_sse_events(response)
 
         text_deltas = [
             payload["delta"]["text"]
@@ -1345,7 +1232,7 @@ class TestAnthropicServer(unittest.TestCase):
                 stream=True,
             )
             self.assertEqual(response.status_code, 200)
-            events = self._collect_sse_events(response)
+            events = collect_sse_events(response)
 
         self.assertTrue(any(event == "ping" for event, _ in events))
         self.assertFalse(any(event == "error" for event, _ in events))

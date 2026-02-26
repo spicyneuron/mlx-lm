@@ -1,63 +1,15 @@
 # Copyright © 2024 Apple Inc.
 
-import http
 import io
 import json
-import threading
 import unittest
 
 import mlx.core as mx
 import requests
 
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
-from mlx_lm.utils import load
-
-
-class DummyModelProvider:
-    def __init__(self, with_draft=False):
-        HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
-        self.model, self.tokenizer = load(HF_MODEL_PATH)
-        self.model_key = (HF_MODEL_PATH, None)
-        self.is_batchable = True
-
-        # Add draft model support
-        self.draft_model = None
-        self.draft_model_key = None
-        self.cli_args = type(
-            "obj",
-            (object,),
-            {
-                "adapter_path": None,
-                "chat_template": None,
-                "use_default_chat_template": False,
-                "trust_remote_code": False,
-                "draft_model": None,
-                "num_draft_tokens": 3,
-                "temp": 0.0,
-                "top_p": 1.0,
-                "top_k": 0,
-                "min_p": 0.0,
-                "max_tokens": 512,
-                "chat_template_args": {},
-                "model": None,
-                "decode_concurrency": 32,
-                "prompt_concurrency": 8,
-                "prompt_cache_size": 10,
-                "prompt_cache_bytes": 1 << 63,
-                "prompt_cache_total_bytes": None,
-            },
-        )
-
-        if with_draft:
-            # Use the same model as the draft model for testing
-            self.draft_model, _ = load(HF_MODEL_PATH)
-            self.draft_model_key = HF_MODEL_PATH
-            self.cli_args.draft_model = HF_MODEL_PATH
-
-    def load(self, model, adapter=None, draft_model=None):
-        assert model in ["default_model", "chat_model"]
-        return self.model, self.tokenizer
+from mlx_lm.server import LRUPromptCache
+from tests._server_test_utils import ServerAPITestBase, collect_sse_payloads
 
 
 class MockCache:
@@ -72,28 +24,7 @@ class MockCache:
         return other.value == self.value
 
 
-class TestServer(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.response_generator = ResponseGenerator(
-            DummyModelProvider(), LRUPromptCache()
-        )
-        cls.server_address = ("localhost", 0)
-        cls.httpd = http.server.HTTPServer(
-            cls.server_address,
-            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
-        )
-        cls.port = cls.httpd.server_port
-        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
-        cls.server_thread.daemon = True
-        cls.server_thread.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        cls.server_thread.join()
-        cls.response_generator.stop_and_join()
+class TestServer(ServerAPITestBase, unittest.TestCase):
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -221,28 +152,8 @@ class TestServer(unittest.TestCase):
         self.assertFalse(sequence_overlap([1, 2, 3], [4, 1, 2, 3]))
 
 
-class TestServerWithDraftModel(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.response_generator = ResponseGenerator(
-            DummyModelProvider(with_draft=True), LRUPromptCache()
-        )
-        cls.server_address = ("localhost", 0)
-        cls.httpd = http.server.HTTPServer(
-            cls.server_address,
-            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
-        )
-        cls.port = cls.httpd.server_port
-        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
-        cls.server_thread.daemon = True
-        cls.server_thread.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.httpd.server_close()
-        cls.server_thread.join()
-        cls.response_generator.stop_and_join()
+class TestServerWithDraftModel(ServerAPITestBase, unittest.TestCase):
+    model_provider_kwargs = {"with_draft": True}
 
     def test_handle_completions_with_draft_model(self):
         url = f"http://localhost:{self.port}/v1/completions"
@@ -308,15 +219,11 @@ class TestServerWithDraftModel(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
 
         chunk_count = 0
-        for chunk in response.iter_lines():
-            if chunk:
-                data = chunk.decode("utf-8")
-                if data.startswith("data: ") and data != "data: [DONE]":
-                    chunk_data = json.loads(data[6:])  # Skip the "data: " prefix
-                    self.assertIn("choices", chunk_data)
-                    self.assertEqual(len(chunk_data["choices"]), 1)
-                    self.assertIn("delta", chunk_data["choices"][0])
-                    chunk_count += 1
+        for chunk_data in collect_sse_payloads(response):
+            self.assertIn("choices", chunk_data)
+            self.assertEqual(len(chunk_data["choices"]), 1)
+            self.assertIn("delta", chunk_data["choices"][0])
+            chunk_count += 1
 
         # Make sure we got some streaming chunks
         self.assertGreater(chunk_count, 0)

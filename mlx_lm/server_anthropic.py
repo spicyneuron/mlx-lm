@@ -10,15 +10,22 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from .server import (
-    CompletionRequest,
-    StopCondition,
-    sequence_overlap,
-    stopping_criteria,
+from .server_common import (
+    load_json_body,
+    make_progress_callback,
+    normalize_stop_words,
+    write_json_response,
 )
+from .server import CompletionRequest, sequence_overlap, stopping_criteria
 
 
-# -- Request conversion (Anthropic -> OpenAI internal) -----------------------
+# Request conversion (Anthropic -> OpenAI internal)
+
+
+def _expect_object(value: Any, error_message: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(error_message)
+    return value
 
 
 def _content_to_text(content, *, field_name: str) -> str:
@@ -29,10 +36,9 @@ def _content_to_text(content, *, field_name: str) -> str:
     if isinstance(content, list):
         text_fragments = []
         for fragment in content:
-            if not isinstance(fragment, dict):
-                raise ValueError(
-                    f"Expected {field_name} content blocks to be objects."
-                )
+            fragment = _expect_object(
+                fragment, f"Expected {field_name} content blocks to be objects."
+            )
             if fragment.get("type") != "text":
                 raise ValueError(
                     f"Only 'text' content type is supported in {field_name}."
@@ -118,8 +124,7 @@ def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
 
     for message in messages:
-        if not isinstance(message, dict):
-            raise ValueError("Each message must be an object")
+        message = _expect_object(message, "Each message must be an object")
         role = message.get("role")
         if role not in {"user", "assistant"}:
             raise ValueError(
@@ -137,8 +142,7 @@ def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
             assistant_text = ""
             assistant_tool_calls = []
             for block in content:
-                if not isinstance(block, dict):
-                    raise ValueError("messages[].content[] must be an object")
+                block = _expect_object(block, "messages[].content[] must be an object")
                 block_type = block.get("type")
                 if block_type == "text":
                     text = block.get("text")
@@ -169,8 +173,7 @@ def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
         # role == "user"
         current_user_text = ""
         for block in content:
-            if not isinstance(block, dict):
-                raise ValueError("messages[].content[] must be an object")
+            block = _expect_object(block, "messages[].content[] must be an object")
             block_type = block.get("type")
             if block_type == "text":
                 text = block.get("text")
@@ -197,8 +200,7 @@ def convert_anthropic_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
 
     out: List[Dict[str, Any]] = []
     for tool in tools:
-        if not isinstance(tool, dict):
-            raise ValueError("Each tool must be an object")
+        tool = _expect_object(tool, "Each tool must be an object")
         tool_type = tool.get("type")
         if tool_type not in (None, "custom"):
             raise ValueError(
@@ -219,7 +221,303 @@ def convert_anthropic_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
     return out
 
 
-# -- Generation loop and response formatting ---------------------------------
+def handle_anthropic_post(handler: Any) -> None:
+    """Handle POST /v1/messages using APIHandler primitives."""
+    success, decoded = load_json_body(handler)
+    if not success:
+        write_json_response(
+            handler,
+            status_code=400,
+            payload=error_payload(
+                f"Invalid JSON in request body: {decoded}",
+                "invalid_request_error",
+            ),
+        )
+        return
+    handler.body = decoded
+
+    if not isinstance(handler.body, dict):
+        write_json_response(
+            handler,
+            status_code=400,
+            payload=error_payload(
+                "Request body must be a JSON object",
+                "invalid_request_error",
+            ),
+        )
+        return
+
+    handler._parse_common_params()
+    handler.max_tokens = handler.body.get(
+        "max_tokens", handler.response_generator.cli_args.max_tokens
+    )
+
+    # Anthropic uses stop_sequences instead of stop.
+    stop_words = normalize_stop_words(handler.body.get("stop_sequences"))
+
+    handler.request_id = f"msg_{uuid.uuid4().hex}"
+
+    try:
+        request = CompletionRequest(
+            "chat",
+            "",
+            convert_anthropic_messages(handler.body),
+            convert_anthropic_tools(handler.body.get("tools")),
+            None,
+        )
+    except ValueError as e:
+        write_json_response(
+            handler,
+            status_code=400,
+            payload=error_payload(str(e), "invalid_request_error"),
+        )
+        return
+
+    args = handler._build_generation_args(stop_words)
+
+    def write_sse_event(event: str, data: Dict[str, Any]) -> None:
+        handler.wfile.write(f"event: {event}\n".encode())
+        handler.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
+        handler.wfile.flush()
+
+    def write_sse_ping() -> None:
+        try:
+            write_sse_event("ping", {"type": "ping"})
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    progress_callback = (
+        make_progress_callback(
+            handler.stream, lambda _processed_tokens, _total_tokens: write_sse_ping()
+        )
+        if handler.stream
+        else None
+    )
+
+    try:
+        ctx, response = handler.response_generator.generate(
+            request,
+            args,
+            progress_callback=progress_callback,
+        )
+    except Exception as e:
+        # NOTE: Existing OpenAI-compatible endpoints also use HTTP 404 here.
+        # Keeping this status avoids cross-endpoint behavior drift.
+        write_json_response(
+            handler,
+            status_code=404,
+            payload=error_payload(str(e), "api_error"),
+        )
+        return
+
+    if not handler.stream:
+        content_blocks: List[Dict[str, Any]] = []
+
+        def append_text(text_segment: str) -> None:
+            if not text_segment:
+                return
+            if content_blocks and content_blocks[-1].get("type") == "text":
+                content_blocks[-1]["text"] += text_segment
+            else:
+                content_blocks.append({"type": "text", "text": text_segment})
+
+        try:
+            result = run_generation_loop(
+                request=request,
+                ctx=ctx,
+                response=response,
+                stop_words=stop_words,
+                on_text_segment=append_text,
+                on_tool_use=lambda tu: content_blocks.append(tu),
+            )
+        except ValueError as e:
+            write_json_response(
+                handler,
+                status_code=400,
+                payload=error_payload(str(e), "invalid_request_error"),
+            )
+            return
+        except Exception:
+            logging.exception("Unexpected error in Anthropic completion")
+            write_json_response(
+                handler,
+                status_code=500,
+                payload=error_payload("Internal server error", "api_error"),
+            )
+            return
+
+        if not content_blocks:
+            content_blocks = [{"type": "text", "text": ""}]
+
+        out = build_response(
+            request_id=handler.request_id,
+            model=handler.requested_model,
+            finish_reason=result.finish_reason,
+            prompt_token_count=len(ctx.prompt),
+            completion_token_count=len(result.tokens),
+            stop_sequence=result.stop_sequence,
+            content_blocks=content_blocks,
+        )
+        write_json_response(
+            handler,
+            status_code=200,
+            payload=out,
+            headers={
+                "anthropic-version": "2023-06-01",
+                "request-id": handler.request_id,
+            },
+            flush=True,
+        )
+        return
+
+    handler.send_response(200)
+    handler.send_header("Content-type", "text/event-stream")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("anthropic-version", "2023-06-01")
+    handler.send_header("request-id", handler.request_id)
+    handler._set_cors_headers()
+    handler.end_headers()
+
+    write_sse_event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": handler.request_id,
+                "type": "message",
+                "role": "assistant",
+                "model": handler.requested_model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": len(ctx.prompt),
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            },
+        },
+    )
+
+    block_index = 0
+    text_block_open = False
+
+    def emit_text_segment(text_segment: str) -> None:
+        nonlocal text_block_open, block_index
+        if not text_segment:
+            return
+        if not text_block_open:
+            write_sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+            text_block_open = True
+        write_sse_event(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {"type": "text_delta", "text": text_segment},
+            },
+        )
+
+    def close_text_block() -> None:
+        nonlocal text_block_open, block_index
+        if text_block_open:
+            write_sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_index},
+            )
+            text_block_open = False
+            block_index += 1
+
+    def emit_tool_use_block(tool_use: Dict[str, Any]) -> None:
+        nonlocal block_index
+        partial_json = json.dumps(tool_use["input"], ensure_ascii=False)
+        write_sse_event(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_use["id"],
+                    "name": tool_use["name"],
+                    "input": {},
+                },
+            },
+        )
+        write_sse_event(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": partial_json,
+                },
+            },
+        )
+        write_sse_event(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": block_index},
+        )
+        block_index += 1
+
+    try:
+        result = run_generation_loop(
+            request=request,
+            ctx=ctx,
+            response=response,
+            stop_words=stop_words,
+            on_text_segment=emit_text_segment,
+            on_tool_use=emit_tool_use_block,
+            on_hidden_progress=write_sse_ping,
+            on_tool_call_start=close_text_block,
+        )
+    except ValueError as e:
+        try:
+            write_sse_event(
+                "error",
+                error_payload(str(e), "invalid_request_error"),
+            )
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        return
+    except Exception:
+        logging.exception("Unexpected error in Anthropic stream")
+        try:
+            write_sse_event(
+                "error", error_payload("Internal server error", "api_error")
+            )
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        return
+
+    close_text_block()
+
+    write_sse_event(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": anthropic_stop_reason(
+                    result.finish_reason, result.stop_sequence
+                ),
+                "stop_sequence": result.stop_sequence,
+            },
+            "usage": {"output_tokens": len(result.tokens)},
+        },
+    )
+    write_sse_event("message_stop", {"type": "message_stop"})
+
+
+# Generation loop and response formatting
 
 
 @dataclass
@@ -337,6 +635,7 @@ def run_generation_loop(
     Parallels handle_completion's token loop in server.py. They share most
     logic (stop checking, tool parsing, reasoning state) but diverge on
     output formatting.
+    TODO: fold both loops behind shared callbacks to avoid drift.
     """
     tokens: List[int] = []
     segment = ""
@@ -436,7 +735,7 @@ def run_generation_loop(
     )
 
 
-# -- Stop reason mapping -----------------------------------------------------
+# Stop reason mapping
 
 
 def anthropic_stop_reason(
@@ -451,7 +750,7 @@ def anthropic_stop_reason(
     return "end_turn"
 
 
-# -- Response builders -------------------------------------------------------
+# Response builders
 
 
 def build_response(

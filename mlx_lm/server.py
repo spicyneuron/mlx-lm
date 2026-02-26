@@ -42,6 +42,12 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
+from .server_common import (
+    load_json_body,
+    make_progress_callback,
+    normalize_stop_words,
+    write_json_response,
+)
 from .utils import load, sharded_load
 
 
@@ -1102,11 +1108,11 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         request_path = self._request_path()
 
-        # Anthropic Messages API is handled by a separate module.
-        if request_path == "/v1/messages":
-            from . import server_anthropic as anth
-
-            self._handle_anthropic_post(anth)
+        post_handlers = {
+            "/v1/messages": self._handle_messages_post,
+        }
+        if request_path in post_handlers:
+            post_handlers[request_path]()
             return
 
         request_factories = {
@@ -1122,18 +1128,15 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # Fetch and parse request body
-        content_length = int(self.headers["Content-Length"])
-        raw_body = self.rfile.read(content_length)
-        try:
-            self.body = json.loads(raw_body.decode())
-        except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+        success, decoded = load_json_body(self)
+        if not success:
+            write_json_response(
+                self,
+                status_code=400,
+                payload={"error": f"Invalid JSON in request body: {decoded}"},
             )
             return
+        self.body = decoded
 
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
@@ -1152,324 +1155,32 @@ class APIHandler(BaseHTTPRequestHandler):
         self.validate_model_parameters()
 
         # Get stop sequences
-        stop_words = self.body.get("stop")
-        stop_words = stop_words or []
-        stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
+        stop_words = normalize_stop_words(self.body.get("stop"))
 
         # Create the completion request
         request = request_factories[request_path]()
         self.handle_completion(request, stop_words)
 
     def _handle_anthropic_post(self, anth):
-        """Handle POST /v1/messages using the server_anthropic module."""
-        content_length = int(self.headers["Content-Length"])
-        raw_body = self.rfile.read(content_length)
-        try:
-            self.body = json.loads(raw_body.decode())
-        except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps(
-                    anth.error_payload(
-                        f"Invalid JSON in request body: {e}",
-                        "invalid_request_error",
-                    )
-                ).encode()
-            )
-            return
+        """Handle POST /v1/messages via server_anthropic."""
+        anth.handle_anthropic_post(self)
 
-        if not isinstance(self.body, dict):
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps(
-                    anth.error_payload(
-                        "Request body must be a JSON object",
-                        "invalid_request_error",
-                    )
-                ).encode()
-            )
-            return
-
-        self._parse_common_params()
-        self.max_tokens = self.body.get(
-            "max_tokens", self.response_generator.cli_args.max_tokens
-        )
-
-        # Anthropic uses stop_sequences instead of stop
-        stop_words = self.body.get("stop_sequences") or []
-        if isinstance(stop_words, str):
-            stop_words = [stop_words]
-
-        self.request_id = f"msg_{uuid.uuid4().hex}"
-        self.object_type = "message"
+    def _handle_messages_post(self):
+        from . import server_anthropic as anth
 
         try:
-            request = CompletionRequest(
-                "chat",
-                "",
-                anth.convert_anthropic_messages(self.body),
-                anth.convert_anthropic_tools(self.body.get("tools")),
-                None,
-            )
-        except ValueError as e:
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps(
-                    anth.error_payload(str(e), "invalid_request_error")
-                ).encode()
-            )
-            return
-
-        args = self._build_generation_args(stop_words)
-
-        # SSE helper closures
-        def write_sse_event(event, data):
-            self.wfile.write(f"event: {event}\n".encode())
-            self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
-            self.wfile.flush()
-
-        def write_sse_ping():
-            try:
-                write_sse_event("ping", {"type": "ping"})
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
-
-        def keepalive_callback(processed_tokens, total_tokens):
-            logging.info(
-                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
-            )
-            if self.stream:
-                write_sse_ping()
-
-        try:
-            ctx, response = self.response_generator.generate(
-                request,
-                args,
-                progress_callback=keepalive_callback if self.stream else None,
-            )
-        except Exception as e:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps(anth.error_payload(str(e), "api_error")).encode()
-            )
-            return
-
-        # Non-streaming response
-        if not self.stream:
-            content_blocks = []
-
-            def append_text(text_segment):
-                if not text_segment:
-                    return
-                if content_blocks and content_blocks[-1].get("type") == "text":
-                    content_blocks[-1]["text"] += text_segment
-                else:
-                    content_blocks.append({"type": "text", "text": text_segment})
-
-            try:
-                result = anth.run_generation_loop(
-                    request=request,
-                    ctx=ctx,
-                    response=response,
-                    stop_words=stop_words,
-                    on_text_segment=append_text,
-                    on_tool_use=lambda tu: content_blocks.append(tu),
-                )
-            except ValueError as e:
-                self._set_completion_headers(400)
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps(
-                        anth.error_payload(str(e), "invalid_request_error")
-                    ).encode()
-                )
-                return
-            except Exception:
-                logging.exception("Unexpected error in Anthropic completion")
-                self._set_completion_headers(500)
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps(
-                        anth.error_payload("Internal server error", "api_error")
-                    ).encode()
-                )
-                return
-
-            if not content_blocks:
-                content_blocks = [{"type": "text", "text": ""}]
-
-            out = anth.build_response(
-                request_id=self.request_id,
-                model=self.requested_model,
-                finish_reason=result.finish_reason,
-                prompt_token_count=len(ctx.prompt),
-                completion_token_count=len(result.tokens),
-                stop_sequence=result.stop_sequence,
-                content_blocks=content_blocks,
-            )
-            response_json = json.dumps(out).encode()
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.send_header("anthropic-version", "2023-06-01")
-            self.send_header("request-id", self.request_id)
-            self.send_header("Content-Length", str(len(response_json)))
-            self._set_cors_headers()
-            self.end_headers()
-            self.wfile.write(response_json)
-            self.wfile.flush()
-            return
-
-        # Streaming response
-        self.send_response(200)
-        self.send_header("Content-type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("anthropic-version", "2023-06-01")
-        self.send_header("request-id", self.request_id)
-        self._set_cors_headers()
-        self.end_headers()
-
-        write_sse_event(
-            "message_start",
-            {
-                "type": "message_start",
-                "message": {
-                    "id": self.request_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": self.requested_model,
-                    "content": [],
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {
-                        "input_tokens": len(ctx.prompt),
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "output_tokens": 0,
-                    },
-                },
-            },
-        )
-
-        block_index = 0
-        text_block_open = False
-
-        def emit_text_segment(text_segment):
-            nonlocal text_block_open, block_index
-            if not text_segment:
-                return
-            if not text_block_open:
-                write_sse_event(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-                text_block_open = True
-            write_sse_event(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {"type": "text_delta", "text": text_segment},
-                },
-            )
-
-        def close_text_block():
-            nonlocal text_block_open, block_index
-            if text_block_open:
-                write_sse_event(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": block_index},
-                )
-                text_block_open = False
-                block_index += 1
-
-        def emit_tool_use_block(tool_use):
-            nonlocal block_index
-            partial_json = json.dumps(tool_use["input"], ensure_ascii=False)
-            write_sse_event(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": tool_use["id"],
-                        "name": tool_use["name"],
-                        "input": {},
-                    },
-                },
-            )
-            write_sse_event(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": partial_json,
-                    },
-                },
-            )
-            write_sse_event(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": block_index},
-            )
-            block_index += 1
-
-        try:
-            result = anth.run_generation_loop(
-                request=request,
-                ctx=ctx,
-                response=response,
-                stop_words=stop_words,
-                on_text_segment=emit_text_segment,
-                on_tool_use=emit_tool_use_block,
-                on_hidden_progress=write_sse_ping,
-                on_tool_call_start=close_text_block,
-            )
-        except ValueError as e:
-            try:
-                write_sse_event(
-                    "error",
-                    anth.error_payload(str(e), "invalid_request_error"),
-                )
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
-            return
+            self._handle_anthropic_post(anth)
         except Exception:
-            logging.exception("Unexpected error in Anthropic stream")
+            logging.exception("Unexpected error in Anthropic messages handler")
             try:
-                write_sse_event(
-                    "error", anth.error_payload("Internal server error", "api_error")
+                write_json_response(
+                    self,
+                    status_code=500,
+                    payload=anth.error_payload("Internal server error", "api_error"),
+                    flush=True,
                 )
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
-            return
-
-        close_text_block()
-
-        write_sse_event(
-            "message_delta",
-            {
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": anth.anthropic_stop_reason(
-                        result.finish_reason, result.stop_sequence
-                    ),
-                    "stop_sequence": result.stop_sequence,
-                },
-                "usage": {"output_tokens": len(result.tokens)},
-            },
-        )
-        write_sse_event("message_stop", {"type": "message_stop"})
 
     def _parse_common_params(self):
         """Extract generation parameters shared across API formats from self.body."""
@@ -1713,21 +1424,20 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         args = self._build_generation_args(stop_words)
 
-        # Create keepalive callback to send SSE comments during long prompt processing
-        def keepalive_callback(processed_tokens, total_tokens):
-            logging.info(
-                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
-            )
-            if self.stream:
-                try:
-                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
-                    self.wfile.write(
-                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                    )
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    # Client disconnected, ignore
-                    pass
+        def write_keepalive_comment(processed_tokens, total_tokens):
+            try:
+                # Send SSE comment for keepalive - invisible to clients but keeps connection alive
+                self.wfile.write(
+                    f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                )
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # Client disconnected, ignore
+                pass
+
+        keepalive_callback = make_progress_callback(
+            self.stream, write_keepalive_comment
+        )
 
         # Create the token generator
         try:
