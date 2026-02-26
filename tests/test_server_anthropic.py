@@ -493,7 +493,7 @@ class TestAnthropicServer(unittest.TestCase):
         )
 
     def test_convert_anthropic_messages_with_tool_blocks(self):
-        from mlx_lm.server import convert_anthropic_messages
+        from mlx_lm.server_anthropic import convert_anthropic_messages
 
         converted = convert_anthropic_messages(
             {
@@ -537,7 +537,7 @@ class TestAnthropicServer(unittest.TestCase):
         self.assertEqual(converted[2]["content"], "72F")
 
     def test_convert_anthropic_messages_tool_use_only_assistant(self):
-        from mlx_lm.server import convert_anthropic_messages
+        from mlx_lm.server_anthropic import convert_anthropic_messages
 
         converted = convert_anthropic_messages(
             {
@@ -574,7 +574,7 @@ class TestAnthropicServer(unittest.TestCase):
         self.assertEqual(converted[1]["tool_calls"][0]["id"], "toolu_1")
 
     def test_convert_anthropic_messages_tool_result_is_error(self):
-        from mlx_lm.server import convert_anthropic_messages
+        from mlx_lm.server_anthropic import convert_anthropic_messages
 
         converted = convert_anthropic_messages(
             {
@@ -613,7 +613,7 @@ class TestAnthropicServer(unittest.TestCase):
         self.assertTrue(converted[2]["is_error"])
 
     def test_convert_anthropic_messages_with_system_string(self):
-        from mlx_lm.server import convert_anthropic_messages
+        from mlx_lm.server_anthropic import convert_anthropic_messages
 
         converted = convert_anthropic_messages(
             {
@@ -626,7 +626,7 @@ class TestAnthropicServer(unittest.TestCase):
         self.assertEqual(converted[1], {"role": "user", "content": "Hello"})
 
     def test_convert_anthropic_messages_merges_adjacent_user_messages(self):
-        from mlx_lm.server import convert_anthropic_messages
+        from mlx_lm.server_anthropic import convert_anthropic_messages
 
         converted = convert_anthropic_messages(
             {
@@ -647,7 +647,7 @@ class TestAnthropicServer(unittest.TestCase):
         )
 
     def test_convert_anthropic_messages_interleaved_tool_result_and_text(self):
-        from mlx_lm.server import convert_anthropic_messages
+        from mlx_lm.server_anthropic import convert_anthropic_messages
 
         converted = convert_anthropic_messages(
             {
@@ -686,7 +686,7 @@ class TestAnthropicServer(unittest.TestCase):
         )
 
     def test_convert_anthropic_messages_multi_turn_text(self):
-        from mlx_lm.server import convert_anthropic_messages
+        from mlx_lm.server_anthropic import convert_anthropic_messages
 
         converted = convert_anthropic_messages(
             {
@@ -708,7 +708,7 @@ class TestAnthropicServer(unittest.TestCase):
         )
 
     def test_convert_anthropic_tools(self):
-        from mlx_lm.server import convert_anthropic_tools
+        from mlx_lm.server_anthropic import convert_anthropic_tools
 
         converted = convert_anthropic_tools(
             [
@@ -728,17 +728,17 @@ class TestAnthropicServer(unittest.TestCase):
         self.assertIn("parameters", converted[0]["function"])
 
     def test_convert_anthropic_tools_none(self):
-        from mlx_lm.server import convert_anthropic_tools
+        from mlx_lm.server_anthropic import convert_anthropic_tools
 
         self.assertIsNone(convert_anthropic_tools(None))
 
     def test_convert_anthropic_tools_empty_list(self):
-        from mlx_lm.server import convert_anthropic_tools
+        from mlx_lm.server_anthropic import convert_anthropic_tools
 
         self.assertEqual(convert_anthropic_tools([]), [])
 
     def test_convert_anthropic_tools_rejects_unsupported_type(self):
-        from mlx_lm.server import convert_anthropic_tools
+        from mlx_lm.server_anthropic import convert_anthropic_tools
 
         with self.assertRaisesRegex(ValueError, "Unsupported tool type"):
             convert_anthropic_tools(
@@ -1184,7 +1184,7 @@ class TestAnthropicServer(unittest.TestCase):
         )
 
     def test_convert_anthropic_tools_accepts_custom_type(self):
-        from mlx_lm.server import convert_anthropic_tools
+        from mlx_lm.server_anthropic import convert_anthropic_tools
 
         converted = convert_anthropic_tools(
             [
@@ -1304,7 +1304,7 @@ class TestAnthropicServer(unittest.TestCase):
         ][-1]
         self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
     def test_trim_visible_stop_text(self):
-        from mlx_lm.server import _trim_visible_stop_text
+        from mlx_lm.server_anthropic import _trim_visible_stop_text
 
         self.assertEqual(_trim_visible_stop_text("hello STOP", "STOP", 4), "hello ")
         self.assertEqual(_trim_visible_stop_text("hello", "STOP", 4), "hello")

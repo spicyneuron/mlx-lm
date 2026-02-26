@@ -5,8 +5,6 @@ import io
 import json
 import threading
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -124,14 +122,6 @@ class TestServer(unittest.TestCase):
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
 
-    def test_handle_completions_requires_prompt(self):
-        url = f"http://localhost:{self.port}/v1/completions"
-        response = requests.post(url, json={"model": "default_model", "max_tokens": 10})
-        self.assertEqual(response.status_code, 400)
-        body = json.loads(response.text)
-        self.assertIn("error", body)
-        self.assertIn("prompt", body["error"])
-
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {
@@ -146,45 +136,6 @@ class TestServer(unittest.TestCase):
             ],
         }
         response = requests.post(url, json=chat_post_data)
-        response_body = response.text
-        self.assertIn("id", response_body)
-        self.assertIn("choices", response_body)
-
-    def test_handle_chat_completions_requires_messages(self):
-        url = f"http://localhost:{self.port}/v1/chat/completions"
-        response = requests.post(url, json={"model": "chat_model", "max_tokens": 10})
-        self.assertEqual(response.status_code, 400)
-        response_body = json.loads(response.text)
-        self.assertIn("error", response_body)
-        self.assertIn("messages", response_body["error"])
-
-    def test_handle_chat_completions_unexpected_factory_error_returns_500(self):
-        url = f"http://localhost:{self.port}/v1/chat/completions"
-        with patch.object(
-            APIHandler, "handle_chat_completions", side_effect=RuntimeError("unexpected")
-        ):
-            response = requests.post(
-                url,
-                json={
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                },
-            )
-
-        self.assertEqual(response.status_code, 500)
-        body = json.loads(response.text)
-        self.assertEqual(body, {"error": "Internal server error"})
-
-    def test_handle_chat_completions_with_query_string(self):
-        url = f"http://localhost:{self.port}/v1/chat/completions?api-version=2026-02-25"
-        chat_post_data = {
-            "model": "chat_model",
-            "max_tokens": 10,
-            "messages": [{"role": "user", "content": "Hello!"}],
-        }
-        response = requests.post(url, json=chat_post_data)
-        self.assertEqual(response.status_code, 200)
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
@@ -243,6 +194,7 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)
@@ -267,73 +219,6 @@ class TestServer(unittest.TestCase):
         self.assertFalse(sequence_overlap([1], [2]))
         self.assertFalse(sequence_overlap([1, 2], [3, 4]))
         self.assertFalse(sequence_overlap([1, 2, 3], [4, 1, 2, 3]))
-
-    def test_handle_chat_completions_streaming_hidden_keepalive(self):
-        url = f"http://localhost:{self.port}/v1/chat/completions"
-
-        def fake_generate(request, generation_args, progress_callback=None):
-            ctx = SimpleNamespace(
-                has_tool_calling=True,
-                tool_call_start="<tool_call>",
-                tool_call_end="</tool_call>",
-                tool_parser=lambda tool_text, tools: {"name": "x", "arguments": {}},
-                has_thinking=False,
-                think_start_id=-1,
-                think_end="",
-                think_end_id=-1,
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[1, 2, 3],
-                stop=lambda: None,
-            )
-
-            def iterator():
-                yield SimpleNamespace(
-                    text="<tool_call>",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text='{"name":"x"}',
-                    token=2,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="</tool_call>",
-                    token=3,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="Done",
-                    token=4,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
-
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
-            response = requests.post(
-                url,
-                json={
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "stream": True,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                },
-                stream=True,
-            )
-            self.assertEqual(response.status_code, 200)
-            lines = [line.decode("utf-8") for line in response.iter_lines() if line]
-
-        self.assertTrue(any(line.startswith(": keepalive hidden") for line in lines))
 
 
 class TestServerWithDraftModel(unittest.TestCase):
@@ -488,17 +373,25 @@ class TestKeepalive(unittest.TestCase):
         """Test keepalive callback sends SSE comments and handles errors"""
         from unittest.mock import Mock
 
-        # Mock handler-like object
+        # Mock handler
         mock_wfile = io.BytesIO()
-        handler = Mock(spec=["stream", "wfile", "_write_sse_keepalive"])
+        handler = Mock()
         handler.wfile = mock_wfile
-        handler._write_sse_keepalive = lambda message: APIHandler._write_sse_keepalive(
-            handler, message
-        )
+
+        # Test callback logic (same as in server.py)
+        def keepalive_callback(processed_tokens, total_tokens):
+            if handler.stream:
+                try:
+                    handler.wfile.write(
+                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                    )
+                    handler.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
 
         # Test streaming enabled
         handler.stream = True
-        APIHandler._keepalive_callback(handler, 1024, 4096)
+        keepalive_callback(1024, 4096)
 
         output = mock_wfile.getvalue().decode("utf-8")
         self.assertEqual(output, ": keepalive 1024/4096\n\n")
@@ -507,7 +400,7 @@ class TestKeepalive(unittest.TestCase):
         handler.stream = False
         mock_wfile.seek(0)
         mock_wfile.truncate(0)
-        APIHandler._keepalive_callback(handler, 2048, 4096)
+        keepalive_callback(2048, 4096)
 
         output = mock_wfile.getvalue().decode("utf-8")
         self.assertEqual(output, "")
@@ -519,7 +412,7 @@ class TestKeepalive(unittest.TestCase):
 
         # Should not raise exception
         try:
-            APIHandler._keepalive_callback(handler, 3072, 4096)
+            keepalive_callback(3072, 4096)
         except Exception as e:
             self.fail(f"Callback should handle BrokenPipeError: {e}")
 

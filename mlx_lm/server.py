@@ -183,244 +183,6 @@ def process_message_content(messages):
                         func["arguments"] = json.loads(args)
 
 
-def _content_to_text(content, *, field_name: str) -> str:
-    if isinstance(content, str):
-        return content
-    if content is None:
-        return ""
-    if isinstance(content, list):
-        text_fragments = []
-        for fragment in content:
-            if not isinstance(fragment, dict):
-                raise ValueError(
-                    f"Expected {field_name} content blocks to be objects."
-                )
-            if fragment.get("type") != "text":
-                raise ValueError(
-                    f"Only 'text' content type is supported in {field_name}."
-                )
-            text = fragment.get("text")
-            if not isinstance(text, str):
-                raise ValueError(
-                    f"text block is missing a valid `text` field in {field_name}."
-                )
-            text_fragments.append(text)
-        return "".join(text_fragments)
-    raise ValueError(
-        f"Expected {field_name} to be a string or list of text blocks, got {type(content)}."
-    )
-
-
-def _append_merged_text_message(
-    out: List[Dict[str, Any]], role: str, content: str
-) -> None:
-    if not content:
-        return
-    if out and out[-1].get("role") == role and "tool_calls" not in out[-1]:
-        out[-1]["content"] += content
-    else:
-        out.append({"role": role, "content": content})
-
-
-def _anthropic_tool_use_to_openai_tool_call(block: Dict[str, Any]) -> Dict[str, Any]:
-    name = block.get("name")
-    if not isinstance(name, str):
-        raise ValueError("tool_use block is missing a valid `name`.")
-    tool_input = block.get("input", {})
-    if not isinstance(tool_input, dict):
-        raise ValueError("tool_use block `input` must be an object.")
-    tool_use_id = block.get("id")
-    if tool_use_id is not None and not isinstance(tool_use_id, str):
-        raise ValueError("tool_use block `id` must be a string.")
-    return {
-        "id": tool_use_id or f"toolu_{uuid.uuid4().hex}",
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": json.dumps(tool_input, ensure_ascii=False),
-        },
-    }
-
-
-def _anthropic_tool_result_to_openai_tool_message(
-    block: Dict[str, Any],
-) -> Dict[str, Any]:
-    tool_use_id = block.get("tool_use_id")
-    if not isinstance(tool_use_id, str):
-        raise ValueError("tool_result block is missing a valid `tool_use_id`.")
-    is_error = block.get("is_error")
-    if is_error is not None and not isinstance(is_error, bool):
-        raise ValueError("tool_result block `is_error` must be a boolean.")
-
-    out = {
-        "role": "tool",
-        "tool_call_id": tool_use_id,
-        "content": _content_to_text(
-            block.get("content"), field_name="tool_result.content"
-        ),
-    }
-    if isinstance(is_error, bool):
-        out["is_error"] = is_error
-    return out
-
-
-def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
-    system = body.get("system")
-    messages = body.get("messages")
-    if not isinstance(messages, list):
-        raise ValueError("messages must be a list")
-
-    out: List[Dict[str, Any]] = []
-    if system is not None:
-        out.append(
-            {
-                "role": "system",
-                "content": _content_to_text(system, field_name="system"),
-            }
-        )
-
-    for message in messages:
-        if not isinstance(message, dict):
-            raise ValueError("Each message must be an object")
-        role = message.get("role")
-        if role not in {"user", "assistant"}:
-            raise ValueError(
-                f"Unsupported role `{role}`. Anthropic messages support only `user` and `assistant`."
-            )
-
-        content = message.get("content")
-        if isinstance(content, str) or content is None:
-            _append_merged_text_message(
-                out,
-                role,
-                _content_to_text(content, field_name="messages[].content"),
-            )
-            continue
-        if not isinstance(content, list):
-            raise ValueError("messages[].content must be a string or list")
-
-        if role == "assistant":
-            assistant_text = ""
-            assistant_tool_calls = []
-            for block in content:
-                if not isinstance(block, dict):
-                    raise ValueError("messages[].content[] must be an object")
-                block_type = block.get("type")
-                if block_type == "text":
-                    text = block.get("text")
-                    if not isinstance(text, str):
-                        raise ValueError("text block is missing a valid `text` field.")
-                    assistant_text += text
-                elif block_type == "tool_use":
-                    assistant_tool_calls.append(
-                        _anthropic_tool_use_to_openai_tool_call(block)
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported content block type `{block_type}` for assistant message."
-                    )
-
-            if assistant_tool_calls:
-                out.append(
-                    {
-                        "role": "assistant",
-                        "content": assistant_text,
-                        "tool_calls": assistant_tool_calls,
-                    }
-                )
-            else:
-                _append_merged_text_message(out, "assistant", assistant_text)
-            continue
-
-        # role == "user"
-        current_user_text = ""
-        for block in content:
-            if not isinstance(block, dict):
-                raise ValueError("messages[].content[] must be an object")
-            block_type = block.get("type")
-            if block_type == "text":
-                text = block.get("text")
-                if not isinstance(text, str):
-                    raise ValueError("text block is missing a valid `text` field.")
-                current_user_text += text
-            elif block_type == "tool_result":
-                _append_merged_text_message(out, "user", current_user_text)
-                current_user_text = ""
-                out.append(_anthropic_tool_result_to_openai_tool_message(block))
-            else:
-                raise ValueError(
-                    f"Unsupported content block type `{block_type}` for user message."
-                )
-        _append_merged_text_message(out, "user", current_user_text)
-    return out
-
-
-def convert_anthropic_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
-    if tools is None:
-        return None
-    if not isinstance(tools, list):
-        raise ValueError("tools must be a list")
-
-    out: List[Dict[str, Any]] = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            raise ValueError("Each tool must be an object")
-        tool_type = tool.get("type")
-        if tool_type not in (None, "custom"):
-            raise ValueError(
-                f"Unsupported tool type `{tool_type}`. Only client tools are supported."
-            )
-        name = tool.get("name")
-        if not isinstance(name, str):
-            raise ValueError("Tool `name` must be a string.")
-        input_schema = tool.get("input_schema", {"type": "object", "properties": {}})
-        if not isinstance(input_schema, dict):
-            raise ValueError("Tool `input_schema` must be an object.")
-
-        function: Dict[str, Any] = {"name": name, "parameters": input_schema}
-        if isinstance(tool.get("description"), str):
-            function["description"] = tool["description"]
-        out.append({"type": "function", "function": function})
-
-    return out
-
-
-@dataclass
-class AnthropicTextState:
-    in_reasoning: bool
-    in_tool_call: bool = False
-
-
-@dataclass
-class AnthropicGenerationResult:
-    tokens: List[int]
-    finish_reason: str
-    stop_sequence: Optional[str]
-    has_tool_use: bool
-
-
-def _make_anthropic_text_state(ctx: Any) -> AnthropicTextState:
-    in_reasoning = False
-    if ctx.has_thinking:
-        for i in range(len(ctx.prompt) - 1, -1, -1):
-            if ctx.prompt[i] == ctx.think_end_id:
-                break
-            elif ctx.prompt[i] == ctx.think_start_id:
-                in_reasoning = True
-                break
-    return AnthropicTextState(in_reasoning=in_reasoning)
-
-
-def _trim_visible_stop_text(
-    text: str, stop_sequence: Optional[str], trim_text_length: int
-) -> str:
-    if trim_text_length <= 0 or not stop_sequence:
-        return text
-    if not text.endswith(stop_sequence):
-        return text
-    return text[: max(0, len(text) - trim_text_length)]
-
-
 class LRUPromptCache:
 
     @dataclass
@@ -1322,22 +1084,12 @@ class APIHandler(BaseHTTPRequestHandler):
     def _set_completion_headers(self, status_code: int = 200):
         self.send_response(status_code)
         self.send_header("Content-type", "application/json")
-        if self._request_path() == "/v1/messages":
-            self.send_header("anthropic-version", "2023-06-01")
-        request_id = getattr(self, "request_id", None)
-        if request_id:
-            self.send_header("request-id", request_id)
         self._set_cors_headers()
 
     def _set_stream_headers(self, status_code: int = 200):
         self.send_response(status_code)
         self.send_header("Content-type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        if self._request_path() == "/v1/messages":
-            self.send_header("anthropic-version", "2023-06-01")
-        request_id = getattr(self, "request_id", None)
-        if request_id:
-            self.send_header("request-id", request_id)
         self._set_cors_headers()
 
     def do_OPTIONS(self):
@@ -1349,11 +1101,18 @@ class APIHandler(BaseHTTPRequestHandler):
         Respond to a POST request from a client.
         """
         request_path = self._request_path()
+
+        # Anthropic Messages API is handled by a separate module.
+        if request_path == "/v1/messages":
+            from . import server_anthropic as anth
+
+            self._handle_anthropic_post(anth)
+            return
+
         request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
-            "/v1/messages": self.handle_anthropic_messages,
         }
 
         if request_path not in request_factories:
@@ -1368,32 +1127,29 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             self.body = json.loads(raw_body.decode())
         except json.JSONDecodeError as e:
-            logging.error("JSONDecodeError: %s - Raw body: %s", e, raw_body.decode())
-            self._write_json_error(
-                400,
-                f"Invalid JSON in request body: {e}",
-                anthropic_error_type="invalid_request_error",
+            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
             )
             return
 
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
-        if not isinstance(self.body, dict):
-            self._write_json_error(400, "Request body must be a JSON object")
-            return
+        assert isinstance(
+            self.body, dict
+        ), f"Request should be dict, but got {type(self.body)}"
 
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
-        # Keep request defaults aligned across OpenAI and Anthropic endpoints.
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
         )
         self.adapter = self.body.get("adapters", None)
-        # Anthropic API requires max_tokens; we intentionally fall through to
-        # the CLI default so local callers aren't forced to send it.
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
             self.max_tokens = self.body.get(
@@ -1417,31 +1173,372 @@ class APIHandler(BaseHTTPRequestHandler):
         self.validate_model_parameters()
 
         # Get stop sequences
-        stop_words = (
-            self.body.get("stop_sequences")
-            if request_path == "/v1/messages"
-            else self.body.get("stop")
-        )
+        stop_words = self.body.get("stop")
         stop_words = stop_words or []
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
+        request = request_factories[request_path]()
+        self.handle_completion(request, stop_words)
+
+    def _handle_anthropic_post(self, anth):
+        """Handle POST /v1/messages using the server_anthropic module."""
+        content_length = int(self.headers["Content-Length"])
+        raw_body = self.rfile.read(content_length)
         try:
-            request = request_factories[request_path]()
+            self.body = json.loads(raw_body.decode())
+        except json.JSONDecodeError as e:
+            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    anth.error_payload(
+                        f"Invalid JSON in request body: {e}",
+                        "invalid_request_error",
+                    )
+                ).encode()
+            )
+            return
+
+        if not isinstance(self.body, dict):
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    anth.error_payload(
+                        "Request body must be a JSON object",
+                        "invalid_request_error",
+                    )
+                ).encode()
+            )
+            return
+
+        # Shared parameter extraction
+        self.stream = self.body.get("stream", False)
+        self.requested_model = self.body.get("model", "default_model")
+        self.requested_draft_model = self.body.get("draft_model", "default_model")
+        self.num_draft_tokens = self.body.get(
+            "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
+        )
+        self.adapter = self.body.get("adapters", None)
+        self.max_tokens = self.body.get(
+            "max_tokens", self.response_generator.cli_args.max_tokens
+        )
+        self.temperature = self.body.get(
+            "temperature", self.response_generator.cli_args.temp
+        )
+        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
+        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
+        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
+        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
+        self.repetition_context_size = self.body.get("repetition_context_size", 20)
+        self.xtc_probability = self.body.get("xtc_probability", 0.0)
+        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
+        self.logit_bias = self.body.get("logit_bias", None)
+        self.logprobs = self.body.get("logprobs", False)
+        self.top_logprobs = self.body.get("top_logprobs", -1)
+        self.seed = self.body.get("seed", None)
+        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+
+        # Anthropic uses stop_sequences instead of stop
+        stop_words = self.body.get("stop_sequences") or []
+        if isinstance(stop_words, str):
+            stop_words = [stop_words]
+
+        self.request_id = f"msg_{uuid.uuid4().hex}"
+        self.object_type = "message"
+
+        try:
+            request = CompletionRequest(
+                "chat",
+                "",
+                anth.convert_anthropic_messages(self.body),
+                anth.convert_anthropic_tools(self.body.get("tools")),
+                None,
+            )
         except ValueError as e:
-            self._write_json_error(400, str(e))
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    anth.error_payload(str(e), "invalid_request_error")
+                ).encode()
+            )
+            return
+
+        args = GenerationArguments(
+            model=ModelDescription(
+                model=self.requested_model,
+                draft=self.requested_draft_model,
+                adapter=self.adapter,
+            ),
+            sampling=SamplingArguments(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                xtc_probability=self.xtc_probability,
+                xtc_threshold=self.xtc_threshold,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+            ),
+            stop_words=stop_words,
+            max_tokens=self.max_tokens,
+            num_draft_tokens=self.num_draft_tokens,
+            logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
+            seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
+
+        # SSE helper closures
+        def write_sse_event(event, data):
+            self.wfile.write(f"event: {event}\n".encode())
+            self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
+            self.wfile.flush()
+
+        def write_sse_ping():
+            try:
+                write_sse_event("ping", {"type": "ping"})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def keepalive_callback(processed_tokens, total_tokens):
+            logging.info(
+                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
+            )
+            if self.stream:
+                write_sse_ping()
+
+        try:
+            ctx, response = self.response_generator.generate(
+                request,
+                args,
+                progress_callback=keepalive_callback if self.stream else None,
+            )
+        except Exception as e:
+            self._set_completion_headers(404)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(anth.error_payload(str(e), "api_error")).encode()
+            )
+            return
+
+        # Non-streaming response
+        if not self.stream:
+            content_blocks = []
+
+            def append_text(text_segment):
+                if not text_segment:
+                    return
+                if content_blocks and content_blocks[-1].get("type") == "text":
+                    content_blocks[-1]["text"] += text_segment
+                else:
+                    content_blocks.append({"type": "text", "text": text_segment})
+
+            try:
+                result = anth.run_generation_loop(
+                    request=request,
+                    ctx=ctx,
+                    response=response,
+                    stop_words=stop_words,
+                    on_text_segment=append_text,
+                    on_tool_use=lambda tu: content_blocks.append(tu),
+                )
+            except ValueError as e:
+                self._set_completion_headers(400)
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        anth.error_payload(str(e), "invalid_request_error")
+                    ).encode()
+                )
+                return
+            except Exception:
+                logging.exception("Unexpected error in Anthropic completion")
+                self._set_completion_headers(500)
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        anth.error_payload("Internal server error", "api_error")
+                    ).encode()
+                )
+                return
+
+            if not content_blocks:
+                content_blocks = [{"type": "text", "text": ""}]
+
+            out = anth.build_response(
+                request_id=self.request_id,
+                model=self.requested_model,
+                finish_reason=result.finish_reason,
+                prompt_token_count=len(ctx.prompt),
+                completion_token_count=len(result.tokens),
+                stop_sequence=result.stop_sequence,
+                content_blocks=content_blocks,
+            )
+            response_json = json.dumps(out).encode()
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("anthropic-version", "2023-06-01")
+            self.send_header("request-id", self.request_id)
+            self.send_header("Content-Length", str(len(response_json)))
+            self._set_cors_headers()
+            self.end_headers()
+            self.wfile.write(response_json)
+            self.wfile.flush()
+            return
+
+        # Streaming response
+        self.send_response(200)
+        self.send_header("Content-type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("anthropic-version", "2023-06-01")
+        self.send_header("request-id", self.request_id)
+        self._set_cors_headers()
+        self.end_headers()
+
+        write_sse_event(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": self.request_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.requested_model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": len(ctx.prompt),
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                },
+            },
+        )
+
+        block_index = 0
+        text_block_open = False
+
+        def emit_text_segment(text_segment):
+            nonlocal text_block_open, block_index
+            if not text_segment:
+                return
+            if not text_block_open:
+                write_sse_event(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
+                text_block_open = True
+            write_sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text_segment},
+                },
+            )
+
+        def close_text_block():
+            nonlocal text_block_open, block_index
+            if text_block_open:
+                write_sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block_index},
+                )
+                text_block_open = False
+                block_index += 1
+
+        def emit_tool_use_block(tool_use):
+            nonlocal block_index
+            partial_json = json.dumps(tool_use["input"], ensure_ascii=False)
+            write_sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_use["id"],
+                        "name": tool_use["name"],
+                        "input": {},
+                    },
+                },
+            )
+            write_sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": partial_json,
+                    },
+                },
+            )
+            write_sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": block_index},
+            )
+            block_index += 1
+
+        try:
+            result = anth.run_generation_loop(
+                request=request,
+                ctx=ctx,
+                response=response,
+                stop_words=stop_words,
+                on_text_segment=emit_text_segment,
+                on_tool_use=emit_tool_use_block,
+                on_hidden_progress=write_sse_ping,
+                on_tool_call_start=close_text_block,
+            )
+        except ValueError as e:
+            try:
+                write_sse_event(
+                    "error",
+                    anth.error_payload(str(e), "invalid_request_error"),
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
         except Exception:
-            logging.exception("Unexpected error while constructing completion request")
-            self._write_json_error(500, "Internal server error")
+            logging.exception("Unexpected error in Anthropic stream")
+            try:
+                write_sse_event(
+                    "error", anth.error_payload("Internal server error", "api_error")
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
-        if request_path == "/v1/messages":
-            if self.stream:
-                self.handle_anthropic_streaming_completion(request, stop_words)
-                return
-            self.handle_anthropic_completion(request, stop_words)
-        else:
-            self.handle_completion(request, stop_words)
+
+        close_text_block()
+
+        write_sse_event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": anth.anthropic_stop_reason(
+                        result.finish_reason, result.stop_sequence
+                    ),
+                    "stop_sequence": result.stop_sequence,
+                },
+                "usage": {"output_tokens": len(result.tokens)},
+            },
+        )
+        write_sse_event("message_stop", {"type": "message_stop"})
 
     def validate_model_parameters(self):
         """
@@ -1511,35 +1608,6 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("adapter must be a string")
         if self.seed is not None and not isinstance(self.seed, int):
             raise ValueError("seed must be an integer")
-
-    def _make_generation_args(self, stop_words: List[str]) -> GenerationArguments:
-        return GenerationArguments(
-            model=ModelDescription(
-                model=self.requested_model,
-                draft=self.requested_draft_model,
-                adapter=self.adapter,
-            ),
-            sampling=SamplingArguments(
-                temperature=self.temperature,
-                top_p=self.top_p,
-                top_k=self.top_k,
-                min_p=self.min_p,
-                xtc_probability=self.xtc_probability,
-                xtc_threshold=self.xtc_threshold,
-            ),
-            logits=LogitsProcessorArguments(
-                logit_bias=self.logit_bias,
-                repetition_penalty=self.repetition_penalty,
-                repetition_context_size=self.repetition_context_size,
-            ),
-            stop_words=stop_words,
-            max_tokens=self.max_tokens,
-            num_draft_tokens=self.num_draft_tokens,
-            logprobs=self.logprobs,
-            top_logprobs=self.top_logprobs,
-            seed=self.seed,
-            chat_template_kwargs=self.chat_template_kwargs,
-        )
 
     def generate_response(
         self,
@@ -1649,281 +1717,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
-    def _anthropic_stop_reason(
-        self, finish_reason: Optional[str], stop_sequence: Optional[str]
-    ) -> str:
-        if finish_reason == "length":
-            return "max_tokens"
-        if finish_reason == "tool_calls":
-            return "tool_use"
-        if finish_reason == "stop":
-            return "stop_sequence" if stop_sequence is not None else "end_turn"
-        return "end_turn"
-
-    def generate_anthropic_response(
-        self,
-        finish_reason: Optional[str],
-        prompt_token_count: int,
-        completion_token_count: int,
-        stop_sequence: Optional[str],
-        content_blocks: List[Dict[str, Any]],
-    ) -> dict:
-        return {
-            "id": self.request_id,
-            "type": "message",
-            "role": "assistant",
-            "model": self.requested_model,
-            "content": content_blocks,
-            "stop_reason": self._anthropic_stop_reason(finish_reason, stop_sequence),
-            "stop_sequence": stop_sequence,
-            "usage": {
-                "input_tokens": prompt_token_count,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": completion_token_count,
-            },
-        }
-
-    @staticmethod
-    def _matched_stop_sequence(
-        tokens: List[int],
-        stop_id_sequences: List[List[int]],
-        stop_words: List[str],
-    ) -> Optional[str]:
-        # stop_id_sequences and stop_words are parallel lists built by the
-        # generation infrastructure; indices must stay in sync.
-        for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
-            if len(tokens) >= len(stop_ids) and tokens[-len(stop_ids) :] == stop_ids:
-                return stop_word
-        return None
-
-    def _parse_tool_call_payloads(
-        self, tool_calls: List[str], ctx: Any, tools: Optional[List[Any]]
-    ) -> List[Dict[str, Any]]:
-        if not tool_calls:
-            return []
-        if ctx.tool_parser is None:
-            raise ValueError("Model does not support tool calling.")
-
-        parsed_calls = []
-        for tool_text in tool_calls:
-            parsed = ctx.tool_parser(tool_text, tools)
-            if isinstance(parsed, list):
-                parsed_calls.extend(parsed)
-            else:
-                parsed_calls.append(parsed)
-
-        out = []
-        for parsed in parsed_calls:
-            if not isinstance(parsed, dict):
-                raise ValueError("Parsed tool call must be an object.")
-            name = parsed.get("name")
-            if not isinstance(name, str):
-                raise ValueError("Parsed tool call is missing `name`.")
-
-            arguments = parsed.get("arguments", {})
-            if isinstance(arguments, str):
-                arguments = json.loads(arguments)
-            if not isinstance(arguments, dict):
-                raise ValueError("Parsed tool call `arguments` must be an object.")
-
-            call_id = parsed.get("id")
-            if call_id is not None and not isinstance(call_id, str):
-                raise ValueError("Parsed tool call `id` must be a string.")
-            out.append({"id": call_id, "name": name, "arguments": arguments})
-        return out
-
-    def _parse_generated_tool_uses(
-        self, tool_calls: List[str], ctx: Any, tools: Optional[List[Any]]
-    ) -> List[Dict[str, Any]]:
-        out = []
-        for parsed_call in self._parse_tool_call_payloads(tool_calls, ctx, tools):
-            out.append(
-                {
-                    "type": "tool_use",
-                    "id": parsed_call["id"] or f"toolu_{uuid.uuid4().hex}",
-                    "name": parsed_call["name"],
-                    "input": parsed_call["arguments"],
-                }
-            )
-        return out
-
-    def _write_sse_event(self, event: str, data: Dict[str, Any]):
-        self.wfile.write(f"event: {event}\n".encode())
-        self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
-        self.wfile.flush()
-
-    def _write_sse_keepalive(self, message: str):
-        try:
-            self.wfile.write(f": {message}\n\n".encode())
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-
-    def _keepalive_callback(self, processed_tokens, total_tokens):
-        logging.info(f"Prompt processing progress: {processed_tokens}/{total_tokens}")
-        if self.stream:
-            # SSE comments are invisible to clients but keep connections alive.
-            self._write_sse_keepalive(f"keepalive {processed_tokens}/{total_tokens}")
-
-    def _write_anthropic_ping(self):
-        try:
-            self._write_sse_event("ping", {"type": "ping"})
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-
-    def _anthropic_error_payload(self, message: str, error_type: str) -> Dict[str, Any]:
-        return {
-            "type": "error",
-            "error": {"type": error_type, "message": message},
-        }
-
-    def _write_json_error(
-        self,
-        status_code: int,
-        message: str,
-        anthropic_error_type: Optional[str] = None,
-    ):
-        self._set_completion_headers(status_code)
-        self.end_headers()
-
-        if self._request_path() == "/v1/messages":
-            error_type = anthropic_error_type or (
-                "invalid_request_error" if status_code == 400 else "api_error"
-            )
-            payload = self._anthropic_error_payload(message, error_type)
-        else:
-            payload = {"error": message}
-
-        self.wfile.write(json.dumps(payload).encode())
-
-    def _write_anthropic_error(self, message: str, error_type: str = "api_error"):
-        try:
-            self._write_sse_event(
-                "error", self._anthropic_error_payload(message, error_type)
-            )
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-
-    # Shares shape with _keepalive_callback but writes a proper SSE ping
-    # event instead of an SSE comment. Could be unified if more formats land.
-    def _anthropic_keepalive_callback(self, processed_tokens, total_tokens):
-        logging.info(f"Prompt processing progress: {processed_tokens}/{total_tokens}")
-        if self.stream:
-            self._write_anthropic_ping()
-
-    # NOTE: This loop parallels handle_completion's token loop. They share
-    # ~80% of logic (stop checking, tool parsing, reasoning state) but
-    # diverge on output formatting. A shared generation core with
-    # format-specific callbacks is a worthwhile follow-up refactor.
-    def _run_anthropic_generation_loop(
-        self,
-        request: CompletionRequest,
-        ctx: Any,
-        response: Any,
-        stop_words: List[str],
-        on_text_segment: Callable[[str], None],
-        on_tool_use: Callable[[Dict[str, Any]], None],
-        on_hidden_progress: Callable[[], None] = lambda: None,
-        on_tool_call_start: Callable[[], None] = lambda: None,
-    ) -> AnthropicGenerationResult:
-        tokens: List[int] = []
-        segment = ""
-        finish_reason = "length"
-        stop_sequence = None
-        state = _make_anthropic_text_state(ctx)
-        tool_text = ""
-        has_tool_use = False
-
-        def flush_segment():
-            nonlocal segment
-            if not segment:
-                return
-            on_text_segment(segment)
-            segment = ""
-
-        def emit_tool_uses(raw_tool_text: str):
-            nonlocal has_tool_use
-            parsed_tool_uses = self._parse_generated_tool_uses(
-                [raw_tool_text], ctx, request.tools
-            )
-            for tool_use in parsed_tool_uses:
-                has_tool_use = True
-                on_tool_use(tool_use)
-
-        for gen in response:
-            tokens.append(gen.token)
-            visible = ""
-
-            if state.in_reasoning:
-                if gen.text == ctx.think_end:
-                    state.in_reasoning = False
-            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                flush_segment()
-                on_tool_call_start()
-                state.in_tool_call = True
-            elif state.in_tool_call:
-                if gen.text == ctx.tool_call_end:
-                    emit_tool_uses(tool_text)
-                    tool_text = ""
-                    state.in_tool_call = False
-                else:
-                    tool_text += gen.text
-            else:
-                visible = gen.text
-
-            segment += visible
-
-            if gen.finish_reason is not None:
-                finish_reason = gen.finish_reason
-
-            stop_condition = stopping_criteria(
-                tokens,
-                ctx.eos_token_ids,
-                ctx.stop_token_sequences,
-                stop_words,
-            )
-            if stop_condition.stop_met:
-                finish_reason = "stop"
-                if stop_condition.trim_length > 0:
-                    stop_sequence = self._matched_stop_sequence(
-                        tokens, ctx.stop_token_sequences, stop_words
-                    )
-                    tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                segment = _trim_visible_stop_text(
-                    segment, stop_sequence, stop_condition.trim_text_length
-                )
-                ctx.stop()
-                flush_segment()
-                break
-
-            if any(
-                sequence_overlap(tokens, sequence) for sequence in ctx.stop_token_sequences
-            ):
-                if not visible and not segment:
-                    on_hidden_progress()
-                continue
-
-            if segment:
-                flush_segment()
-            elif not visible:
-                on_hidden_progress()
-
-        if state.in_tool_call and tool_text:
-            emit_tool_uses(tool_text)
-
-        flush_segment()
-
-        if has_tool_use:
-            finish_reason = "tool_calls"
-
-        return AnthropicGenerationResult(
-            tokens=tokens,
-            finish_reason=finish_reason,
-            stop_sequence=stop_sequence,
-            has_tool_use=has_tool_use,
-        )
-
     def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
         """
         Generate a response to a prompt and send it to the client in a single batch.
@@ -1933,19 +1726,61 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_words (List[str]): A list of stop words passed to the
                 stopping_criteria function
         """
-        args = self._make_generation_args(stop_words)
+        args = GenerationArguments(
+            model=ModelDescription(
+                model=self.requested_model,
+                draft=self.requested_draft_model,
+                adapter=self.adapter,
+            ),
+            sampling=SamplingArguments(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                xtc_probability=self.xtc_probability,
+                xtc_threshold=self.xtc_threshold,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+            ),
+            stop_words=stop_words,
+            max_tokens=self.max_tokens,
+            num_draft_tokens=self.num_draft_tokens,
+            logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
+            seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
+
+        # Create keepalive callback to send SSE comments during long prompt processing
+        def keepalive_callback(processed_tokens, total_tokens):
+            logging.info(
+                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
+            )
+            if self.stream:
+                try:
+                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
+                    self.wfile.write(
+                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # Client disconnected, ignore
+                    pass
 
         # Create the token generator
         try:
             ctx, response = self.response_generator.generate(
                 request,
                 args,
-                progress_callback=self._keepalive_callback,
+                progress_callback=keepalive_callback,
             )
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(json.dumps({"error": f"{e}"}).encode())
             return
 
         # Prepare the headers
@@ -1967,14 +1802,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
         def format_tool_call(tool_call):
             nonlocal tool_idx
-            tool_call_id = tool_call["id"] or str(uuid.uuid4())
+            tool_call_id = tool_call.pop("id", None) or str(uuid.uuid4())
+            tool_call["arguments"] = json.dumps(
+                tool_call["arguments"], ensure_ascii=False
+            )
             out = {
-                "function": {
-                    "name": tool_call["name"],
-                    "arguments": json.dumps(
-                        tool_call["arguments"], ensure_ascii=False
-                    ),
-                },
+                "function": tool_call,
                 "type": "function",
                 "id": tool_call_id,
             }
@@ -1984,8 +1817,16 @@ class APIHandler(BaseHTTPRequestHandler):
             return out
 
         def parse_tools(tool_calls):
-            parsed = self._parse_tool_call_payloads(tool_calls, ctx, request.tools)
-            return [format_tool_call(tool_call) for tool_call in parsed]
+            if not tool_calls:
+                return []
+            result = []
+            for tool_text in tool_calls:
+                parsed = ctx.tool_parser(tool_text, request.tools)
+                if isinstance(parsed, list):
+                    result.extend(format_tool_call(tc) for tc in parsed)
+                else:
+                    result.append(format_tool_call(parsed))
+            return result
 
         # Start out in reasoning if the model is a reasoning model and the
         # prompt has an open think token but no closing think token
@@ -2067,7 +1908,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         for sequence in ctx.stop_token_sequences
                     )
                 ):
-                    self._write_sse_keepalive("keepalive buffering")
                     continue
                 elif segment or tool_calls or reasoning_text:
                     response = self.generate_response(
@@ -2081,10 +1921,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning_text = ""
                     segment = ""
                     tool_calls = []
-                else:
-                    self._write_sse_keepalive("keepalive hidden")
-            elif self.stream and in_tool_call:
-                self._write_sse_keepalive("keepalive hidden")
 
             if gen.finish_reason is not None:
                 finish_reason = gen.finish_reason
@@ -2135,214 +1971,6 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(response_json)
             self.wfile.flush()
 
-    def handle_anthropic_completion(
-        self, request: CompletionRequest, stop_words: List[str]
-    ):
-        args = self._make_generation_args(stop_words)
-
-        try:
-            ctx, response = self.response_generator.generate(
-                request,
-                args,
-            )
-        except Exception as e:
-            self._write_json_error(404, str(e))
-            return
-
-        content_blocks = []
-
-        def append_text_segment(text_segment: str):
-            if not text_segment:
-                return
-            if content_blocks and content_blocks[-1].get("type") == "text":
-                content_blocks[-1]["text"] += text_segment
-            else:
-                content_blocks.append({"type": "text", "text": text_segment})
-
-        def append_tool_use(tool_use: Dict[str, Any]):
-            content_blocks.append(tool_use)
-
-        try:
-            result = self._run_anthropic_generation_loop(
-                request=request,
-                ctx=ctx,
-                response=response,
-                stop_words=stop_words,
-                on_text_segment=append_text_segment,
-                on_tool_use=append_tool_use,
-            )
-        except ValueError as e:
-            self._write_json_error(
-                400, str(e), anthropic_error_type="invalid_request_error"
-            )
-            return
-        except Exception:
-            logging.exception("Unexpected error while handling Anthropic completion")
-            self._write_json_error(500, "Internal server error")
-            return
-
-        if not content_blocks:
-            content_blocks = [{"type": "text", "text": ""}]
-
-        out = self.generate_anthropic_response(
-            finish_reason=result.finish_reason,
-            prompt_token_count=len(ctx.prompt),
-            completion_token_count=len(result.tokens),
-            stop_sequence=result.stop_sequence,
-            content_blocks=content_blocks,
-        )
-        response_json = json.dumps(out).encode()
-        self._set_completion_headers(200)
-        self.send_header("Content-Length", str(len(response_json)))
-        self.end_headers()
-        self.wfile.write(response_json)
-        self.wfile.flush()
-
-    def handle_anthropic_streaming_completion(
-        self, request: CompletionRequest, stop_words: List[str]
-    ):
-        args = self._make_generation_args(stop_words)
-
-        try:
-            ctx, response = self.response_generator.generate(
-                request,
-                args,
-                progress_callback=self._anthropic_keepalive_callback,
-            )
-        except Exception as e:
-            self._write_json_error(404, str(e))
-            return
-
-        self._set_stream_headers(200)
-        self.end_headers()
-
-        self._write_sse_event(
-            "message_start",
-            {
-                "type": "message_start",
-                "message": {
-                    "id": self.request_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": self.requested_model,
-                    "content": [],
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {
-                        "input_tokens": len(ctx.prompt),
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "output_tokens": 0,
-                    },
-                },
-            },
-        )
-
-        block_index = 0
-        text_block_open = False
-
-        def emit_text_segment(text_segment: str):
-            nonlocal text_block_open, block_index
-            if not text_segment:
-                return
-            if not text_block_open:
-                self._write_sse_event(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-                text_block_open = True
-            self._write_sse_event(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {"type": "text_delta", "text": text_segment},
-                },
-            )
-
-        def close_text_block():
-            nonlocal text_block_open, block_index
-            if text_block_open:
-                self._write_sse_event(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": block_index},
-                )
-                text_block_open = False
-                block_index += 1
-
-        def emit_tool_use_block(tool_use: Dict[str, Any]):
-            nonlocal block_index
-            partial_json = json.dumps(tool_use["input"], ensure_ascii=False)
-            self._write_sse_event(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": tool_use["id"],
-                        "name": tool_use["name"],
-                        "input": {},
-                    },
-                },
-            )
-            self._write_sse_event(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": block_index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": partial_json,
-                    },
-                },
-            )
-            self._write_sse_event(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": block_index},
-            )
-            block_index += 1
-
-        try:
-            result = self._run_anthropic_generation_loop(
-                request=request,
-                ctx=ctx,
-                response=response,
-                stop_words=stop_words,
-                on_text_segment=emit_text_segment,
-                on_tool_use=emit_tool_use_block,
-                on_hidden_progress=self._write_anthropic_ping,
-                on_tool_call_start=close_text_block,
-            )
-        except ValueError as e:
-            self._write_anthropic_error(str(e), error_type="invalid_request_error")
-            return
-        except Exception:
-            logging.exception("Unexpected error while handling Anthropic stream")
-            self._write_anthropic_error("Internal server error", error_type="api_error")
-            return
-
-        close_text_block()
-
-        self._write_sse_event(
-            "message_delta",
-            {
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": self._anthropic_stop_reason(
-                        result.finish_reason, result.stop_sequence
-                    ),
-                    "stop_sequence": result.stop_sequence,
-                },
-                "usage": {"output_tokens": len(result.tokens)},
-            },
-        )
-        self._write_sse_event("message_stop", {"type": "message_stop"})
-
     def completion_usage_response(
         self,
         prompt_token_count: Optional[int] = None,
@@ -2376,8 +2004,7 @@ class APIHandler(BaseHTTPRequestHandler):
             mx.array: A mx.array of the tokenized prompt from the request body
         """
         body = self.body
-        if "messages" not in body:
-            raise ValueError("Request did not contain messages")
+        assert "messages" in body, "Request did not contain messages"
 
         # Determine response type
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -2391,22 +2018,6 @@ class APIHandler(BaseHTTPRequestHandler):
             body.get("role_mapping"),
         )
 
-    def handle_anthropic_messages(self) -> CompletionRequest:
-        body = self.body
-        if "messages" not in body:
-            raise ValueError("Request did not contain messages")
-
-        self.request_id = f"msg_{uuid.uuid4().hex}"
-        self.object_type = "message"
-
-        return CompletionRequest(
-            "chat",
-            "",
-            convert_anthropic_messages(body),
-            convert_anthropic_tools(body.get("tools")),
-            None,
-        )
-
     def handle_text_completions(self) -> CompletionRequest:
         """
         Handle a text completion request.
@@ -2417,8 +2028,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Determine response type
         self.request_id = f"cmpl-{uuid.uuid4()}"
         self.object_type = "text_completion"
-        if "prompt" not in self.body:
-            raise ValueError("Request did not contain a prompt")
+        assert "prompt" in self.body, "Request did not contain a prompt"
         return CompletionRequest(
             "text",
             self.body["prompt"],
@@ -2431,10 +2041,9 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        request_path = self._request_path()
-        if request_path.startswith("/v1/models"):
+        if self.path.startswith("/v1/models"):
             self.handle_models_request()
-        elif request_path == "/health":
+        elif self.path == "/health":
             self.handle_health_check()
         else:
             self._set_completion_headers(404)
@@ -2460,7 +2069,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
-        parts = self._request_path().split("/")
+        parts = self.path.split("/")
         filter_repo_id = None
         if len(parts) > 3:
             filter_repo_id = "/".join(parts[3:])
