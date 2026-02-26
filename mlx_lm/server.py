@@ -1364,7 +1364,7 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.error("JSONDecodeError: %s - Raw body: %s", e, raw_body.decode())
             self._write_json_error(
                 400,
-                f"Invalid JSON in request body: {str(e)}",
+                f"Invalid JSON in request body: {e}",
                 anthropic_error_type="invalid_request_error",
             )
             return
@@ -1813,8 +1813,8 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_words: List[str],
         on_text_segment: Callable[[str], None],
         on_tool_use: Callable[[Dict[str, Any]], None],
-        on_hidden_progress: Optional[Callable[[], None]] = None,
-        on_tool_call_start: Optional[Callable[[], None]] = None,
+        on_hidden_progress: Callable[[], None] = lambda: None,
+        on_tool_call_start: Callable[[], None] = lambda: None,
     ) -> AnthropicGenerationResult:
         tokens: List[int] = []
         segment = ""
@@ -1823,16 +1823,6 @@ class APIHandler(BaseHTTPRequestHandler):
         state = _make_anthropic_text_state(ctx)
         tool_text = ""
         has_tool_use = False
-        if on_hidden_progress is None:
-            def noop_hidden_progress():
-                return
-
-            on_hidden_progress = noop_hidden_progress
-        if on_tool_call_start is None:
-            def noop_tool_call_start():
-                return
-
-            on_tool_call_start = noop_tool_call_start
 
         def flush_segment():
             nonlocal segment
@@ -2143,7 +2133,6 @@ class APIHandler(BaseHTTPRequestHandler):
             ctx, response = self.response_generator.generate(
                 request,
                 args,
-                progress_callback=self._anthropic_keepalive_callback,
             )
         except Exception as e:
             self._write_json_error(404, str(e))

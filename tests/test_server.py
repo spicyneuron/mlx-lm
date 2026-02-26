@@ -649,6 +649,81 @@ class TestServer(unittest.TestCase):
         self.assertEqual(converted[2]["tool_call_id"], "toolu_1")
         self.assertEqual(converted[2]["content"], "72F")
 
+    def test_convert_anthropic_messages_tool_use_only_assistant(self):
+        from mlx_lm.server import convert_anthropic_messages
+
+        converted = convert_anthropic_messages(
+            {
+                "messages": [
+                    {"role": "user", "content": "Check weather."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "get_weather",
+                                "input": {"location": "sf"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "72F",
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(converted[1]["role"], "assistant")
+        self.assertEqual(converted[1]["content"], "")
+        self.assertEqual(len(converted[1]["tool_calls"]), 1)
+        self.assertEqual(converted[1]["tool_calls"][0]["id"], "toolu_1")
+
+    def test_convert_anthropic_messages_tool_result_is_error(self):
+        from mlx_lm.server import convert_anthropic_messages
+
+        converted = convert_anthropic_messages(
+            {
+                "messages": [
+                    {"role": "user", "content": "Check weather."},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "get_weather",
+                                "input": {"location": "sf"},
+                            },
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "Connection timed out",
+                                "is_error": True,
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+
+        # is_error is silently dropped (no OpenAI equivalent)
+        self.assertEqual(converted[2]["role"], "tool")
+        self.assertEqual(converted[2]["tool_call_id"], "toolu_1")
+        self.assertEqual(converted[2]["content"], "Connection timed out")
+
     def test_convert_anthropic_messages_with_system_string(self):
         from mlx_lm.server import convert_anthropic_messages
 
@@ -1413,14 +1488,13 @@ class TestServer(unittest.TestCase):
         self.assertTrue(captured["called"])
         self.assertTrue(captured["has_callback"])
 
-    def test_handle_anthropic_messages_non_stream_uses_progress_callback(self):
+    def test_handle_anthropic_messages_non_stream_skips_progress_callback(self):
         url = f"http://localhost:{self.port}/v1/messages"
-        captured = {"called": False, "has_callback": False, "callback_name": None}
+        captured = {"called": False, "has_callback": False}
 
         def fake_generate(request, generation_args, progress_callback=None):
             captured["called"] = True
             captured["has_callback"] = progress_callback is not None
-            captured["callback_name"] = getattr(progress_callback, "__name__", None)
             ctx = SimpleNamespace(
                 has_thinking=False,
                 think_start_id=-1,
@@ -1458,8 +1532,7 @@ class TestServer(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
 
         self.assertTrue(captured["called"])
-        self.assertTrue(captured["has_callback"])
-        self.assertEqual(captured["callback_name"], "_anthropic_keepalive_callback")
+        self.assertFalse(captured["has_callback"])
 
     def test_handle_anthropic_messages_non_stream_hides_thinking_text(self):
         url = f"http://localhost:{self.port}/v1/messages"
