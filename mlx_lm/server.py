@@ -190,7 +190,6 @@ def process_message_content(messages):
 
 
 class LRUPromptCache:
-
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
@@ -808,7 +807,7 @@ class ResponseGenerator:
 
                     ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
                     logging.info(
-                        f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB"
+                        f"We have {ncaches} kv caches that take {nbytes / 1e9:.2f} GB"
                     )
 
                     (uid,) = batch_generator.insert(
@@ -987,7 +986,7 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
-            logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
+            logging.info(f"We have {ncaches} kv caches that take {nbytes / 1e9:.2f} GB")
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1084,9 +1083,6 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
 
-    def _request_path(self) -> str:
-        return urlsplit(self.path).path
-
     def _set_completion_headers(self, status_code: int = 200):
         self.send_response(status_code)
         self.send_header("Content-type", "application/json")
@@ -1106,13 +1102,9 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
-        request_path = self._request_path()
-
-        post_handlers = {
-            "/v1/messages": self._handle_messages_post,
-        }
-        if request_path in post_handlers:
-            post_handlers[request_path]()
+        # Anthropic clients may append query params, so strip them for matching
+        if urlsplit(self.path).path == "/v1/messages":
+            self._handle_messages_post()
             return
 
         request_factories = {
@@ -1121,7 +1113,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/chat/completions": self.handle_chat_completions,
         }
 
-        if request_path not in request_factories:
+        if self.path not in request_factories:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
@@ -1140,9 +1132,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
-        assert isinstance(
-            self.body, dict
-        ), f"Request should be dict, but got {type(self.body)}"
+        assert isinstance(self.body, dict), (
+            f"Request should be dict, but got {type(self.body)}"
+        )
 
         # Extract request parameters from the body
         self._parse_common_params()
@@ -1158,18 +1150,14 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_words = normalize_stop_words(self.body.get("stop"))
 
         # Create the completion request
-        request = request_factories[request_path]()
+        request = request_factories[self.path]()
         self.handle_completion(request, stop_words)
-
-    def _handle_anthropic_post(self, anth):
-        """Handle POST /v1/messages via server_anthropic."""
-        anth.handle_anthropic_post(self)
 
     def _handle_messages_post(self):
         from . import server_anthropic as anth
 
         try:
-            self._handle_anthropic_post(anth)
+            anth.handle_anthropic_post(self)
         except Exception:
             logging.exception("Unexpected error in Anthropic messages handler")
             try:
@@ -1188,9 +1176,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream = self.body.get("stream", False)
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get(
-            "num_draft_tokens", cli.num_draft_tokens
-        )
+        self.num_draft_tokens = self.body.get("num_draft_tokens", cli.num_draft_tokens)
         self.adapter = self.body.get("adapters", None)
         self.temperature = self.body.get("temperature", cli.temp)
         self.top_p = self.body.get("top_p", cli.top_p)

@@ -8,7 +8,6 @@ from unittest.mock import patch
 import requests
 
 import mlx_lm.server_anthropic as server_anthropic
-from mlx_lm.server import APIHandler
 from tests._server_test_utils import ServerAPITestBase, collect_sse_events
 
 
@@ -927,8 +926,8 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
     def test_handle_anthropic_messages_unexpected_request_factory_error_returns_500(self):
         url = f"http://localhost:{self.port}/v1/messages"
         with patch.object(
-            APIHandler,
-            "_handle_anthropic_post",
+            server_anthropic,
+            "handle_anthropic_post",
             side_effect=RuntimeError("unexpected"),
         ):
             response = requests.post(
