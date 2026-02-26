@@ -248,13 +248,20 @@ def _anthropic_tool_result_to_openai_tool_message(
     tool_use_id = block.get("tool_use_id")
     if not isinstance(tool_use_id, str):
         raise ValueError("tool_result block is missing a valid `tool_use_id`.")
-    return {
+    is_error = block.get("is_error")
+    if is_error is not None and not isinstance(is_error, bool):
+        raise ValueError("tool_result block `is_error` must be a boolean.")
+
+    out = {
         "role": "tool",
         "tool_call_id": tool_use_id,
         "content": _content_to_text(
             block.get("content"), field_name="tool_result.content"
         ),
     }
+    if isinstance(is_error, bool):
+        out["is_error"] = is_error
+    return out
 
 
 def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1421,8 +1428,12 @@ class APIHandler(BaseHTTPRequestHandler):
         # Create the completion request
         try:
             request = request_factories[request_path]()
-        except Exception as e:
+        except ValueError as e:
             self._write_json_error(400, str(e))
+            return
+        except Exception:
+            logging.exception("Unexpected error while constructing completion request")
+            self._write_json_error(500, "Internal server error")
             return
         if request_path == "/v1/messages":
             if self.stream:
@@ -2160,10 +2171,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 on_text_segment=append_text_segment,
                 on_tool_use=append_tool_use,
             )
-        except Exception as e:
+        except ValueError as e:
             self._write_json_error(
                 400, str(e), anthropic_error_type="invalid_request_error"
             )
+            return
+        except Exception:
+            logging.exception("Unexpected error while handling Anthropic completion")
+            self._write_json_error(500, "Internal server error")
             return
 
         if not content_blocks:
@@ -2303,8 +2318,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 on_hidden_progress=self._write_anthropic_ping,
                 on_tool_call_start=close_text_block,
             )
-        except Exception as e:
+        except ValueError as e:
             self._write_anthropic_error(str(e), error_type="invalid_request_error")
+            return
+        except Exception:
+            logging.exception("Unexpected error while handling Anthropic stream")
+            self._write_anthropic_error("Internal server error", error_type="api_error")
             return
 
         close_text_block()
