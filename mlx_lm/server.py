@@ -1142,34 +1142,13 @@ class APIHandler(BaseHTTPRequestHandler):
         ), f"Request should be dict, but got {type(self.body)}"
 
         # Extract request parameters from the body
-        self.stream = self.body.get("stream", False)
+        self._parse_common_params()
         self.stream_options = self.body.get("stream_options", None)
-        self.requested_model = self.body.get("model", "default_model")
-        self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get(
-            "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
-        )
-        self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
             self.max_tokens = self.body.get(
                 "max_tokens", self.response_generator.cli_args.max_tokens
             )
-        self.temperature = self.body.get(
-            "temperature", self.response_generator.cli_args.temp
-        )
-        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
-        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
-        self.repetition_context_size = self.body.get("repetition_context_size", 20)
-        self.xtc_probability = self.body.get("xtc_probability", 0.0)
-        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
-        self.logit_bias = self.body.get("logit_bias", None)
-        self.logprobs = self.body.get("logprobs", False)
-        self.top_logprobs = self.body.get("top_logprobs", -1)
-        self.seed = self.body.get("seed", None)
-        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1214,32 +1193,10 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Shared parameter extraction
-        self.stream = self.body.get("stream", False)
-        self.requested_model = self.body.get("model", "default_model")
-        self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get(
-            "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
-        )
-        self.adapter = self.body.get("adapters", None)
+        self._parse_common_params()
         self.max_tokens = self.body.get(
             "max_tokens", self.response_generator.cli_args.max_tokens
         )
-        self.temperature = self.body.get(
-            "temperature", self.response_generator.cli_args.temp
-        )
-        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
-        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
-        self.repetition_context_size = self.body.get("repetition_context_size", 20)
-        self.xtc_probability = self.body.get("xtc_probability", 0.0)
-        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
-        self.logit_bias = self.body.get("logit_bias", None)
-        self.logprobs = self.body.get("logprobs", False)
-        self.top_logprobs = self.body.get("top_logprobs", -1)
-        self.seed = self.body.get("seed", None)
-        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
 
         # Anthropic uses stop_sequences instead of stop
         stop_words = self.body.get("stop_sequences") or []
@@ -1267,33 +1224,7 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
-        args = GenerationArguments(
-            model=ModelDescription(
-                model=self.requested_model,
-                draft=self.requested_draft_model,
-                adapter=self.adapter,
-            ),
-            sampling=SamplingArguments(
-                temperature=self.temperature,
-                top_p=self.top_p,
-                top_k=self.top_k,
-                min_p=self.min_p,
-                xtc_probability=self.xtc_probability,
-                xtc_threshold=self.xtc_threshold,
-            ),
-            logits=LogitsProcessorArguments(
-                logit_bias=self.logit_bias,
-                repetition_penalty=self.repetition_penalty,
-                repetition_context_size=self.repetition_context_size,
-            ),
-            stop_words=stop_words,
-            max_tokens=self.max_tokens,
-            num_draft_tokens=self.num_draft_tokens,
-            logprobs=self.logprobs,
-            top_logprobs=self.top_logprobs,
-            seed=self.seed,
-            chat_template_kwargs=self.chat_template_kwargs,
-        )
+        args = self._build_generation_args(stop_words)
 
         # SSE helper closures
         def write_sse_event(event, data):
@@ -1540,6 +1471,60 @@ class APIHandler(BaseHTTPRequestHandler):
         )
         write_sse_event("message_stop", {"type": "message_stop"})
 
+    def _parse_common_params(self):
+        """Extract generation parameters shared across API formats from self.body."""
+        cli = self.response_generator.cli_args
+        self.stream = self.body.get("stream", False)
+        self.requested_model = self.body.get("model", "default_model")
+        self.requested_draft_model = self.body.get("draft_model", "default_model")
+        self.num_draft_tokens = self.body.get(
+            "num_draft_tokens", cli.num_draft_tokens
+        )
+        self.adapter = self.body.get("adapters", None)
+        self.temperature = self.body.get("temperature", cli.temp)
+        self.top_p = self.body.get("top_p", cli.top_p)
+        self.top_k = self.body.get("top_k", cli.top_k)
+        self.min_p = self.body.get("min_p", cli.min_p)
+        self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
+        self.repetition_context_size = self.body.get("repetition_context_size", 20)
+        self.xtc_probability = self.body.get("xtc_probability", 0.0)
+        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
+        self.logit_bias = self.body.get("logit_bias", None)
+        self.logprobs = self.body.get("logprobs", False)
+        self.top_logprobs = self.body.get("top_logprobs", -1)
+        self.seed = self.body.get("seed", None)
+        self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+
+    def _build_generation_args(self, stop_words):
+        """Build GenerationArguments from parsed request params."""
+        return GenerationArguments(
+            model=ModelDescription(
+                model=self.requested_model,
+                draft=self.requested_draft_model,
+                adapter=self.adapter,
+            ),
+            sampling=SamplingArguments(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                xtc_probability=self.xtc_probability,
+                xtc_threshold=self.xtc_threshold,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+            ),
+            stop_words=stop_words,
+            max_tokens=self.max_tokens,
+            num_draft_tokens=self.num_draft_tokens,
+            logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
+            seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
+
     def validate_model_parameters(self):
         """
         Validate the model parameters passed in the request for the correct types and values.
@@ -1726,33 +1711,7 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_words (List[str]): A list of stop words passed to the
                 stopping_criteria function
         """
-        args = GenerationArguments(
-            model=ModelDescription(
-                model=self.requested_model,
-                draft=self.requested_draft_model,
-                adapter=self.adapter,
-            ),
-            sampling=SamplingArguments(
-                temperature=self.temperature,
-                top_p=self.top_p,
-                top_k=self.top_k,
-                min_p=self.min_p,
-                xtc_probability=self.xtc_probability,
-                xtc_threshold=self.xtc_threshold,
-            ),
-            logits=LogitsProcessorArguments(
-                logit_bias=self.logit_bias,
-                repetition_penalty=self.repetition_penalty,
-                repetition_context_size=self.repetition_context_size,
-            ),
-            stop_words=stop_words,
-            max_tokens=self.max_tokens,
-            num_draft_tokens=self.num_draft_tokens,
-            logprobs=self.logprobs,
-            top_logprobs=self.top_logprobs,
-            seed=self.seed,
-            chat_template_kwargs=self.chat_template_kwargs,
-        )
+        args = self._build_generation_args(stop_words)
 
         # Create keepalive callback to send SSE comments during long prompt processing
         def keepalive_callback(processed_tokens, total_tokens):

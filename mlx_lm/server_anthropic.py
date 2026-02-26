@@ -128,11 +128,7 @@ def convert_anthropic_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         content = message.get("content")
         if isinstance(content, str) or content is None:
-            _append_merged_text_message(
-                out,
-                role,
-                _content_to_text(content, field_name="messages[].content"),
-            )
+            _append_merged_text_message(out, role, content or "")
             continue
         if not isinstance(content, list):
             raise ValueError("messages[].content must be a string or list")
@@ -252,7 +248,7 @@ def _make_text_state(ctx: Any) -> _TextState:
     return _TextState(in_reasoning=in_reasoning)
 
 
-def _trim_visible_stop_text(
+def trim_visible_stop_text(
     text: str, stop_sequence: Optional[str], trim_text_length: int
 ) -> str:
     if trim_text_length <= 0 or not stop_sequence:
@@ -262,7 +258,7 @@ def _trim_visible_stop_text(
     return text[: max(0, len(text) - trim_text_length)]
 
 
-def _matched_stop_sequence(
+def matched_stop_sequence(
     tokens: List[int],
     stop_id_sequences: List[List[int]],
     stop_words: List[str],
@@ -401,11 +397,11 @@ def run_generation_loop(
         if stop_condition.stop_met:
             finish_reason = "stop"
             if stop_condition.trim_length > 0:
-                stop_sequence = _matched_stop_sequence(
+                stop_sequence = matched_stop_sequence(
                     tokens, ctx.stop_token_sequences, stop_words
                 )
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
-            segment = _trim_visible_stop_text(
+            segment = trim_visible_stop_text(
                 segment, stop_sequence, stop_condition.trim_text_length
             )
             ctx.stop()

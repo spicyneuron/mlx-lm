@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import requests
 
+import mlx_lm.server_anthropic as server_anthropic
 from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
 from mlx_lm.utils import load
 
@@ -58,6 +59,7 @@ class DummyModelProvider:
         assert model in ["default_model", "chat_model"]
         return self.model, self.tokenizer
 
+
 class TestAnthropicServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -92,48 +94,73 @@ class TestAnthropicServer(unittest.TestCase):
             if line.startswith(":"):
                 continue
             if line.startswith("event: "):
-                current_event = line[len("event: ") :]
+                current_event = line[len("event: "):]
                 continue
             if line.startswith("data: "):
-                payload = json.loads(line[len("data: ") :])
+                payload = json.loads(line[len("data: "):])
                 events.append((current_event, payload))
         return events
 
+    # -- Test helpers ----------------------------------------------------------
+
     @staticmethod
-    def _make_tool_ctx(tool_parser):
-        return SimpleNamespace(
+    def _make_ctx(**overrides):
+        """Build a mock generation context with sensible defaults."""
+        defaults = dict(
             has_thinking=False,
             think_start_id=-1,
             think_end_id=-1,
             think_end="",
-            has_tool_calling=True,
-            tool_call_start="<tool_call>",
-            tool_call_end="</tool_call>",
-            tool_parser=tool_parser,
+            has_tool_calling=False,
+            tool_call_start="",
+            tool_call_end="",
             eos_token_ids=set(),
             stop_token_sequences=[],
             prompt=[1, 2, 3],
             stop=lambda: None,
         )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
 
-    def _make_fake_tool_generate(self, chunks, tool_parser):
+    @staticmethod
+    def _make_gen(text, token, finish_reason=None):
+        return SimpleNamespace(
+            text=text, token=token, logprob=0.0,
+            finish_reason=finish_reason, top_tokens=(),
+        )
+
+    def _make_fake_generate(self, chunks, on_call=None, **ctx_overrides):
+        """Build a fake generate function.
+
+        Args:
+            chunks: list of text strings to yield as tokens
+            on_call: optional callback(request, generation_args, progress_callback)
+            **ctx_overrides: overrides for _make_ctx
+        """
         def fake_generate(request, generation_args, progress_callback=None):
-            ctx = self._make_tool_ctx(tool_parser)
+            if on_call:
+                on_call(request, generation_args, progress_callback)
+            ctx = self._make_ctx(**ctx_overrides)
 
             def iterator():
-                final_idx = len(chunks)
                 for idx, text in enumerate(chunks, start=1):
-                    yield SimpleNamespace(
-                        text=text,
-                        token=idx,
-                        logprob=0.0,
-                        finish_reason="stop" if idx == final_idx else None,
-                        top_tokens=(),
+                    yield self._make_gen(
+                        text, idx,
+                        finish_reason="stop" if idx == len(chunks) else None,
                     )
 
             return ctx, iterator()
 
         return fake_generate
+
+    def _make_fake_tool_generate(self, chunks, tool_parser):
+        return self._make_fake_generate(
+            chunks,
+            has_tool_calling=True,
+            tool_call_start="<tool_call>",
+            tool_call_end="</tool_call>",
+            tool_parser=tool_parser,
+        )
 
     @staticmethod
     def _anthropic_tool_request(stream=False):
@@ -165,6 +192,9 @@ class TestAnthropicServer(unittest.TestCase):
             self.assertEqual(body["error"]["type"], error_type)
         if message_substring is not None:
             self.assertIn(message_substring, body["error"]["message"])
+
+    # -- Tests -----------------------------------------------------------------
+
     def test_handle_anthropic_messages(self):
         url = f"http://localhost:{self.port}/v1/messages"
         post_data = {
@@ -253,34 +283,12 @@ class TestAnthropicServer(unittest.TestCase):
         url = f"http://localhost:{self.port}/v1/messages"
         captured = {"stop_words": None}
 
-        def fake_generate(request, generation_args, progress_callback=None):
-            captured["stop_words"] = generation_args.stop_words
-            ctx = SimpleNamespace(
-                has_thinking=False,
-                think_start_id=-1,
-                think_end_id=-1,
-                think_end="",
-                has_tool_calling=False,
-                tool_call_start="",
-                tool_call_end="",
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[1, 2, 3],
-                stop=lambda: None,
-            )
+        def on_call(req, args, cb):
+            captured["stop_words"] = args.stop_words
 
-            def iterator():
-                yield SimpleNamespace(
-                    text="Hello",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
+        fake = self._make_fake_generate(["Hello"], on_call=on_call)
 
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -297,48 +305,12 @@ class TestAnthropicServer(unittest.TestCase):
 
     def test_handle_anthropic_messages_stop_sequences_stops_generation(self):
         url = f"http://localhost:{self.port}/v1/messages"
+        fake = self._make_fake_generate(
+            ["Hello ", "STOP", "ignored"],
+            stop_token_sequences=[[2]],
+        )
 
-        def fake_generate(request, generation_args, progress_callback=None):
-            ctx = SimpleNamespace(
-                has_thinking=False,
-                think_start_id=-1,
-                think_end_id=-1,
-                think_end="",
-                has_tool_calling=False,
-                tool_call_start="",
-                tool_call_end="",
-                eos_token_ids=set(),
-                stop_token_sequences=[[2]],
-                prompt=[1, 2, 3],
-                stop=lambda: None,
-            )
-
-            def iterator():
-                yield SimpleNamespace(
-                    text="Hello ",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="STOP",
-                    token=2,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="ignored",
-                    token=3,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
-
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -362,35 +334,13 @@ class TestAnthropicServer(unittest.TestCase):
         url = f"http://localhost:{self.port}/v1/messages"
         captured = {"model": None, "max_tokens": None}
 
-        def fake_generate(request, generation_args, progress_callback=None):
-            captured["model"] = generation_args.model.model
-            captured["max_tokens"] = generation_args.max_tokens
-            ctx = SimpleNamespace(
-                has_thinking=False,
-                think_start_id=-1,
-                think_end_id=-1,
-                think_end="",
-                has_tool_calling=False,
-                tool_call_start="",
-                tool_call_end="",
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[1, 2, 3],
-                stop=lambda: None,
-            )
+        def on_call(req, args, cb):
+            captured["model"] = args.model.model
+            captured["max_tokens"] = args.max_tokens
 
-            def iterator():
-                yield SimpleNamespace(
-                    text="Hello",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
+        fake = self._make_fake_generate(["Hello"], on_call=on_call)
 
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -461,18 +411,12 @@ class TestAnthropicServer(unittest.TestCase):
 
     def test_handle_anthropic_messages_unexpected_loop_error_is_server_error(self):
         url = f"http://localhost:{self.port}/v1/messages"
+        fake = self._make_fake_generate(["Hello"])
 
-        def fake_generate(request, generation_args, progress_callback=None):
-            ctx = SimpleNamespace(
-                prompt=[1, 2, 3],
-                stop=lambda: None,
-            )
-            return ctx, iter(())
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             with patch.object(
-                APIHandler,
-                "_run_anthropic_generation_loop",
+                server_anthropic,
+                "run_generation_loop",
                 side_effect=RuntimeError("unexpected"),
             ):
                 response = requests.post(
@@ -768,49 +712,16 @@ class TestAnthropicServer(unittest.TestCase):
 
     def test_handle_anthropic_messages_with_tools_non_stream(self):
         url = f"http://localhost:{self.port}/v1/messages"
+        fake = self._make_fake_tool_generate(
+            [
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+            ],
+            lambda text, tools: json.loads(text),
+        )
 
-        def fake_generate(request, generation_args, progress_callback=None):
-            ctx = SimpleNamespace(
-                has_thinking=False,
-                think_start_id=-1,
-                think_end_id=-1,
-                think_end="",
-                has_tool_calling=True,
-                tool_call_start="<tool_call>",
-                tool_call_end="</tool_call>",
-                tool_parser=lambda text, tools: json.loads(text),
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[1, 2, 3],
-                stop=lambda: None,
-            )
-
-            def iterator():
-                yield SimpleNamespace(
-                    text="<tool_call>",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text='{"name":"get_weather","arguments":{"location":"sf"}}',
-                    token=2,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="</tool_call>",
-                    token=3,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
-
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -880,49 +791,16 @@ class TestAnthropicServer(unittest.TestCase):
 
     def test_handle_anthropic_messages_streaming_tool_use(self):
         url = f"http://localhost:{self.port}/v1/messages"
+        fake = self._make_fake_tool_generate(
+            [
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+            ],
+            lambda text, tools: json.loads(text),
+        )
 
-        def fake_generate(request, generation_args, progress_callback=None):
-            ctx = SimpleNamespace(
-                has_thinking=False,
-                think_start_id=-1,
-                think_end_id=-1,
-                think_end="",
-                has_tool_calling=True,
-                tool_call_start="<tool_call>",
-                tool_call_end="</tool_call>",
-                tool_parser=lambda text, tools: json.loads(text),
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[1, 2, 3],
-                stop=lambda: None,
-            )
-
-            def iterator():
-                yield SimpleNamespace(
-                    text="<tool_call>",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text='{"name":"get_weather","arguments":{"location":"sf"}}',
-                    token=2,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="</tool_call>",
-                    token=3,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
-
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -1163,7 +1041,7 @@ class TestAnthropicServer(unittest.TestCase):
         url = f"http://localhost:{self.port}/v1/messages"
         with patch.object(
             APIHandler,
-            "handle_anthropic_messages",
+            "_handle_anthropic_post",
             side_effect=RuntimeError("unexpected"),
         ):
             response = requests.post(
@@ -1303,22 +1181,25 @@ class TestAnthropicServer(unittest.TestCase):
             payload for event, payload in events if event == "message_delta"
         ][-1]
         self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
-    def test_trim_visible_stop_text(self):
-        from mlx_lm.server_anthropic import _trim_visible_stop_text
 
-        self.assertEqual(_trim_visible_stop_text("hello STOP", "STOP", 4), "hello ")
-        self.assertEqual(_trim_visible_stop_text("hello", "STOP", 4), "hello")
-        self.assertEqual(_trim_visible_stop_text("hello", None, 4), "hello")
+    def test_trim_visible_stop_text(self):
+        from mlx_lm.server_anthropic import trim_visible_stop_text
+
+        self.assertEqual(trim_visible_stop_text("hello STOP", "STOP", 4), "hello ")
+        self.assertEqual(trim_visible_stop_text("hello", "STOP", 4), "hello")
+        self.assertEqual(trim_visible_stop_text("hello", None, 4), "hello")
 
     def test_matched_stop_sequence(self):
-        matched = APIHandler._matched_stop_sequence(
+        from mlx_lm.server_anthropic import matched_stop_sequence
+
+        matched = matched_stop_sequence(
             tokens=[1, 2, 3],
             stop_id_sequences=[[9], [2, 3]],
             stop_words=["x", "STOP"],
         )
         self.assertEqual(matched, "STOP")
 
-        unmatched = APIHandler._matched_stop_sequence(
+        unmatched = matched_stop_sequence(
             tokens=[1, 2, 3],
             stop_id_sequences=[[4, 5]],
             stop_words=["NOPE"],
@@ -1329,34 +1210,13 @@ class TestAnthropicServer(unittest.TestCase):
         url = f"http://localhost:{self.port}/v1/messages"
         captured = {"called": False, "has_callback": False}
 
-        def fake_generate(request, generation_args, progress_callback=None):
+        def on_call(req, args, cb):
             captured["called"] = True
-            captured["has_callback"] = progress_callback is not None
-            ctx = SimpleNamespace(
-                has_thinking=False,
-                think_start_id=-1,
-                think_end_id=-1,
-                think_end="",
-                has_tool_calling=False,
-                tool_call_start="",
-                tool_call_end="",
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[1, 2, 3],
-            )
+            captured["has_callback"] = cb is not None
 
-            def iterator():
-                yield SimpleNamespace(
-                    text="Hello",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
+        fake = self._make_fake_generate(["Hello"], on_call=on_call)
 
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -1378,35 +1238,13 @@ class TestAnthropicServer(unittest.TestCase):
         url = f"http://localhost:{self.port}/v1/messages"
         captured = {"called": False, "has_callback": False}
 
-        def fake_generate(request, generation_args, progress_callback=None):
+        def on_call(req, args, cb):
             captured["called"] = True
-            captured["has_callback"] = progress_callback is not None
-            ctx = SimpleNamespace(
-                has_thinking=False,
-                think_start_id=-1,
-                think_end_id=-1,
-                think_end="",
-                has_tool_calling=False,
-                tool_call_start="",
-                tool_call_end="",
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[1, 2, 3],
-                stop=lambda: None,
-            )
+            captured["has_callback"] = cb is not None
 
-            def iterator():
-                yield SimpleNamespace(
-                    text="Hello",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
+        fake = self._make_fake_generate(["Hello"], on_call=on_call)
 
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -1422,48 +1260,16 @@ class TestAnthropicServer(unittest.TestCase):
 
     def test_handle_anthropic_messages_non_stream_hides_thinking_text(self):
         url = f"http://localhost:{self.port}/v1/messages"
+        fake = self._make_fake_generate(
+            ["internal reasoning", "</think>", "Hello"],
+            has_thinking=True,
+            think_start_id=11,
+            think_end_id=12,
+            think_end="</think>",
+            prompt=[11],
+        )
 
-        def fake_generate(request, generation_args, progress_callback=None):
-            ctx = SimpleNamespace(
-                has_thinking=True,
-                think_start_id=11,
-                think_end_id=12,
-                think_end="</think>",
-                has_tool_calling=False,
-                tool_call_start="",
-                tool_call_end="",
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[11],
-                stop=lambda: None,
-            )
-
-            def iterator():
-                yield SimpleNamespace(
-                    text="internal reasoning",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="</think>",
-                    token=2,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="Hello",
-                    token=3,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
-
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -1485,48 +1291,16 @@ class TestAnthropicServer(unittest.TestCase):
 
     def test_handle_anthropic_messages_streaming_hides_thinking_text(self):
         url = f"http://localhost:{self.port}/v1/messages"
+        fake = self._make_fake_generate(
+            ["internal reasoning", "</think>", "Hello"],
+            has_thinking=True,
+            think_start_id=11,
+            think_end_id=12,
+            think_end="</think>",
+            prompt=[11],
+        )
 
-        def fake_generate(request, generation_args, progress_callback=None):
-            ctx = SimpleNamespace(
-                has_thinking=True,
-                think_start_id=11,
-                think_end_id=12,
-                think_end="</think>",
-                has_tool_calling=False,
-                tool_call_start="",
-                tool_call_end="",
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[11],
-                stop=lambda: None,
-            )
-
-            def iterator():
-                yield SimpleNamespace(
-                    text="internal reasoning",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="</think>",
-                    token=2,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="Hello",
-                    token=3,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
-
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -1551,56 +1325,15 @@ class TestAnthropicServer(unittest.TestCase):
 
     def test_handle_anthropic_messages_streaming_hidden_keepalive(self):
         url = f"http://localhost:{self.port}/v1/messages"
+        fake = self._make_fake_generate(
+            ["<tool_call>", '{"name":"x"}', "</tool_call>", "Hello"],
+            has_tool_calling=True,
+            tool_call_start="<tool_call>",
+            tool_call_end="</tool_call>",
+            tool_parser=lambda text, tools: {"name": "x", "arguments": {}},
+        )
 
-        def fake_generate(request, generation_args, progress_callback=None):
-            ctx = SimpleNamespace(
-                has_thinking=False,
-                think_start_id=-1,
-                think_end_id=-1,
-                think_end="",
-                has_tool_calling=True,
-                tool_call_start="<tool_call>",
-                tool_call_end="</tool_call>",
-                tool_parser=lambda text, tools: {"name": "x", "arguments": {}},
-                eos_token_ids=set(),
-                stop_token_sequences=[],
-                prompt=[1, 2, 3],
-                stop=lambda: None,
-            )
-
-            def iterator():
-                yield SimpleNamespace(
-                    text="<tool_call>",
-                    token=1,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text='{"name":"x"}',
-                    token=2,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="</tool_call>",
-                    token=3,
-                    logprob=0.0,
-                    finish_reason=None,
-                    top_tokens=(),
-                )
-                yield SimpleNamespace(
-                    text="Hello",
-                    token=4,
-                    logprob=0.0,
-                    finish_reason="stop",
-                    top_tokens=(),
-                )
-
-            return ctx, iterator()
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+        with patch.object(self.response_generator, "generate", side_effect=fake):
             response = requests.post(
                 url,
                 json={
@@ -1623,6 +1356,7 @@ class TestAnthropicServer(unittest.TestCase):
             and payload.get("delta", {}).get("type") == "text_delta"
         ]
         self.assertIn("Hello", "".join(text_deltas))
+
 
 if __name__ == "__main__":
     unittest.main()
