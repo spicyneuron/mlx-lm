@@ -102,7 +102,7 @@ def _anthropic_tool_result_to_openai_tool_message(
     if is_error is not None and not isinstance(is_error, bool):
         raise ValueError("tool_result block `is_error` must be a boolean.")
 
-    out = {
+    out: Dict[str, Any] = {
         "role": "tool",
         "tool_call_id": tool_use_id,
         "content": _content_to_text(
@@ -243,40 +243,24 @@ def convert_anthropic_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
     return out
 
 
-def _run_generation_with_error_mapping(
-    ctx: Any,
-    response: Any,
-    stop_words: Any,
-    *,
-    on_value_error: Any,
-    on_unexpected_error: Any,
-    log_message: str,
-    **loop_kwargs: Any,
-) -> Optional[Any]:
-    try:
-        return run_generation_loop(
-            ctx,
-            response,
-            stop_words,
-            **loop_kwargs,
-        )
-    except ValueError as e:
-        on_value_error(str(e))
-        return None
-    except Exception:
-        logging.exception(log_message)
-        on_unexpected_error()
-        return None
-
-
-def _start_generation(
+def _run_completion_pipeline(
     handler: Any,
     request: CompletionRequest,
     args: Any,
+    emit_parsed_tool_uses: Any,
+    *,
+    on_text_segment: Any,
+    on_tool_use: Any,
+    on_value_error: Any,
+    on_unexpected_error: Any,
+    log_message: str,
     progress_callback: Optional[Any] = None,
-) -> Optional[Any]:
+    on_hidden_progress: Optional[Any] = None,
+    on_tool_call_start: Optional[Any] = None,
+    before_loop: Optional[Any] = None,
+) -> Optional[Tuple[Any, Any]]:
     try:
-        return handler.response_generator.generate(
+        generated = handler.response_generator.generate(
             request,
             args,
             progress_callback=progress_callback,
@@ -290,6 +274,31 @@ def _start_generation(
             payload=error_payload(str(e), "api_error"),
         )
         return None
+
+    ctx, response = generated
+
+    if before_loop is not None:
+        before_loop(ctx)
+
+    try:
+        result = run_generation_loop(
+            ctx,
+            response,
+            args.stop_words,
+            on_text_segment=on_text_segment,
+            on_tool_call_done=lambda raw: emit_parsed_tool_uses(raw, on_tool_use, ctx),
+            on_hidden_progress=on_hidden_progress or (lambda: None),
+            on_tool_call_start=on_tool_call_start or (lambda: None),
+        )
+    except ValueError as e:
+        on_value_error(str(e))
+        return None
+    except Exception:
+        logging.exception(log_message)
+        on_unexpected_error()
+        return None
+
+    return ctx, result
 
 
 def _write_invalid_request(handler: Any, message: str) -> None:
@@ -456,11 +465,6 @@ def _handle_non_stream_completion(
     emit_parsed_tool_uses: Any,
     effective_finish_reason: Any,
 ) -> None:
-    generated = _start_generation(handler, request, args)
-    if generated is None:
-        return
-    ctx, response = generated
-
     content_blocks: List[Dict[str, Any]] = []
 
     def append_text(text_segment: str) -> None:
@@ -471,20 +475,20 @@ def _handle_non_stream_completion(
         else:
             content_blocks.append({"type": "text", "text": text_segment})
 
-    result = _run_generation_with_error_mapping(
-        ctx,
-        response,
-        args.stop_words,
+    generated = _run_completion_pipeline(
+        handler,
+        request,
+        args,
+        emit_parsed_tool_uses,
         on_text_segment=append_text,
-        on_tool_call_done=lambda raw: emit_parsed_tool_uses(
-            raw, lambda tu: content_blocks.append(tu), ctx
-        ),
+        on_tool_use=content_blocks.append,
         on_value_error=lambda message: _write_invalid_request(handler, message),
         on_unexpected_error=lambda: _write_server_error(handler),
         log_message="Unexpected error in Anthropic completion",
     )
-    if result is None:
+    if generated is None:
         return
+    ctx, result = generated
 
     if not content_blocks:
         content_blocks = [{"type": "text", "text": ""}]
@@ -518,53 +522,43 @@ def _handle_stream_completion(
     effective_finish_reason: Any,
 ) -> None:
     sse = _SSEWriter(handler)
+    block_emitter = _StreamBlockEmitter(sse)
 
     progress_callback = make_progress_callback(
         True, lambda _processed_tokens, _total_tokens: sse.ping()
     )
 
-    generated = _start_generation(
+    def send_message_start(ctx: Any) -> None:
+        sse.send_headers()
+        sse.emit(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": handler.request_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": handler.requested_model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": len(ctx.prompt),
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                },
+            },
+        )
+
+    generated = _run_completion_pipeline(
         handler,
         request,
         args,
-        progress_callback=progress_callback,
-    )
-    if generated is None:
-        return
-    ctx, response = generated
-
-    sse.send_headers()
-    sse.emit(
-        "message_start",
-        {
-            "type": "message_start",
-            "message": {
-                "id": handler.request_id,
-                "type": "message",
-                "role": "assistant",
-                "model": handler.requested_model,
-                "content": [],
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": len(ctx.prompt),
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "output_tokens": 0,
-                },
-            },
-        },
-    )
-
-    block_emitter = _StreamBlockEmitter(sse)
-    result = _run_generation_with_error_mapping(
-        ctx,
-        response,
-        args.stop_words,
+        emit_parsed_tool_uses,
         on_text_segment=block_emitter.emit_text,
-        on_tool_call_done=lambda raw: emit_parsed_tool_uses(
-            raw, block_emitter.emit_tool_use, ctx
-        ),
+        on_tool_use=block_emitter.emit_tool_use,
         on_hidden_progress=sse.ping,
         on_tool_call_start=block_emitter.close_text,
         on_value_error=lambda message: sse.emit_safely(
@@ -574,9 +568,12 @@ def _handle_stream_completion(
             "error", error_payload("Internal server error", "api_error")
         ),
         log_message="Unexpected error in Anthropic stream",
+        progress_callback=progress_callback,
+        before_loop=send_message_start,
     )
-    if result is None:
+    if generated is None:
         return
+    _, result = generated
 
     block_emitter.close_text()
 

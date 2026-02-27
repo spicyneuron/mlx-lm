@@ -2,7 +2,6 @@
 
 import json
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
@@ -10,70 +9,24 @@ import requests
 import mlx_lm.server_anthropic as server_anthropic
 from mlx_lm.server_anthropic import convert_anthropic_messages, convert_anthropic_tools
 from mlx_lm.server_common import stopping_criteria, trim_visible_stop_text
-from tests._server_test_utils import ServerAPITestBase, collect_sse_events
+from tests._server_test_utils import (
+    ServerAPITestBase,
+    collect_sse_events,
+    event_payloads,
+    make_fake_generate,
+    make_fake_tool_generate,
+    message_delta,
+    text_deltas,
+    text_from_content_blocks,
+    tool_use_delta_payloads,
+    tool_use_start_payloads,
+    visible_event_names,
+)
 
 
 class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
 
     # Test helpers
-
-    @staticmethod
-    def _make_ctx(**overrides):
-        """Build a mock generation context with sensible defaults."""
-        defaults = dict(
-            has_thinking=False,
-            think_start_id=-1,
-            think_end_id=-1,
-            think_end="",
-            has_tool_calling=False,
-            tool_call_start="",
-            tool_call_end="",
-            eos_token_ids=set(),
-            stop_token_sequences=[],
-            prompt=[1, 2, 3],
-            stop=lambda: None,
-        )
-        defaults.update(overrides)
-        return SimpleNamespace(**defaults)
-
-    @staticmethod
-    def _make_gen(text, token, finish_reason=None):
-        return SimpleNamespace(
-            text=text,
-            token=token,
-            logprob=0.0,
-            finish_reason=finish_reason,
-            top_tokens=(),
-        )
-
-    def _make_fake_generate(self, chunks, on_call=None, **ctx_overrides):
-        """Build a fake generate function."""
-
-        def fake_generate(request, generation_args, progress_callback=None):
-            if on_call:
-                on_call(request, generation_args, progress_callback)
-            ctx = self._make_ctx(**ctx_overrides)
-
-            def iterator():
-                for idx, text in enumerate(chunks, start=1):
-                    yield self._make_gen(
-                        text,
-                        idx,
-                        finish_reason="stop" if idx == len(chunks) else None,
-                    )
-
-            return ctx, iterator()
-
-        return fake_generate
-
-    def _make_fake_tool_generate(self, chunks, tool_parser):
-        return self._make_fake_generate(
-            chunks,
-            has_tool_calling=True,
-            tool_call_start="<tool_call>",
-            tool_call_end="</tool_call>",
-            tool_parser=tool_parser,
-        )
 
     @staticmethod
     def _anthropic_tool_request(stream=False):
@@ -122,51 +75,6 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
     def _json_body(response):
         return json.loads(response.text)
 
-    @staticmethod
-    def _events(response):
-        return collect_sse_events(response)
-
-    @staticmethod
-    def _event_payloads(events, event_name):
-        return [payload for event, payload in events if event == event_name]
-
-    @staticmethod
-    def _visible_event_names(events):
-        return [event for event, _ in events if event != "ping"]
-
-    @staticmethod
-    def _text_deltas(events):
-        return [
-            payload["delta"]["text"]
-            for event, payload in events
-            if event == "content_block_delta"
-            and payload.get("delta", {}).get("type") == "text_delta"
-        ]
-
-    @classmethod
-    def _tool_use_start_payloads(cls, events):
-        return [
-            payload
-            for payload in cls._event_payloads(events, "content_block_start")
-            if payload.get("content_block", {}).get("type") == "tool_use"
-        ]
-
-    @classmethod
-    def _tool_use_delta_payloads(cls, events):
-        return [
-            payload
-            for payload in cls._event_payloads(events, "content_block_delta")
-            if payload.get("delta", {}).get("type") == "input_json_delta"
-        ]
-
-    @staticmethod
-    def _message_delta(events):
-        return [payload for event, payload in events if event == "message_delta"][-1]
-
-    @staticmethod
-    def _text_from_content_blocks(content):
-        return "".join(block["text"] for block in content if block.get("type") == "text")
-
     def _assert_anthropic_error(self, body, error_type=None, message_substring=None):
         self.assertEqual(body["type"], "error")
         self.assertIn("error", body)
@@ -184,9 +92,9 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             self.assertEqual(payload["content_block"]["input"], {})
 
     def _assert_stream_tool_inputs(self, events, expected_inputs):
-        starts = self._tool_use_start_payloads(events)
+        starts = tool_use_start_payloads(events)
         self._assert_tool_use_starts(starts, expected_name="get_weather", expected_count=len(expected_inputs))
-        deltas = self._tool_use_delta_payloads(events)
+        deltas = tool_use_delta_payloads(events)
         self.assertEqual(len(deltas), len(expected_inputs))
         for delta, expected in zip(deltas, expected_inputs):
             self.assertEqual(json.loads(delta["delta"]["partial_json"]), expected)
@@ -270,7 +178,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         def on_call(req, args, cb):
             captured["stop_words"] = args.stop_words
 
-        fake = self._make_fake_generate(["Hello"], on_call=on_call)
+        fake = make_fake_generate(["Hello"], on_call=on_call)
 
         with patch.object(self.response_generator, "generate", side_effect=fake):
             response = self._post_messages(
@@ -287,7 +195,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(captured["stop_words"], ["take-this-stop"])
 
     def test_handle_anthropic_messages_stop_sequences_stops_generation(self):
-        fake = self._make_fake_generate(
+        fake = make_fake_generate(
             ["Hello ", "STOP", "ignored"],
             stop_token_sequences=[[2]],
         )
@@ -306,7 +214,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         body = self._json_body(response)
         self.assertEqual(body["stop_reason"], "stop_sequence")
         self.assertEqual(body["stop_sequence"], "STOP")
-        self.assertEqual(self._text_from_content_blocks(body["content"]), "Hello ")
+        self.assertEqual(text_from_content_blocks(body["content"]), "Hello ")
 
     def test_handle_anthropic_messages_defaults_model_and_max_tokens(self):
         captured = {"model": None, "max_tokens": None}
@@ -315,7 +223,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             captured["model"] = args.model.model
             captured["max_tokens"] = args.max_tokens
 
-        fake = self._make_fake_generate(["Hello"], on_call=on_call)
+        fake = make_fake_generate(["Hello"], on_call=on_call)
 
         with patch.object(self.response_generator, "generate", side_effect=fake):
             response = self._post_messages(
@@ -349,7 +257,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                 )
 
     def test_handle_anthropic_messages_unexpected_loop_error_is_server_error(self):
-        fake = self._make_fake_generate(["Hello"])
+        fake = make_fake_generate(["Hello"])
 
         with patch.object(self.response_generator, "generate", side_effect=fake):
             with patch.object(
@@ -386,8 +294,8 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(body["role"], "assistant")
         self.assertEqual(body["content"][0]["type"], "text")
 
-    def test_handle_anthropic_messages_with_tools_non_stream(self):
-        fake = self._make_fake_tool_generate(
+    def test_handle_anthropic_messages_tool_use(self):
+        fake = make_fake_tool_generate(
             [
                 "<tool_call>",
                 '{"name":"get_weather","arguments":{"location":"sf"}}',
@@ -396,29 +304,40 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             lambda text, tools: json.loads(text),
         )
 
-        with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = self._post_messages(self._anthropic_tool_request())
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                with patch.object(self.response_generator, "generate", side_effect=fake):
+                    response = self._post_messages(
+                        self._anthropic_tool_request(stream=stream),
+                        stream=stream,
+                    )
+                self.assertEqual(response.status_code, 200)
 
-        self.assertEqual(response.status_code, 200)
-        body = self._json_body(response)
-        self.assertEqual(body["stop_reason"], "tool_use")
-        self._assert_non_stream_tool_inputs(body, [{"location": "sf"}])
+                if stream:
+                    events = collect_sse_events(response)
+                    self._assert_stream_tool_inputs(events, [{"location": "sf"}])
+                    self.assertEqual(message_delta(events)["delta"]["stop_reason"], "tool_use")
+                    continue
+
+                body = self._json_body(response)
+                self.assertEqual(body["stop_reason"], "tool_use")
+                self._assert_non_stream_tool_inputs(body, [{"location": "sf"}])
 
     def test_handle_anthropic_messages_streaming(self):
         response = self._post_messages(self._basic_request(stream=True), stream=True)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get("anthropic-version"), "2023-06-01")
 
-        events = self._events(response)
-        visible_event_names = self._visible_event_names(events)
-        self.assertEqual(visible_event_names[0], "message_start")
-        self.assertEqual(visible_event_names[1], "content_block_start")
-        self.assertIn("content_block_stop", visible_event_names)
-        self.assertEqual(visible_event_names[-2], "message_delta")
-        self.assertEqual(visible_event_names[-1], "message_stop")
+        events = collect_sse_events(response)
+        event_names = visible_event_names(events)
+        self.assertEqual(event_names[0], "message_start")
+        self.assertEqual(event_names[1], "content_block_start")
+        self.assertIn("content_block_stop", event_names)
+        self.assertEqual(event_names[-2], "message_delta")
+        self.assertEqual(event_names[-1], "message_stop")
         self.assertLess(
-            visible_event_names.index("content_block_stop"),
-            visible_event_names.index("message_delta"),
+            event_names.index("content_block_stop"),
+            event_names.index("message_delta"),
         )
 
         message_start = events[0][1]
@@ -427,36 +346,18 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(message_start["message"]["role"], "assistant")
         self.assertEqual(message_start["message"]["usage"]["output_tokens"], 0)
 
-        message_delta = self._message_delta(events)
-        self.assertEqual(message_delta["type"], "message_delta")
+        delta = message_delta(events)
+        self.assertEqual(delta["type"], "message_delta")
         self.assertIn(
-            message_delta["delta"]["stop_reason"],
+            delta["delta"]["stop_reason"],
             {"end_turn", "max_tokens", "stop_sequence"},
         )
-        self.assertIn("stop_sequence", message_delta["delta"])
-        self.assertIn("output_tokens", message_delta["usage"])
-        self.assertGreaterEqual(message_delta["usage"]["output_tokens"], 0)
-
-    def test_handle_anthropic_messages_streaming_tool_use(self):
-        fake = self._make_fake_tool_generate(
-            [
-                "<tool_call>",
-                '{"name":"get_weather","arguments":{"location":"sf"}}',
-                "</tool_call>",
-            ],
-            lambda text, tools: json.loads(text),
-        )
-
-        with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = self._post_messages(self._anthropic_tool_request(stream=True), stream=True)
-            self.assertEqual(response.status_code, 200)
-            events = self._events(response)
-
-        self._assert_stream_tool_inputs(events, [{"location": "sf"}])
-        self.assertEqual(self._message_delta(events)["delta"]["stop_reason"], "tool_use")
+        self.assertIn("stop_sequence", delta["delta"])
+        self.assertIn("output_tokens", delta["usage"])
+        self.assertGreaterEqual(delta["usage"]["output_tokens"], 0)
 
     def test_handle_anthropic_messages_interleaved_text_tool_order(self):
-        fake_generate = self._make_fake_tool_generate(
+        fake_generate = make_fake_tool_generate(
             [
                 "Before ",
                 "<tool_call>",
@@ -479,7 +380,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                     self.assertEqual(response.status_code, 200)
 
                 if stream:
-                    events = self._events(response)
+                    events = collect_sse_events(response)
                     block_types = [
                         payload["content_block"]["type"]
                         for event, payload in events
@@ -487,7 +388,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                     ]
                     self.assertEqual(block_types, ["text", "tool_use", "text"])
                     self.assertEqual(
-                        self._message_delta(events)["delta"]["stop_reason"],
+                        message_delta(events)["delta"]["stop_reason"],
                         "tool_use",
                     )
                 else:
@@ -501,49 +402,42 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                     self.assertEqual(body["content"][2]["text"], "After")
                     self.assertEqual(body["stop_reason"], "tool_use")
 
-    def test_handle_anthropic_messages_non_stream_tool_parse_error_returns_400(self):
-
+    def test_handle_anthropic_messages_tool_parse_error(self):
         def bad_parser(text, tools):
             raise ValueError("bad tool call json")
 
-        fake_generate = self._make_fake_tool_generate(
+        fake_generate = make_fake_tool_generate(
             ["<tool_call>", "not-json", "</tool_call>"],
             bad_parser,
         )
 
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
-            response = self._post_messages(self._anthropic_tool_request())
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+                    response = self._post_messages(
+                        self._anthropic_tool_request(stream=stream),
+                        stream=stream,
+                    )
 
-        self.assertEqual(response.status_code, 400)
-        self._assert_anthropic_error(
-            self._json_body(response),
-            error_type="invalid_request_error",
-            message_substring="bad tool call json",
-        )
+                if not stream:
+                    self.assertEqual(response.status_code, 400)
+                    self._assert_anthropic_error(
+                        self._json_body(response),
+                        error_type="invalid_request_error",
+                        message_substring="bad tool call json",
+                    )
+                    continue
 
-    def test_handle_anthropic_messages_streaming_tool_parse_error_emits_error_event(self):
-
-        def bad_parser(text, tools):
-            raise ValueError("bad tool call json")
-
-        fake_generate = self._make_fake_tool_generate(
-            ["<tool_call>", "not-json", "</tool_call>"],
-            bad_parser,
-        )
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
-            response = self._post_messages(self._anthropic_tool_request(stream=True), stream=True)
-            self.assertEqual(response.status_code, 200)
-            events = self._events(response)
-
-        self.assertTrue(any(event == "error" for event, _ in events))
-        error_payload = self._event_payloads(events, "error")[-1]
-        self.assertEqual(error_payload["type"], "error")
-        self.assertIn("bad tool call json", error_payload["error"]["message"])
-        self.assertNotEqual(events[-1][0], "message_stop")
+                self.assertEqual(response.status_code, 200)
+                events = collect_sse_events(response)
+                self.assertTrue(any(event == "error" for event, _ in events))
+                payload = event_payloads(events, "error")[-1]
+                self.assertEqual(payload["type"], "error")
+                self.assertIn("bad tool call json", payload["error"]["message"])
+                self.assertNotEqual(events[-1][0], "message_stop")
 
     def test_handle_anthropic_messages_no_tool_use_stop_reason_when_tool_list_empty(self):
-        fake_generate = self._make_fake_tool_generate(
+        fake_generate = make_fake_tool_generate(
             ["<tool_call>", '{"name":"noop","arguments":{}}', "</tool_call>"],
             lambda text, tools: [],
         )
@@ -611,7 +505,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_handle_anthropic_messages_multiple_tool_calls(self):
-        fake_generate = self._make_fake_tool_generate(
+        fake_generate = make_fake_tool_generate(
             [
                 "<tool_call>",
                 '{"name":"get_weather","arguments":{"location":"sf"}}',
@@ -635,18 +529,18 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                     self.assertEqual(response.status_code, 200)
 
                 if stream:
-                    events = self._events(response)
+                    events = collect_sse_events(response)
                     self._assert_stream_tool_inputs(
                         events,
                         [{"location": "sf"}, {"location": "nyc"}],
                     )
-                    starts = self._tool_use_start_payloads(events)
+                    starts = tool_use_start_payloads(events)
                     self.assertNotEqual(
                         starts[0]["content_block"]["id"],
                         starts[1]["content_block"]["id"],
                     )
                     self.assertEqual(
-                        self._message_delta(events)["delta"]["stop_reason"],
+                        message_delta(events)["delta"]["stop_reason"],
                         "tool_use",
                     )
                 else:
@@ -668,7 +562,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                     captured["called"] = True
                     captured["has_callback"] = cb is not None
 
-                fake = self._make_fake_generate(["Hello"], on_call=on_call)
+                fake = make_fake_generate(["Hello"], on_call=on_call)
                 request_body = self._basic_request(stream=stream)
 
                 with patch.object(self.response_generator, "generate", side_effect=fake):
@@ -684,7 +578,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
     def test_handle_anthropic_messages_hides_thinking_text(self):
         for stream in (False, True):
             with self.subTest(stream=stream):
-                fake = self._make_fake_generate(
+                fake = make_fake_generate(
                     ["internal reasoning", "</think>", "Hello"],
                     has_thinking=True,
                     think_start_id=11,
@@ -698,9 +592,9 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                     response = self._post_messages(request_body, stream=stream)
                     self.assertEqual(response.status_code, 200)
                     if stream:
-                        visible_text = "".join(self._text_deltas(self._events(response)))
+                        visible_text = "".join(text_deltas(collect_sse_events(response)))
                     else:
-                        visible_text = self._text_from_content_blocks(
+                        visible_text = text_from_content_blocks(
                             self._json_body(response)["content"]
                         )
 
@@ -708,7 +602,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                 self.assertNotIn("internal reasoning", visible_text)
 
     def test_handle_anthropic_messages_streaming_hidden_keepalive(self):
-        fake = self._make_fake_generate(
+        fake = make_fake_generate(
             ["<tool_call>", '{"name":"x"}', "</tool_call>", "Hello"],
             has_tool_calling=True,
             tool_call_start="<tool_call>",
@@ -719,11 +613,11 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         with patch.object(self.response_generator, "generate", side_effect=fake):
             response = self._post_messages(self._basic_request(stream=True), stream=True)
             self.assertEqual(response.status_code, 200)
-            events = self._events(response)
+            events = collect_sse_events(response)
 
         self.assertTrue(any(event == "ping" for event, _ in events))
         self.assertFalse(any(event == "error" for event, _ in events))
-        self.assertIn("Hello", "".join(self._text_deltas(events)))
+        self.assertIn("Hello", "".join(text_deltas(events)))
 
 
 class TestAnthropicConversion(unittest.TestCase):
