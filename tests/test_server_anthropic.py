@@ -737,7 +737,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         ]
         self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
 
-    def test_handle_anthropic_messages_non_stream_interleaved_text_tool_order(self):
+    def test_handle_anthropic_messages_interleaved_text_tool_order(self):
         url = self._messages_url()
         fake_generate = self._make_fake_tool_generate(
             [
@@ -750,51 +750,40 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             lambda text, tools: json.loads(text),
         )
 
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
-            response = requests.post(url, json=self._anthropic_tool_request())
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                with patch.object(
+                    self.response_generator, "generate", side_effect=fake_generate
+                ):
+                    response = requests.post(
+                        url,
+                        json=self._anthropic_tool_request(stream=stream),
+                        stream=stream,
+                    )
+                    self.assertEqual(response.status_code, 200)
 
-        self.assertEqual(response.status_code, 200)
-        body = json.loads(response.text)
-        self.assertEqual(
-            [block["type"] for block in body["content"]], ["text", "tool_use", "text"]
-        )
-        self.assertEqual(body["content"][0]["text"], "Before ")
-        self.assertEqual(body["content"][1]["name"], "get_weather")
-        self.assertEqual(body["content"][2]["text"], "After")
-        self.assertEqual(body["stop_reason"], "tool_use")
-
-    def test_handle_anthropic_messages_streaming_interleaved_text_tool_order(self):
-        url = self._messages_url()
-        fake_generate = self._make_fake_tool_generate(
-            [
-                "Before ",
-                "<tool_call>",
-                '{"name":"get_weather","arguments":{"location":"sf"}}',
-                "</tool_call>",
-                "After",
-            ],
-            lambda text, tools: json.loads(text),
-        )
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
-            response = requests.post(
-                url,
-                json=self._anthropic_tool_request(stream=True),
-                stream=True,
-            )
-            self.assertEqual(response.status_code, 200)
-            events = collect_sse_events(response)
-
-        block_start_types = [
-            payload["content_block"]["type"]
-            for event, payload in events
-            if event == "content_block_start"
-        ]
-        self.assertEqual(block_start_types, ["text", "tool_use", "text"])
-        message_delta = [payload for event, payload in events if event == "message_delta"][
-            -1
-        ]
-        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+                if stream:
+                    events = collect_sse_events(response)
+                    block_types = [
+                        payload["content_block"]["type"]
+                        for event, payload in events
+                        if event == "content_block_start"
+                    ]
+                    self.assertEqual(block_types, ["text", "tool_use", "text"])
+                    message_delta = [
+                        payload for event, payload in events if event == "message_delta"
+                    ][-1]
+                    self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+                else:
+                    body = json.loads(response.text)
+                    self.assertEqual(
+                        [block["type"] for block in body["content"]],
+                        ["text", "tool_use", "text"],
+                    )
+                    self.assertEqual(body["content"][0]["text"], "Before ")
+                    self.assertEqual(body["content"][1]["name"], "get_weather")
+                    self.assertEqual(body["content"][2]["text"], "After")
+                    self.assertEqual(body["stop_reason"], "tool_use")
 
     def test_handle_anthropic_messages_non_stream_tool_parse_error_returns_400(self):
         url = self._messages_url()
@@ -944,7 +933,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             message_substring="Invalid JSON",
         )
 
-    def test_handle_anthropic_messages_multiple_tool_calls_non_stream(self):
+    def test_handle_anthropic_messages_multiple_tool_calls(self):
         url = self._messages_url()
         fake_generate = self._make_fake_tool_generate(
             [
@@ -958,78 +947,65 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             lambda text, tools: json.loads(text),
         )
 
-        with patch.object(
-            self.response_generator, "generate", side_effect=fake_generate
-        ):
-            response = requests.post(url, json=self._anthropic_tool_request())
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                with patch.object(
+                    self.response_generator, "generate", side_effect=fake_generate
+                ):
+                    response = requests.post(
+                        url,
+                        json=self._anthropic_tool_request(stream=stream),
+                        stream=stream,
+                    )
+                    self.assertEqual(response.status_code, 200)
 
-        self.assertEqual(response.status_code, 200)
-        body = json.loads(response.text)
-        tool_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
-        self.assertEqual(len(tool_blocks), 2)
-        self.assertEqual(tool_blocks[0]["input"], {"location": "sf"})
-        self.assertEqual(tool_blocks[1]["input"], {"location": "nyc"})
-        # Each tool use should have a unique ID
-        self.assertNotEqual(tool_blocks[0]["id"], tool_blocks[1]["id"])
-        self.assertEqual(body["stop_reason"], "tool_use")
+                if stream:
+                    events = collect_sse_events(response)
+                    tool_starts = [
+                        payload
+                        for event, payload in events
+                        if event == "content_block_start"
+                        and payload["content_block"]["type"] == "tool_use"
+                    ]
+                    self.assertEqual(len(tool_starts), 2)
+                    self.assertEqual(
+                        tool_starts[0]["content_block"]["name"], "get_weather"
+                    )
+                    self.assertEqual(
+                        tool_starts[1]["content_block"]["name"], "get_weather"
+                    )
+                    self.assertNotEqual(
+                        tool_starts[0]["content_block"]["id"],
+                        tool_starts[1]["content_block"]["id"],
+                    )
 
-    def test_handle_anthropic_messages_multiple_tool_calls_streaming(self):
-        url = self._messages_url()
-        fake_generate = self._make_fake_tool_generate(
-            [
-                "<tool_call>",
-                '{"name":"get_weather","arguments":{"location":"sf"}}',
-                "</tool_call>",
-                "<tool_call>",
-                '{"name":"get_weather","arguments":{"location":"nyc"}}',
-                "</tool_call>",
-            ],
-            lambda text, tools: json.loads(text),
-        )
-
-        with patch.object(
-            self.response_generator, "generate", side_effect=fake_generate
-        ):
-            response = requests.post(
-                url,
-                json=self._anthropic_tool_request(stream=True),
-                stream=True,
-            )
-            self.assertEqual(response.status_code, 200)
-            events = collect_sse_events(response)
-
-        tool_starts = [
-            payload
-            for event, payload in events
-            if event == "content_block_start"
-            and payload["content_block"]["type"] == "tool_use"
-        ]
-        self.assertEqual(len(tool_starts), 2)
-        self.assertEqual(tool_starts[0]["content_block"]["name"], "get_weather")
-        self.assertEqual(tool_starts[1]["content_block"]["name"], "get_weather")
-        self.assertNotEqual(
-            tool_starts[0]["content_block"]["id"],
-            tool_starts[1]["content_block"]["id"],
-        )
-
-        tool_deltas = [
-            payload
-            for event, payload in events
-            if event == "content_block_delta"
-            and payload["delta"]["type"] == "input_json_delta"
-        ]
-        self.assertEqual(len(tool_deltas), 2)
-        self.assertEqual(
-            json.loads(tool_deltas[0]["delta"]["partial_json"]), {"location": "sf"}
-        )
-        self.assertEqual(
-            json.loads(tool_deltas[1]["delta"]["partial_json"]), {"location": "nyc"}
-        )
-
-        message_delta = [
-            payload for event, payload in events if event == "message_delta"
-        ][-1]
-        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+                    tool_deltas = [
+                        payload
+                        for event, payload in events
+                        if event == "content_block_delta"
+                        and payload["delta"]["type"] == "input_json_delta"
+                    ]
+                    self.assertEqual(len(tool_deltas), 2)
+                    self.assertEqual(
+                        json.loads(tool_deltas[0]["delta"]["partial_json"]),
+                        {"location": "sf"},
+                    )
+                    self.assertEqual(
+                        json.loads(tool_deltas[1]["delta"]["partial_json"]),
+                        {"location": "nyc"},
+                    )
+                    message_delta = [
+                        payload for event, payload in events if event == "message_delta"
+                    ][-1]
+                    self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
+                else:
+                    body = json.loads(response.text)
+                    tool_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
+                    self.assertEqual(len(tool_blocks), 2)
+                    self.assertEqual(tool_blocks[0]["input"], {"location": "sf"})
+                    self.assertEqual(tool_blocks[1]["input"], {"location": "nyc"})
+                    self.assertNotEqual(tool_blocks[0]["id"], tool_blocks[1]["id"])
+                    self.assertEqual(body["stop_reason"], "tool_use")
 
     def test_trim_visible_stop_text(self):
         from mlx_lm.server_common import trim_visible_stop_text
