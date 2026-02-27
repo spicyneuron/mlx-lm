@@ -220,15 +220,41 @@ def convert_anthropic_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
     return out
 
 
+def _start_generation(
+    handler: Any,
+    request: CompletionRequest,
+    args: Any,
+    progress_callback: Optional[Any] = None,
+) -> Optional[Any]:
+    try:
+        return handler.response_generator.generate(
+            request,
+            args,
+            progress_callback=progress_callback,
+        )
+    except Exception as e:
+        # NOTE: Existing OpenAI-compatible endpoints also use HTTP 404 here.
+        # Keeping this status avoids cross-endpoint behavior drift.
+        write_json_response(
+            handler,
+            status_code=404,
+            payload=error_payload(str(e), "api_error"),
+        )
+        return None
+
+
 def _handle_non_stream_completion(
     handler: Any,
     request: CompletionRequest,
     args: Any,
-    ctx: Any,
-    response: Any,
     emit_parsed_tool_uses: Any,
     effective_finish_reason: Any,
 ) -> None:
+    generated = _start_generation(handler, request, args)
+    if generated is None:
+        return
+    ctx, response = generated
+
     content_blocks: List[Dict[str, Any]] = []
 
     def append_text(text_segment: str) -> None:
@@ -246,7 +272,7 @@ def _handle_non_stream_completion(
             args.stop_words,
             on_text_segment=append_text,
             on_tool_call_done=lambda raw: emit_parsed_tool_uses(
-                raw, lambda tu: content_blocks.append(tu)
+                raw, lambda tu: content_blocks.append(tu), ctx
             ),
         )
     except ValueError as e:
@@ -289,55 +315,14 @@ def _handle_non_stream_completion(
     )
 
 
-def handle_post(handler: Any) -> None:
-    """Handle POST /v1/messages using APIHandler primitives."""
-    success, decoded = load_json_body(handler)
-    if not success:
-        write_json_response(
-            handler,
-            status_code=400,
-            payload=error_payload(
-                f"Invalid JSON in request body: {decoded}",
-                "invalid_request_error",
-            ),
-        )
-        return
-    handler.body = decoded
-
-    if not isinstance(handler.body, dict):
-        write_json_response(
-            handler,
-            status_code=400,
-            payload=error_payload(
-                "Request body must be a JSON object",
-                "invalid_request_error",
-            ),
-        )
-        return
-
-    # Anthropic uses stop_sequences instead of stop
-    args = handler._parse_and_build_args(
-        handler.body.get("stop_sequences"),
-        handler.body.get("max_tokens"),
-    )
-
-    handler.request_id = f"msg_{uuid.uuid4().hex}"
-
-    try:
-        request = CompletionRequest(
-            "chat",
-            "",
-            convert_anthropic_messages(handler.body),
-            convert_anthropic_tools(handler.body.get("tools")),
-            None,
-        )
-    except ValueError as e:
-        write_json_response(
-            handler,
-            status_code=400,
-            payload=error_payload(str(e), "invalid_request_error"),
-        )
-        return
+def _handle_stream_completion(
+    handler: Any,
+    request: CompletionRequest,
+    args: Any,
+    emit_parsed_tool_uses: Any,
+    effective_finish_reason: Any,
+) -> None:
+    headers_sent = False
 
     def write_sse_event(event: str, data: Dict[str, Any]) -> None:
         handler.wfile.write(f"event: {event}\n".encode())
@@ -345,62 +330,26 @@ def handle_post(handler: Any) -> None:
         handler.wfile.flush()
 
     def write_sse_ping() -> None:
+        if not headers_sent:
+            return
         try:
             write_sse_event("ping", {"type": "ping"})
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
-    progress_callback = (
-        make_progress_callback(
-            handler.stream, lambda _processed_tokens, _total_tokens: write_sse_ping()
-        )
-        if handler.stream
-        else None
+    progress_callback = make_progress_callback(
+        True, lambda _processed_tokens, _total_tokens: write_sse_ping()
     )
 
-    try:
-        ctx, response = handler.response_generator.generate(
-            request,
-            args,
-            progress_callback=progress_callback,
-        )
-    except Exception as e:
-        # NOTE: Existing OpenAI-compatible endpoints also use HTTP 404 here.
-        # Keeping this status avoids cross-endpoint behavior drift.
-        write_json_response(
-            handler,
-            status_code=404,
-            payload=error_payload(str(e), "api_error"),
-        )
+    generated = _start_generation(
+        handler,
+        request,
+        args,
+        progress_callback=progress_callback,
+    )
+    if generated is None:
         return
-
-    # Shared state for tool-use tracking. The shared loop sets
-    # made_tool_call when delimiters are seen; has_tool_use tracks whether
-    # parsed tool uses were actually produced (parser may return empty).
-    has_tool_use = False
-
-    def emit_parsed_tool_uses(raw_tool_text, on_emit):
-        nonlocal has_tool_use
-        for tu in _parse_generated_tool_uses(raw_tool_text, ctx, request.tools):
-            has_tool_use = True
-            on_emit(tu)
-
-    def effective_finish_reason(result):
-        if result.finish_reason == "tool_calls" and not has_tool_use:
-            return "stop"
-        return result.finish_reason
-
-    if not handler.stream:
-        _handle_non_stream_completion(
-            handler,
-            request,
-            args,
-            ctx,
-            response,
-            emit_parsed_tool_uses,
-            effective_finish_reason,
-        )
-        return
+    ctx, response = generated
 
     handler.send_response(200)
     handler.send_header("Content-type", "text/event-stream")
@@ -409,6 +358,7 @@ def handle_post(handler: Any) -> None:
     handler.send_header("request-id", handler.request_id)
     handler._set_cors_headers()
     handler.end_headers()
+    headers_sent = True
 
     write_sse_event(
         "message_start",
@@ -508,7 +458,7 @@ def handle_post(handler: Any) -> None:
             args.stop_words,
             on_text_segment=emit_text_segment,
             on_tool_call_done=lambda raw: emit_parsed_tool_uses(
-                raw, emit_tool_use_block
+                raw, emit_tool_use_block, ctx
             ),
             on_hidden_progress=write_sse_ping,
             on_tool_call_start=close_text_block,
@@ -525,9 +475,7 @@ def handle_post(handler: Any) -> None:
     except Exception:
         logging.exception("Unexpected error in Anthropic stream")
         try:
-            write_sse_event(
-                "error", error_payload("Internal server error", "api_error")
-            )
+            write_sse_event("error", error_payload("Internal server error", "api_error"))
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         return
@@ -548,6 +496,91 @@ def handle_post(handler: Any) -> None:
         },
     )
     write_sse_event("message_stop", {"type": "message_stop"})
+
+
+def handle_post(handler: Any) -> None:
+    """Handle POST /v1/messages using APIHandler primitives."""
+    success, decoded = load_json_body(handler)
+    if not success:
+        write_json_response(
+            handler,
+            status_code=400,
+            payload=error_payload(
+                f"Invalid JSON in request body: {decoded}",
+                "invalid_request_error",
+            ),
+        )
+        return
+    handler.body = decoded
+
+    if not isinstance(handler.body, dict):
+        write_json_response(
+            handler,
+            status_code=400,
+            payload=error_payload(
+                "Request body must be a JSON object",
+                "invalid_request_error",
+            ),
+        )
+        return
+
+    # Anthropic uses stop_sequences instead of stop
+    args = handler._parse_and_build_args(
+        handler.body.get("stop_sequences"),
+        handler.body.get("max_tokens"),
+    )
+
+    handler.request_id = f"msg_{uuid.uuid4().hex}"
+
+    try:
+        request = CompletionRequest(
+            "chat",
+            "",
+            convert_anthropic_messages(handler.body),
+            convert_anthropic_tools(handler.body.get("tools")),
+            None,
+        )
+    except ValueError as e:
+        write_json_response(
+            handler,
+            status_code=400,
+            payload=error_payload(str(e), "invalid_request_error"),
+        )
+        return
+
+    # Shared state for tool-use tracking. The shared loop sets
+    # made_tool_call when delimiters are seen; has_tool_use tracks whether
+    # parsed tool uses were actually produced (parser may return empty).
+    has_tool_use = False
+
+    def emit_parsed_tool_uses(raw_tool_text, on_emit, ctx):
+        nonlocal has_tool_use
+        for tu in _parse_generated_tool_uses(raw_tool_text, ctx, request.tools):
+            has_tool_use = True
+            on_emit(tu)
+
+    def effective_finish_reason(result):
+        if result.finish_reason == "tool_calls" and not has_tool_use:
+            return "stop"
+        return result.finish_reason
+
+    if not handler.stream:
+        _handle_non_stream_completion(
+            handler,
+            request,
+            args,
+            emit_parsed_tool_uses,
+            effective_finish_reason,
+        )
+        return
+
+    _handle_stream_completion(
+        handler,
+        request,
+        args,
+        emit_parsed_tool_uses,
+        effective_finish_reason,
+    )
 
 
 # Tool parsing
