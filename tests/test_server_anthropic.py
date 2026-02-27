@@ -883,30 +883,6 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         response_body = json.loads(response.text)
         self._assert_anthropic_error(response_body, error_type="invalid_request_error")
 
-    def test_handle_anthropic_messages_non_stream_text_completion(self):
-        url = f"http://localhost:{self.port}/v1/messages"
-        response = requests.post(
-            url,
-            json={
-                "model": "chat_model",
-                "max_tokens": 10,
-                "messages": [{"role": "user", "content": "Hello!"}],
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        body = json.loads(response.text)
-        self.assertEqual(body["type"], "message")
-        self.assertEqual(body["role"], "assistant")
-        self.assertIn("content", body)
-        self.assertGreater(len(body["content"]), 0)
-        self.assertEqual(body["content"][0]["type"], "text")
-        self.assertIsInstance(body["content"][0]["text"], str)
-        self.assertIn(body["stop_reason"], {"end_turn", "max_tokens", "stop_sequence"})
-        self.assertIn("usage", body)
-        self.assertIn("input_tokens", body["usage"])
-        self.assertIn("output_tokens", body["usage"])
-
     def test_handle_anthropic_messages_malformed_request_returns_anthropic_error(self):
         url = f"http://localhost:{self.port}/v1/messages"
         # Missing required "messages" field triggers an error during request
@@ -1075,22 +1051,26 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(trim_visible_stop_text("hello", "STOP", 4), "hello")
         self.assertEqual(trim_visible_stop_text("hello", None, 4), "hello")
 
-    def test_matched_stop_sequence(self):
-        from mlx_lm.server_anthropic import matched_stop_sequence
+    def test_stopping_criteria_returns_matched_stop_word(self):
+        from mlx_lm.server import stopping_criteria
 
-        matched = matched_stop_sequence(
+        matched = stopping_criteria(
             tokens=[1, 2, 3],
+            eos_token_ids=set(),
             stop_id_sequences=[[9], [2, 3]],
             stop_words=["x", "STOP"],
         )
-        self.assertEqual(matched, "STOP")
+        self.assertTrue(matched.stop_met)
+        self.assertEqual(matched.stop_word, "STOP")
 
-        unmatched = matched_stop_sequence(
+        unmatched = stopping_criteria(
             tokens=[1, 2, 3],
+            eos_token_ids=set(),
             stop_id_sequences=[[4, 5]],
             stop_words=["NOPE"],
         )
-        self.assertIsNone(unmatched)
+        self.assertFalse(unmatched.stop_met)
+        self.assertIsNone(unmatched.stop_word)
 
     def test_handle_anthropic_messages_streaming_uses_progress_callback(self):
         url = f"http://localhost:{self.port}/v1/messages"

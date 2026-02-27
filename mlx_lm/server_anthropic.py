@@ -321,7 +321,7 @@ def handle_post(handler: Any) -> None:
                 request=request,
                 ctx=ctx,
                 response=response,
-                stop_words=stop_words,
+                stop_words=args.stop_words,
                 on_text_segment=append_text,
                 on_tool_use=lambda tu: content_blocks.append(tu),
             )
@@ -469,7 +469,7 @@ def handle_post(handler: Any) -> None:
             request=request,
             ctx=ctx,
             response=response,
-            stop_words=stop_words,
+            stop_words=args.stop_words,
             on_text_segment=emit_text_segment,
             on_tool_use=emit_tool_use_block,
             on_hidden_progress=write_sse_ping,
@@ -516,29 +516,11 @@ def handle_post(handler: Any) -> None:
 
 
 @dataclass
-class _TextState:
-    in_reasoning: bool
-    in_tool_call: bool = False
-
-
-@dataclass
 class GenerationResult:
     tokens: List[int]
     finish_reason: str
     stop_sequence: Optional[str]
     has_tool_use: bool
-
-
-def _make_text_state(ctx: Any) -> _TextState:
-    in_reasoning = False
-    if ctx.has_thinking:
-        for i in range(len(ctx.prompt) - 1, -1, -1):
-            if ctx.prompt[i] == ctx.think_end_id:
-                break
-            elif ctx.prompt[i] == ctx.think_start_id:
-                in_reasoning = True
-                break
-    return _TextState(in_reasoning=in_reasoning)
 
 
 def trim_visible_stop_text(
@@ -551,18 +533,7 @@ def trim_visible_stop_text(
     return text[: max(0, len(text) - trim_text_length)]
 
 
-def matched_stop_sequence(
-    tokens: List[int],
-    stop_id_sequences: List[List[int]],
-    stop_words: List[str],
-) -> Optional[str]:
-    for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
-        if len(tokens) >= len(stop_ids) and tokens[-len(stop_ids) :] == stop_ids:
-            return stop_word
-    return None
-
-
-def _parse_tool_call_payloads(
+def _parse_generated_tool_uses(
     tool_calls: List[str], ctx: Any, tools: Optional[List[Any]]
 ) -> List[Dict[str, Any]]:
     if not tool_calls:
@@ -595,21 +566,12 @@ def _parse_tool_call_payloads(
         call_id = parsed.get("id")
         if call_id is not None and not isinstance(call_id, str):
             raise ValueError("Parsed tool call `id` must be a string.")
-        out.append({"id": call_id, "name": name, "arguments": arguments})
-    return out
-
-
-def _parse_generated_tool_uses(
-    tool_calls: List[str], ctx: Any, tools: Optional[List[Any]]
-) -> List[Dict[str, Any]]:
-    out = []
-    for parsed_call in _parse_tool_call_payloads(tool_calls, ctx, tools):
         out.append(
             {
                 "type": "tool_use",
-                "id": parsed_call["id"] or f"toolu_{uuid.uuid4().hex}",
-                "name": parsed_call["name"],
-                "input": parsed_call["arguments"],
+                "id": call_id or f"toolu_{uuid.uuid4().hex}",
+                "name": name,
+                "input": arguments,
             }
         )
     return out
@@ -636,9 +598,17 @@ def run_generation_loop(
     segment = ""
     finish_reason = "length"
     stop_sequence = None
-    state = _make_text_state(ctx)
     tool_text = ""
     has_tool_use = False
+    in_tool_call = False
+    in_reasoning = False
+    if ctx.has_thinking:
+        for i in range(len(ctx.prompt) - 1, -1, -1):
+            if ctx.prompt[i] == ctx.think_end_id:
+                break
+            elif ctx.prompt[i] == ctx.think_start_id:
+                in_reasoning = True
+                break
 
     def flush_segment():
         nonlocal segment
@@ -660,18 +630,18 @@ def run_generation_loop(
         tokens.append(gen.token)
         visible = ""
 
-        if state.in_reasoning:
+        if in_reasoning:
             if gen.text == ctx.think_end:
-                state.in_reasoning = False
+                in_reasoning = False
         elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
             flush_segment()
             on_tool_call_start()
-            state.in_tool_call = True
-        elif state.in_tool_call:
+            in_tool_call = True
+        elif in_tool_call:
             if gen.text == ctx.tool_call_end:
                 emit_tool_uses(tool_text)
                 tool_text = ""
-                state.in_tool_call = False
+                in_tool_call = False
             else:
                 tool_text += gen.text
         else:
@@ -691,9 +661,7 @@ def run_generation_loop(
         if stop_condition.stop_met:
             finish_reason = "stop"
             if stop_condition.trim_length > 0:
-                stop_sequence = matched_stop_sequence(
-                    tokens, ctx.stop_token_sequences, stop_words
-                )
+                stop_sequence = stop_condition.stop_word
                 tokens = tokens[: len(tokens) - stop_condition.trim_length]
             segment = trim_visible_stop_text(
                 segment, stop_sequence, stop_condition.trim_text_length
@@ -714,7 +682,7 @@ def run_generation_loop(
         elif not visible:
             on_hidden_progress()
 
-    if state.in_tool_call and tool_text:
+    if in_tool_call and tool_text:
         emit_tool_uses(tool_text)
 
     flush_segment()

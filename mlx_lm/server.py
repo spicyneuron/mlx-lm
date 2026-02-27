@@ -71,6 +71,7 @@ class StopCondition(NamedTuple):
     stop_met: bool
     trim_length: int
     trim_text_length: int
+    stop_word: Optional[str] = None
 
 
 def stopping_criteria(
@@ -110,6 +111,7 @@ def stopping_criteria(
                     stop_met=True,
                     trim_length=len(stop_ids),
                     trim_text_length=len(stop_word),
+                    stop_word=stop_word,
                 )
 
     return StopCondition(stop_met=False, trim_length=0, trim_text_length=0)
