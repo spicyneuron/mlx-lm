@@ -8,6 +8,8 @@ from unittest.mock import patch
 import requests
 
 import mlx_lm.server_anthropic as server_anthropic
+from mlx_lm.server_anthropic import convert_anthropic_messages, convert_anthropic_tools
+from mlx_lm.server_common import stopping_criteria, trim_visible_stop_text
 from tests._server_test_utils import ServerAPITestBase, collect_sse_events
 
 
@@ -37,18 +39,16 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
     @staticmethod
     def _make_gen(text, token, finish_reason=None):
         return SimpleNamespace(
-            text=text, token=token, logprob=0.0,
-            finish_reason=finish_reason, top_tokens=(),
+            text=text,
+            token=token,
+            logprob=0.0,
+            finish_reason=finish_reason,
+            top_tokens=(),
         )
 
     def _make_fake_generate(self, chunks, on_call=None, **ctx_overrides):
-        """Build a fake generate function.
+        """Build a fake generate function."""
 
-        Args:
-            chunks: list of text strings to yield as tokens
-            on_call: optional callback(request, generation_args, progress_callback)
-            **ctx_overrides: overrides for _make_ctx
-        """
         def fake_generate(request, generation_args, progress_callback=None):
             if on_call:
                 on_call(request, generation_args, progress_callback)
@@ -57,7 +57,8 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             def iterator():
                 for idx, text in enumerate(chunks, start=1):
                     yield self._make_gen(
-                        text, idx,
+                        text,
+                        idx,
                         finish_reason="stop" if idx == len(chunks) else None,
                     )
 
@@ -94,15 +95,79 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             body["stream"] = True
         return body
 
+    @staticmethod
+    def _basic_request(message="Hello!", stream=False):
+        body = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": message}],
+        }
+        if stream:
+            body["stream"] = True
+        return body
+
     def _messages_url(self, query=""):
         url = f"http://localhost:{self.port}/v1/messages"
         if query:
             return f"{url}?{query}"
         return url
 
-    def _assert_anthropic_error(
-        self, body, error_type=None, message_substring=None
-    ):
+    def _post_messages(self, body, *, stream=False, query=""):
+        return requests.post(self._messages_url(query), json=body, stream=stream)
+
+    def _post_raw(self, data, headers):
+        return requests.post(self._messages_url(), data=data, headers=headers)
+
+    @staticmethod
+    def _json_body(response):
+        return json.loads(response.text)
+
+    @staticmethod
+    def _events(response):
+        return collect_sse_events(response)
+
+    @staticmethod
+    def _event_payloads(events, event_name):
+        return [payload for event, payload in events if event == event_name]
+
+    @staticmethod
+    def _visible_event_names(events):
+        return [event for event, _ in events if event != "ping"]
+
+    @staticmethod
+    def _text_deltas(events):
+        return [
+            payload["delta"]["text"]
+            for event, payload in events
+            if event == "content_block_delta"
+            and payload.get("delta", {}).get("type") == "text_delta"
+        ]
+
+    @classmethod
+    def _tool_use_start_payloads(cls, events):
+        return [
+            payload
+            for payload in cls._event_payloads(events, "content_block_start")
+            if payload.get("content_block", {}).get("type") == "tool_use"
+        ]
+
+    @classmethod
+    def _tool_use_delta_payloads(cls, events):
+        return [
+            payload
+            for payload in cls._event_payloads(events, "content_block_delta")
+            if payload.get("delta", {}).get("type") == "input_json_delta"
+        ]
+
+    @staticmethod
+    def _message_delta(events):
+        return [payload for event, payload in events if event == "message_delta"][-1]
+
+    @staticmethod
+    def _text_from_content_blocks(content):
+        return "".join(block["text"] for block in content if block.get("type") == "text")
+
+    def _assert_anthropic_error(self, body, error_type=None, message_substring=None):
         self.assertEqual(body["type"], "error")
         self.assertIn("error", body)
         self.assertIsInstance(body["error"], dict)
@@ -111,91 +176,95 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         if message_substring is not None:
             self.assertIn(message_substring, body["error"]["message"])
 
-    # Tests
+    def _assert_tool_use_starts(self, starts, expected_name, expected_count):
+        self.assertEqual(len(starts), expected_count)
+        for payload in starts:
+            self.assertEqual(payload["content_block"]["name"], expected_name)
+            self.assertTrue(payload["content_block"]["id"].startswith("toolu_"))
+            self.assertEqual(payload["content_block"]["input"], {})
+
+    def _assert_stream_tool_inputs(self, events, expected_inputs):
+        starts = self._tool_use_start_payloads(events)
+        self._assert_tool_use_starts(starts, expected_name="get_weather", expected_count=len(expected_inputs))
+        deltas = self._tool_use_delta_payloads(events)
+        self.assertEqual(len(deltas), len(expected_inputs))
+        for delta, expected in zip(deltas, expected_inputs):
+            self.assertEqual(json.loads(delta["delta"]["partial_json"]), expected)
+
+    def _assert_non_stream_tool_inputs(self, body, expected_inputs):
+        tool_blocks = [block for block in body["content"] if block["type"] == "tool_use"]
+        self.assertEqual(len(tool_blocks), len(expected_inputs))
+        for block, expected in zip(tool_blocks, expected_inputs):
+            self.assertEqual(block["name"], "get_weather")
+            self.assertTrue(block["id"].startswith("toolu_"))
+            self.assertEqual(block["input"], expected)
+
+    # Endpoint tests
 
     def test_handle_anthropic_messages(self):
-        url = self._messages_url()
-        post_data = {
-            "model": "chat_model",
-            "max_tokens": 10,
-            "messages": [{"role": "user", "content": "Hello!"}],
-        }
-        response = requests.post(url, json=post_data)
+        response = self._post_messages(self._basic_request())
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get("anthropic-version"), "2023-06-01")
 
-        response_body = json.loads(response.text)
-        self.assertTrue(response_body["id"].startswith("msg_"))
-        self.assertEqual(response_body["type"], "message")
-        self.assertEqual(response_body["role"], "assistant")
-        self.assertEqual(response_body["model"], "chat_model")
-        self.assertIsInstance(response_body["content"], list)
-        self.assertEqual(response_body["content"][0]["type"], "text")
-        self.assertIn("text", response_body["content"][0])
-        self.assertIn(
-            response_body["stop_reason"], {"end_turn", "max_tokens", "stop_sequence"}
-        )
-        self.assertIn("stop_sequence", response_body)
-        self.assertIn("usage", response_body)
-        self.assertIn("input_tokens", response_body["usage"])
-        self.assertIn("output_tokens", response_body["usage"])
+        body = self._json_body(response)
+        self.assertTrue(body["id"].startswith("msg_"))
+        self.assertEqual(body["type"], "message")
+        self.assertEqual(body["role"], "assistant")
+        self.assertEqual(body["model"], "chat_model")
+        self.assertIsInstance(body["content"], list)
+        self.assertEqual(body["content"][0]["type"], "text")
+        self.assertIn("text", body["content"][0])
+        self.assertIn(body["stop_reason"], {"end_turn", "max_tokens", "stop_sequence"})
+        self.assertIn("stop_sequence", body)
+        self.assertIn("usage", body)
+        self.assertIn("input_tokens", body["usage"])
+        self.assertIn("output_tokens", body["usage"])
 
     def test_handle_anthropic_messages_requires_messages(self):
-        url = self._messages_url()
-        response = requests.post(url, json={"model": "chat_model", "max_tokens": 10})
+        response = self._post_messages({"model": "chat_model", "max_tokens": 10})
         self.assertEqual(response.status_code, 400)
-        response_body = json.loads(response.text)
         self._assert_anthropic_error(
-            response_body,
+            self._json_body(response),
             error_type="invalid_request_error",
             message_substring="messages",
         )
 
     def test_handle_anthropic_messages_requires_object_body(self):
-        url = self._messages_url()
-        response = requests.post(url, json=["not", "an", "object"])
+        response = self._post_messages(["not", "an", "object"])
         self.assertEqual(response.status_code, 400)
-        body = json.loads(response.text)
         self._assert_anthropic_error(
-            body,
+            self._json_body(response),
             error_type="invalid_request_error",
             message_substring="JSON object",
         )
 
     def test_handle_anthropic_messages_with_query_string(self):
-        url = self._messages_url("beta=true&anthropic-version=2023-06-01")
-        post_data = {
-            "model": "chat_model",
-            "max_tokens": 10,
-            "messages": [{"role": "user", "content": "Hello!"}],
-        }
-        response = requests.post(url, json=post_data)
+        response = self._post_messages(
+            self._basic_request(),
+            query="beta=true&anthropic-version=2023-06-01",
+        )
         self.assertEqual(response.status_code, 200)
-        response_body = json.loads(response.text)
-        self.assertEqual(response_body["type"], "message")
-        self.assertEqual(response_body["role"], "assistant")
+        body = self._json_body(response)
+        self.assertEqual(body["type"], "message")
+        self.assertEqual(body["role"], "assistant")
 
     def test_handle_anthropic_messages_rejects_text_block_missing_text_field(self):
-        url = self._messages_url()
-        response = requests.post(
-            url,
-            json={
+        response = self._post_messages(
+            {
                 "model": "chat_model",
                 "max_tokens": 10,
                 "system": [{"type": "text"}],
                 "messages": [{"role": "user", "content": "Hello!"}],
-            },
+            }
         )
         self.assertEqual(response.status_code, 400)
-        response_body = json.loads(response.text)
         self._assert_anthropic_error(
-            response_body,
+            self._json_body(response),
             error_type="invalid_request_error",
             message_substring="valid `text`",
         )
 
     def test_handle_anthropic_messages_uses_stop_sequences_field(self):
-        url = self._messages_url()
         captured = {"stop_words": None}
 
         def on_call(req, args, cb):
@@ -204,49 +273,42 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         fake = self._make_fake_generate(["Hello"], on_call=on_call)
 
         with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
+            response = self._post_messages(
+                {
                     "model": "chat_model",
                     "max_tokens": 10,
                     "messages": [{"role": "user", "content": "Hello!"}],
                     "stop": ["ignored-stop"],
                     "stop_sequences": ["take-this-stop"],
-                },
+                }
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(captured["stop_words"], ["take-this-stop"])
 
     def test_handle_anthropic_messages_stop_sequences_stops_generation(self):
-        url = self._messages_url()
         fake = self._make_fake_generate(
             ["Hello ", "STOP", "ignored"],
             stop_token_sequences=[[2]],
         )
 
         with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
+            response = self._post_messages(
+                {
                     "model": "chat_model",
                     "max_tokens": 10,
                     "messages": [{"role": "user", "content": "Hello!"}],
                     "stop_sequences": ["STOP"],
-                },
+                }
             )
 
         self.assertEqual(response.status_code, 200)
-        body = json.loads(response.text)
-        text_blocks = [
-            block["text"] for block in body["content"] if block.get("type") == "text"
-        ]
+        body = self._json_body(response)
         self.assertEqual(body["stop_reason"], "stop_sequence")
         self.assertEqual(body["stop_sequence"], "STOP")
-        self.assertEqual("".join(text_blocks), "Hello ")
+        self.assertEqual(self._text_from_content_blocks(body["content"]), "Hello ")
 
     def test_handle_anthropic_messages_defaults_model_and_max_tokens(self):
-        url = self._messages_url()
         captured = {"model": None, "max_tokens": None}
 
         def on_call(req, args, cb):
@@ -256,50 +318,37 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         fake = self._make_fake_generate(["Hello"], on_call=on_call)
 
         with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
+            response = self._post_messages(
+                {
                     "messages": [{"role": "user", "content": "Hello!"}],
-                },
+                }
             )
 
         self.assertEqual(response.status_code, 200)
-        body = json.loads(response.text)
+        body = self._json_body(response)
         self.assertEqual(body["model"], "default_model")
         self.assertEqual(captured["model"], "default_model")
-        self.assertEqual(
-            captured["max_tokens"], self.response_generator.cli_args.max_tokens
-        )
+        self.assertEqual(captured["max_tokens"], self.response_generator.cli_args.max_tokens)
 
     def test_handle_anthropic_messages_generate_error_uses_anthropic_schema(self):
-        url = self._messages_url()
         for stream in (False, True):
             with self.subTest(stream=stream):
-                request_body = {
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                }
-                if stream:
-                    request_body["stream"] = True
-
+                request_body = self._basic_request(stream=stream)
                 with patch.object(
                     self.response_generator,
                     "generate",
                     side_effect=RuntimeError("generation failed"),
                 ):
-                    response = requests.post(url, json=request_body)
+                    response = self._post_messages(request_body)
 
                 self.assertEqual(response.status_code, 404)
-                body = json.loads(response.text)
                 self._assert_anthropic_error(
-                    body,
+                    self._json_body(response),
                     error_type="api_error",
                     message_substring="generation failed",
                 )
 
     def test_handle_anthropic_messages_unexpected_loop_error_is_server_error(self):
-        url = self._messages_url()
         fake = self._make_fake_generate(["Hello"])
 
         with patch.object(self.response_generator, "generate", side_effect=fake):
@@ -308,26 +357,377 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                 "run_generation_loop",
                 side_effect=RuntimeError("unexpected"),
             ):
-                response = requests.post(
-                    url,
-                    json={
-                        "model": "chat_model",
-                        "max_tokens": 10,
-                        "messages": [{"role": "user", "content": "Hello!"}],
-                    },
-                )
+                response = self._post_messages(self._basic_request())
 
         self.assertEqual(response.status_code, 500)
-        body = json.loads(response.text)
         self._assert_anthropic_error(
-            body,
+            self._json_body(response),
             error_type="api_error",
             message_substring="Internal server error",
         )
 
-    def test_convert_anthropic_messages_with_tool_blocks(self):
-        from mlx_lm.server_anthropic import convert_anthropic_messages
+    def test_handle_anthropic_messages_with_blocks_and_system(self):
+        response = self._post_messages(
+            {
+                "model": "chat_model",
+                "max_tokens": 10,
+                "system": [{"type": "text", "text": "You are a helpful assistant."}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Say hi."}],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(response.status_code, 200)
+        body = self._json_body(response)
+        self.assertEqual(body["type"], "message")
+        self.assertEqual(body["role"], "assistant")
+        self.assertEqual(body["content"][0]["type"], "text")
 
+    def test_handle_anthropic_messages_with_tools_non_stream(self):
+        fake = self._make_fake_tool_generate(
+            [
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+            ],
+            lambda text, tools: json.loads(text),
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake):
+            response = self._post_messages(self._anthropic_tool_request())
+
+        self.assertEqual(response.status_code, 200)
+        body = self._json_body(response)
+        self.assertEqual(body["stop_reason"], "tool_use")
+        self._assert_non_stream_tool_inputs(body, [{"location": "sf"}])
+
+    def test_handle_anthropic_messages_streaming(self):
+        response = self._post_messages(self._basic_request(stream=True), stream=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("anthropic-version"), "2023-06-01")
+
+        events = self._events(response)
+        visible_event_names = self._visible_event_names(events)
+        self.assertEqual(visible_event_names[0], "message_start")
+        self.assertEqual(visible_event_names[1], "content_block_start")
+        self.assertIn("content_block_stop", visible_event_names)
+        self.assertEqual(visible_event_names[-2], "message_delta")
+        self.assertEqual(visible_event_names[-1], "message_stop")
+        self.assertLess(
+            visible_event_names.index("content_block_stop"),
+            visible_event_names.index("message_delta"),
+        )
+
+        message_start = events[0][1]
+        self.assertEqual(message_start["type"], "message_start")
+        self.assertEqual(message_start["message"]["type"], "message")
+        self.assertEqual(message_start["message"]["role"], "assistant")
+        self.assertEqual(message_start["message"]["usage"]["output_tokens"], 0)
+
+        message_delta = self._message_delta(events)
+        self.assertEqual(message_delta["type"], "message_delta")
+        self.assertIn(
+            message_delta["delta"]["stop_reason"],
+            {"end_turn", "max_tokens", "stop_sequence"},
+        )
+        self.assertIn("stop_sequence", message_delta["delta"])
+        self.assertIn("output_tokens", message_delta["usage"])
+        self.assertGreaterEqual(message_delta["usage"]["output_tokens"], 0)
+
+    def test_handle_anthropic_messages_streaming_tool_use(self):
+        fake = self._make_fake_tool_generate(
+            [
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+            ],
+            lambda text, tools: json.loads(text),
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake):
+            response = self._post_messages(self._anthropic_tool_request(stream=True), stream=True)
+            self.assertEqual(response.status_code, 200)
+            events = self._events(response)
+
+        self._assert_stream_tool_inputs(events, [{"location": "sf"}])
+        self.assertEqual(self._message_delta(events)["delta"]["stop_reason"], "tool_use")
+
+    def test_handle_anthropic_messages_interleaved_text_tool_order(self):
+        fake_generate = self._make_fake_tool_generate(
+            [
+                "Before ",
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+                "After",
+            ],
+            lambda text, tools: json.loads(text),
+        )
+
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                with patch.object(
+                    self.response_generator, "generate", side_effect=fake_generate
+                ):
+                    response = self._post_messages(
+                        self._anthropic_tool_request(stream=stream),
+                        stream=stream,
+                    )
+                    self.assertEqual(response.status_code, 200)
+
+                if stream:
+                    events = self._events(response)
+                    block_types = [
+                        payload["content_block"]["type"]
+                        for event, payload in events
+                        if event == "content_block_start"
+                    ]
+                    self.assertEqual(block_types, ["text", "tool_use", "text"])
+                    self.assertEqual(
+                        self._message_delta(events)["delta"]["stop_reason"],
+                        "tool_use",
+                    )
+                else:
+                    body = self._json_body(response)
+                    self.assertEqual(
+                        [block["type"] for block in body["content"]],
+                        ["text", "tool_use", "text"],
+                    )
+                    self.assertEqual(body["content"][0]["text"], "Before ")
+                    self.assertEqual(body["content"][1]["name"], "get_weather")
+                    self.assertEqual(body["content"][2]["text"], "After")
+                    self.assertEqual(body["stop_reason"], "tool_use")
+
+    def test_handle_anthropic_messages_non_stream_tool_parse_error_returns_400(self):
+
+        def bad_parser(text, tools):
+            raise ValueError("bad tool call json")
+
+        fake_generate = self._make_fake_tool_generate(
+            ["<tool_call>", "not-json", "</tool_call>"],
+            bad_parser,
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = self._post_messages(self._anthropic_tool_request())
+
+        self.assertEqual(response.status_code, 400)
+        self._assert_anthropic_error(
+            self._json_body(response),
+            error_type="invalid_request_error",
+            message_substring="bad tool call json",
+        )
+
+    def test_handle_anthropic_messages_streaming_tool_parse_error_emits_error_event(self):
+
+        def bad_parser(text, tools):
+            raise ValueError("bad tool call json")
+
+        fake_generate = self._make_fake_tool_generate(
+            ["<tool_call>", "not-json", "</tool_call>"],
+            bad_parser,
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = self._post_messages(self._anthropic_tool_request(stream=True), stream=True)
+            self.assertEqual(response.status_code, 200)
+            events = self._events(response)
+
+        self.assertTrue(any(event == "error" for event, _ in events))
+        error_payload = self._event_payloads(events, "error")[-1]
+        self.assertEqual(error_payload["type"], "error")
+        self.assertIn("bad tool call json", error_payload["error"]["message"])
+        self.assertNotEqual(events[-1][0], "message_stop")
+
+    def test_handle_anthropic_messages_no_tool_use_stop_reason_when_tool_list_empty(self):
+        fake_generate = self._make_fake_tool_generate(
+            ["<tool_call>", '{"name":"noop","arguments":{}}', "</tool_call>"],
+            lambda text, tools: [],
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
+            response = self._post_messages(self._anthropic_tool_request())
+
+        self.assertEqual(response.status_code, 200)
+        body = self._json_body(response)
+        self.assertNotEqual(body["stop_reason"], "tool_use")
+        self.assertEqual(body["content"], [{"type": "text", "text": ""}])
+
+    def test_handle_anthropic_messages_rejects_non_text_content(self):
+        response = self._post_messages(
+            {
+                "model": "chat_model",
+                "max_tokens": 10,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "url",
+                                    "url": "https://example.com/a.png",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(response.status_code, 400)
+        self._assert_anthropic_error(
+            self._json_body(response),
+            error_type="invalid_request_error",
+        )
+
+    def test_handle_anthropic_messages_unexpected_request_factory_error_returns_500(self):
+        with patch.object(
+            server_anthropic,
+            "handle_post",
+            side_effect=RuntimeError("unexpected"),
+        ):
+            response = self._post_messages(self._basic_request())
+
+        self.assertEqual(response.status_code, 500)
+        self._assert_anthropic_error(
+            self._json_body(response),
+            error_type="api_error",
+            message_substring="Internal server error",
+        )
+
+    def test_handle_anthropic_messages_malformed_json_returns_anthropic_error(self):
+        response = self._post_raw(
+            data=b"{not valid json",
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self._assert_anthropic_error(
+            self._json_body(response),
+            error_type="invalid_request_error",
+            message_substring="Invalid JSON",
+        )
+
+    def test_handle_anthropic_messages_multiple_tool_calls(self):
+        fake_generate = self._make_fake_tool_generate(
+            [
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"sf"}}',
+                "</tool_call>",
+                "<tool_call>",
+                '{"name":"get_weather","arguments":{"location":"nyc"}}',
+                "</tool_call>",
+            ],
+            lambda text, tools: json.loads(text),
+        )
+
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                with patch.object(
+                    self.response_generator, "generate", side_effect=fake_generate
+                ):
+                    response = self._post_messages(
+                        self._anthropic_tool_request(stream=stream),
+                        stream=stream,
+                    )
+                    self.assertEqual(response.status_code, 200)
+
+                if stream:
+                    events = self._events(response)
+                    self._assert_stream_tool_inputs(
+                        events,
+                        [{"location": "sf"}, {"location": "nyc"}],
+                    )
+                    starts = self._tool_use_start_payloads(events)
+                    self.assertNotEqual(
+                        starts[0]["content_block"]["id"],
+                        starts[1]["content_block"]["id"],
+                    )
+                    self.assertEqual(
+                        self._message_delta(events)["delta"]["stop_reason"],
+                        "tool_use",
+                    )
+                else:
+                    body = self._json_body(response)
+                    self._assert_non_stream_tool_inputs(
+                        body,
+                        [{"location": "sf"}, {"location": "nyc"}],
+                    )
+                    tool_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
+                    self.assertNotEqual(tool_blocks[0]["id"], tool_blocks[1]["id"])
+                    self.assertEqual(body["stop_reason"], "tool_use")
+
+    def test_handle_anthropic_messages_progress_callback_by_stream_mode(self):
+        for stream, expected_callback in ((False, False), (True, True)):
+            with self.subTest(stream=stream):
+                captured = {"called": False, "has_callback": False}
+
+                def on_call(req, args, cb):
+                    captured["called"] = True
+                    captured["has_callback"] = cb is not None
+
+                fake = self._make_fake_generate(["Hello"], on_call=on_call)
+                request_body = self._basic_request(stream=stream)
+
+                with patch.object(self.response_generator, "generate", side_effect=fake):
+                    response = self._post_messages(request_body, stream=stream)
+                    self.assertEqual(response.status_code, 200)
+                    if stream:
+                        for _ in response.iter_lines():
+                            pass
+
+                self.assertTrue(captured["called"])
+                self.assertEqual(captured["has_callback"], expected_callback)
+
+    def test_handle_anthropic_messages_hides_thinking_text(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                fake = self._make_fake_generate(
+                    ["internal reasoning", "</think>", "Hello"],
+                    has_thinking=True,
+                    think_start_id=11,
+                    think_end_id=12,
+                    think_end="</think>",
+                    prompt=[11],
+                )
+                request_body = self._basic_request(stream=stream)
+
+                with patch.object(self.response_generator, "generate", side_effect=fake):
+                    response = self._post_messages(request_body, stream=stream)
+                    self.assertEqual(response.status_code, 200)
+                    if stream:
+                        visible_text = "".join(self._text_deltas(self._events(response)))
+                    else:
+                        visible_text = self._text_from_content_blocks(
+                            self._json_body(response)["content"]
+                        )
+
+                self.assertEqual(visible_text, "Hello")
+                self.assertNotIn("internal reasoning", visible_text)
+
+    def test_handle_anthropic_messages_streaming_hidden_keepalive(self):
+        fake = self._make_fake_generate(
+            ["<tool_call>", '{"name":"x"}', "</tool_call>", "Hello"],
+            has_tool_calling=True,
+            tool_call_start="<tool_call>",
+            tool_call_end="</tool_call>",
+            tool_parser=lambda text, tools: {"name": "x", "arguments": {}},
+        )
+
+        with patch.object(self.response_generator, "generate", side_effect=fake):
+            response = self._post_messages(self._basic_request(stream=True), stream=True)
+            self.assertEqual(response.status_code, 200)
+            events = self._events(response)
+
+        self.assertTrue(any(event == "ping" for event, _ in events))
+        self.assertFalse(any(event == "error" for event, _ in events))
+        self.assertIn("Hello", "".join(self._text_deltas(events)))
+
+
+class TestAnthropicConversion(unittest.TestCase):
+    def test_convert_anthropic_messages_with_tool_blocks(self):
         converted = convert_anthropic_messages(
             {
                 "messages": [
@@ -362,16 +762,12 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(converted[1]["role"], "assistant")
         self.assertEqual(converted[1]["content"], "Looking it up.")
         self.assertEqual(converted[1]["tool_calls"][0]["id"], "toolu_1")
-        self.assertEqual(
-            converted[1]["tool_calls"][0]["function"]["name"], "get_weather"
-        )
+        self.assertEqual(converted[1]["tool_calls"][0]["function"]["name"], "get_weather")
         self.assertEqual(converted[2]["role"], "tool")
         self.assertEqual(converted[2]["tool_call_id"], "toolu_1")
         self.assertEqual(converted[2]["content"], "72F")
 
     def test_convert_anthropic_messages_tool_use_only_assistant(self):
-        from mlx_lm.server_anthropic import convert_anthropic_messages
-
         converted = convert_anthropic_messages(
             {
                 "messages": [
@@ -407,8 +803,6 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(converted[1]["tool_calls"][0]["id"], "toolu_1")
 
     def test_convert_anthropic_messages_tool_result_is_error(self):
-        from mlx_lm.server_anthropic import convert_anthropic_messages
-
         converted = convert_anthropic_messages(
             {
                 "messages": [
@@ -439,15 +833,12 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             }
         )
 
-        # Preserve error semantics for templates that choose to use it.
         self.assertEqual(converted[2]["role"], "tool")
         self.assertEqual(converted[2]["tool_call_id"], "toolu_1")
         self.assertEqual(converted[2]["content"], "Connection timed out")
         self.assertTrue(converted[2]["is_error"])
 
     def test_convert_anthropic_messages_with_system_string(self):
-        from mlx_lm.server_anthropic import convert_anthropic_messages
-
         converted = convert_anthropic_messages(
             {
                 "system": "You are concise.",
@@ -459,8 +850,6 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(converted[1], {"role": "user", "content": "Hello"})
 
     def test_convert_anthropic_messages_merges_adjacent_user_messages(self):
-        from mlx_lm.server_anthropic import convert_anthropic_messages
-
         converted = convert_anthropic_messages(
             {
                 "messages": [
@@ -480,8 +869,6 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_convert_anthropic_messages_interleaved_tool_result_and_text(self):
-        from mlx_lm.server_anthropic import convert_anthropic_messages
-
         converted = convert_anthropic_messages(
             {
                 "messages": [
@@ -519,8 +906,6 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_convert_anthropic_messages_multi_turn_text(self):
-        from mlx_lm.server_anthropic import convert_anthropic_messages
-
         converted = convert_anthropic_messages(
             {
                 "messages": [
@@ -541,8 +926,6 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_convert_anthropic_tools(self):
-        from mlx_lm.server_anthropic import convert_anthropic_tools
-
         converted = convert_anthropic_tools(
             [
                 {
@@ -561,347 +944,18 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertIn("parameters", converted[0]["function"])
 
     def test_convert_anthropic_tools_none(self):
-        from mlx_lm.server_anthropic import convert_anthropic_tools
-
         self.assertIsNone(convert_anthropic_tools(None))
 
     def test_convert_anthropic_tools_empty_list(self):
-        from mlx_lm.server_anthropic import convert_anthropic_tools
-
         self.assertEqual(convert_anthropic_tools([]), [])
 
     def test_convert_anthropic_tools_rejects_unsupported_type(self):
-        from mlx_lm.server_anthropic import convert_anthropic_tools
-
         with self.assertRaisesRegex(ValueError, "Unsupported tool type"):
             convert_anthropic_tools(
                 [{"type": "server", "name": "get_weather", "input_schema": {}}]
             )
 
-    def test_handle_anthropic_messages_with_blocks_and_system(self):
-        url = self._messages_url()
-        post_data = {
-            "model": "chat_model",
-            "max_tokens": 10,
-            "system": [{"type": "text", "text": "You are a helpful assistant."}],
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": "Say hi."}],
-                }
-            ],
-        }
-        response = requests.post(url, json=post_data)
-        self.assertEqual(response.status_code, 200)
-
-        response_body = json.loads(response.text)
-        self.assertEqual(response_body["type"], "message")
-        self.assertEqual(response_body["role"], "assistant")
-        self.assertEqual(response_body["content"][0]["type"], "text")
-
-    def test_handle_anthropic_messages_with_tools_non_stream(self):
-        url = self._messages_url()
-        fake = self._make_fake_tool_generate(
-            [
-                "<tool_call>",
-                '{"name":"get_weather","arguments":{"location":"sf"}}',
-                "</tool_call>",
-            ],
-            lambda text, tools: json.loads(text),
-        )
-
-        with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "messages": [{"role": "user", "content": "Use a tool"}],
-                    "tools": [
-                        {
-                            "name": "get_weather",
-                            "input_schema": {
-                                "type": "object",
-                                "properties": {"location": {"type": "string"}},
-                            },
-                        }
-                    ],
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        body = json.loads(response.text)
-        self.assertEqual(body["stop_reason"], "tool_use")
-        self.assertEqual(body["content"][0]["type"], "tool_use")
-        self.assertEqual(body["content"][0]["name"], "get_weather")
-        self.assertTrue(body["content"][0]["id"].startswith("toolu_"))
-        self.assertEqual(body["content"][0]["input"], {"location": "sf"})
-
-    def test_handle_anthropic_messages_streaming(self):
-        url = self._messages_url()
-        post_data = {
-            "model": "chat_model",
-            "max_tokens": 10,
-            "stream": True,
-            "messages": [{"role": "user", "content": "Hello!"}],
-        }
-        response = requests.post(url, json=post_data, stream=True)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers.get("anthropic-version"), "2023-06-01")
-        events = collect_sse_events(response)
-
-        event_names = [event for event, _ in events]
-        visible_event_names = [event for event in event_names if event != "ping"]
-        self.assertEqual(visible_event_names[0], "message_start")
-        self.assertEqual(visible_event_names[1], "content_block_start")
-        self.assertIn("content_block_stop", visible_event_names)
-        self.assertEqual(visible_event_names[-2], "message_delta")
-        self.assertEqual(visible_event_names[-1], "message_stop")
-        self.assertLess(
-            visible_event_names.index("content_block_stop"),
-            visible_event_names.index("message_delta"),
-        )
-
-        message_start = events[0][1]
-        self.assertEqual(message_start["type"], "message_start")
-        self.assertEqual(message_start["message"]["type"], "message")
-        self.assertEqual(message_start["message"]["role"], "assistant")
-        self.assertEqual(message_start["message"]["usage"]["output_tokens"], 0)
-
-        message_delta = events[-2][1]
-        self.assertEqual(message_delta["type"], "message_delta")
-        self.assertIn(
-            message_delta["delta"]["stop_reason"],
-            {"end_turn", "max_tokens", "stop_sequence"},
-        )
-        self.assertIn("stop_sequence", message_delta["delta"])
-        self.assertIn("output_tokens", message_delta["usage"])
-        self.assertGreaterEqual(message_delta["usage"]["output_tokens"], 0)
-
-    def test_handle_anthropic_messages_streaming_tool_use(self):
-        url = self._messages_url()
-        fake = self._make_fake_tool_generate(
-            [
-                "<tool_call>",
-                '{"name":"get_weather","arguments":{"location":"sf"}}',
-                "</tool_call>",
-            ],
-            lambda text, tools: json.loads(text),
-        )
-
-        with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "stream": True,
-                    "messages": [{"role": "user", "content": "Use a tool"}],
-                    "tools": [
-                        {
-                            "name": "get_weather",
-                            "input_schema": {
-                                "type": "object",
-                                "properties": {"location": {"type": "string"}},
-                            },
-                        }
-                    ],
-                },
-                stream=True,
-            )
-            self.assertEqual(response.status_code, 200)
-            events = collect_sse_events(response)
-
-        tool_starts = [
-            payload
-            for event, payload in events
-            if event == "content_block_start"
-            and payload["content_block"]["type"] == "tool_use"
-        ]
-        self.assertEqual(len(tool_starts), 1)
-        self.assertEqual(tool_starts[0]["content_block"]["name"], "get_weather")
-        self.assertTrue(tool_starts[0]["content_block"]["id"].startswith("toolu_"))
-        self.assertEqual(tool_starts[0]["content_block"]["input"], {})
-        tool_deltas = [
-            payload
-            for event, payload in events
-            if event == "content_block_delta"
-            and payload["delta"]["type"] == "input_json_delta"
-        ]
-        self.assertEqual(len(tool_deltas), 1)
-        self.assertEqual(
-            json.loads(tool_deltas[0]["delta"]["partial_json"]), {"location": "sf"}
-        )
-        message_delta = [payload for event, payload in events if event == "message_delta"][
-            -1
-        ]
-        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
-
-    def test_handle_anthropic_messages_interleaved_text_tool_order(self):
-        url = self._messages_url()
-        fake_generate = self._make_fake_tool_generate(
-            [
-                "Before ",
-                "<tool_call>",
-                '{"name":"get_weather","arguments":{"location":"sf"}}',
-                "</tool_call>",
-                "After",
-            ],
-            lambda text, tools: json.loads(text),
-        )
-
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                with patch.object(
-                    self.response_generator, "generate", side_effect=fake_generate
-                ):
-                    response = requests.post(
-                        url,
-                        json=self._anthropic_tool_request(stream=stream),
-                        stream=stream,
-                    )
-                    self.assertEqual(response.status_code, 200)
-
-                if stream:
-                    events = collect_sse_events(response)
-                    block_types = [
-                        payload["content_block"]["type"]
-                        for event, payload in events
-                        if event == "content_block_start"
-                    ]
-                    self.assertEqual(block_types, ["text", "tool_use", "text"])
-                    message_delta = [
-                        payload for event, payload in events if event == "message_delta"
-                    ][-1]
-                    self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
-                else:
-                    body = json.loads(response.text)
-                    self.assertEqual(
-                        [block["type"] for block in body["content"]],
-                        ["text", "tool_use", "text"],
-                    )
-                    self.assertEqual(body["content"][0]["text"], "Before ")
-                    self.assertEqual(body["content"][1]["name"], "get_weather")
-                    self.assertEqual(body["content"][2]["text"], "After")
-                    self.assertEqual(body["stop_reason"], "tool_use")
-
-    def test_handle_anthropic_messages_non_stream_tool_parse_error_returns_400(self):
-        url = self._messages_url()
-
-        def bad_parser(text, tools):
-            raise ValueError("bad tool call json")
-
-        fake_generate = self._make_fake_tool_generate(
-            ["<tool_call>", "not-json", "</tool_call>"],
-            bad_parser,
-        )
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
-            response = requests.post(url, json=self._anthropic_tool_request())
-
-        self.assertEqual(response.status_code, 400)
-        body = json.loads(response.text)
-        self._assert_anthropic_error(
-            body,
-            error_type="invalid_request_error",
-            message_substring="bad tool call json",
-        )
-
-    def test_handle_anthropic_messages_streaming_tool_parse_error_emits_error_event(self):
-        url = self._messages_url()
-
-        def bad_parser(text, tools):
-            raise ValueError("bad tool call json")
-
-        fake_generate = self._make_fake_tool_generate(
-            ["<tool_call>", "not-json", "</tool_call>"],
-            bad_parser,
-        )
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
-            response = requests.post(
-                url,
-                json=self._anthropic_tool_request(stream=True),
-                stream=True,
-            )
-            self.assertEqual(response.status_code, 200)
-            events = collect_sse_events(response)
-
-        self.assertTrue(any(event == "error" for event, _ in events))
-        error_payload = [payload for event, payload in events if event == "error"][-1]
-        self.assertEqual(error_payload["type"], "error")
-        self.assertIn("bad tool call json", error_payload["error"]["message"])
-        # Stream terminates on error without a trailing message_stop, matching
-        # the real Anthropic API behavior.
-        self.assertNotEqual(events[-1][0], "message_stop")
-
-    def test_handle_anthropic_messages_no_tool_use_stop_reason_when_tool_list_empty(self):
-        url = self._messages_url()
-        fake_generate = self._make_fake_tool_generate(
-            ["<tool_call>", '{"name":"noop","arguments":{}}', "</tool_call>"],
-            lambda text, tools: [],
-        )
-
-        with patch.object(self.response_generator, "generate", side_effect=fake_generate):
-            response = requests.post(url, json=self._anthropic_tool_request())
-
-        self.assertEqual(response.status_code, 200)
-        body = json.loads(response.text)
-        self.assertNotEqual(body["stop_reason"], "tool_use")
-        self.assertEqual(body["content"], [{"type": "text", "text": ""}])
-
-    def test_handle_anthropic_messages_rejects_non_text_content(self):
-        url = self._messages_url()
-        post_data = {
-            "model": "chat_model",
-            "max_tokens": 10,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "url",
-                                "url": "https://example.com/a.png",
-                            },
-                        }
-                    ],
-                }
-            ],
-        }
-        response = requests.post(url, json=post_data)
-        self.assertEqual(response.status_code, 400)
-        response_body = json.loads(response.text)
-        self._assert_anthropic_error(response_body, error_type="invalid_request_error")
-
-    def test_handle_anthropic_messages_unexpected_request_factory_error_returns_500(self):
-        url = self._messages_url()
-        with patch.object(
-            server_anthropic,
-            "handle_post",
-            side_effect=RuntimeError("unexpected"),
-        ):
-            response = requests.post(
-                url,
-                json={
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                },
-            )
-
-        self.assertEqual(response.status_code, 500)
-        body = json.loads(response.text)
-        self._assert_anthropic_error(
-            body,
-            error_type="api_error",
-            message_substring="Internal server error",
-        )
-
     def test_convert_anthropic_tools_accepts_custom_type(self):
-        from mlx_lm.server_anthropic import convert_anthropic_tools
-
         converted = convert_anthropic_tools(
             [
                 {
@@ -918,105 +972,14 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(converted[0]["type"], "function")
         self.assertEqual(converted[0]["function"]["name"], "get_weather")
 
-    def test_handle_anthropic_messages_malformed_json_returns_anthropic_error(self):
-        url = self._messages_url()
-        response = requests.post(
-            url,
-            data=b"{not valid json",
-            headers={"Content-Type": "application/json"},
-        )
-        self.assertEqual(response.status_code, 400)
-        body = json.loads(response.text)
-        self._assert_anthropic_error(
-            body,
-            error_type="invalid_request_error",
-            message_substring="Invalid JSON",
-        )
 
-    def test_handle_anthropic_messages_multiple_tool_calls(self):
-        url = self._messages_url()
-        fake_generate = self._make_fake_tool_generate(
-            [
-                "<tool_call>",
-                '{"name":"get_weather","arguments":{"location":"sf"}}',
-                "</tool_call>",
-                "<tool_call>",
-                '{"name":"get_weather","arguments":{"location":"nyc"}}',
-                "</tool_call>",
-            ],
-            lambda text, tools: json.loads(text),
-        )
-
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                with patch.object(
-                    self.response_generator, "generate", side_effect=fake_generate
-                ):
-                    response = requests.post(
-                        url,
-                        json=self._anthropic_tool_request(stream=stream),
-                        stream=stream,
-                    )
-                    self.assertEqual(response.status_code, 200)
-
-                if stream:
-                    events = collect_sse_events(response)
-                    tool_starts = [
-                        payload
-                        for event, payload in events
-                        if event == "content_block_start"
-                        and payload["content_block"]["type"] == "tool_use"
-                    ]
-                    self.assertEqual(len(tool_starts), 2)
-                    self.assertEqual(
-                        tool_starts[0]["content_block"]["name"], "get_weather"
-                    )
-                    self.assertEqual(
-                        tool_starts[1]["content_block"]["name"], "get_weather"
-                    )
-                    self.assertNotEqual(
-                        tool_starts[0]["content_block"]["id"],
-                        tool_starts[1]["content_block"]["id"],
-                    )
-
-                    tool_deltas = [
-                        payload
-                        for event, payload in events
-                        if event == "content_block_delta"
-                        and payload["delta"]["type"] == "input_json_delta"
-                    ]
-                    self.assertEqual(len(tool_deltas), 2)
-                    self.assertEqual(
-                        json.loads(tool_deltas[0]["delta"]["partial_json"]),
-                        {"location": "sf"},
-                    )
-                    self.assertEqual(
-                        json.loads(tool_deltas[1]["delta"]["partial_json"]),
-                        {"location": "nyc"},
-                    )
-                    message_delta = [
-                        payload for event, payload in events if event == "message_delta"
-                    ][-1]
-                    self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
-                else:
-                    body = json.loads(response.text)
-                    tool_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
-                    self.assertEqual(len(tool_blocks), 2)
-                    self.assertEqual(tool_blocks[0]["input"], {"location": "sf"})
-                    self.assertEqual(tool_blocks[1]["input"], {"location": "nyc"})
-                    self.assertNotEqual(tool_blocks[0]["id"], tool_blocks[1]["id"])
-                    self.assertEqual(body["stop_reason"], "tool_use")
-
+class TestServerCommonUtilities(unittest.TestCase):
     def test_trim_visible_stop_text(self):
-        from mlx_lm.server_common import trim_visible_stop_text
-
         self.assertEqual(trim_visible_stop_text("hello STOP", "STOP", 4), "hello ")
         self.assertEqual(trim_visible_stop_text("hello", "STOP", 4), "hello")
         self.assertEqual(trim_visible_stop_text("hello", None, 4), "hello")
 
     def test_stopping_criteria_returns_matched_stop_word(self):
-        from mlx_lm.server_common import stopping_criteria
-
         matched = stopping_criteria(
             tokens=[1, 2, 3],
             eos_token_ids=set(),
@@ -1034,125 +997,6 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
         self.assertFalse(unmatched.stop_met)
         self.assertIsNone(unmatched.stop_word)
-
-    def test_handle_anthropic_messages_progress_callback_by_stream_mode(self):
-        url = self._messages_url()
-        cases = (
-            (False, False),
-            (True, True),
-        )
-
-        for stream, expected_callback in cases:
-            with self.subTest(stream=stream):
-                captured = {"called": False, "has_callback": False}
-
-                def on_call(req, args, cb):
-                    captured["called"] = True
-                    captured["has_callback"] = cb is not None
-
-                fake = self._make_fake_generate(["Hello"], on_call=on_call)
-                request_body = {
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                }
-                if stream:
-                    request_body["stream"] = True
-
-                with patch.object(self.response_generator, "generate", side_effect=fake):
-                    response = requests.post(
-                        url,
-                        json=request_body,
-                        stream=stream,
-                    )
-                    self.assertEqual(response.status_code, 200)
-                    if stream:
-                        for _ in response.iter_lines():
-                            pass
-
-                self.assertTrue(captured["called"])
-                self.assertEqual(captured["has_callback"], expected_callback)
-
-    def test_handle_anthropic_messages_hides_thinking_text(self):
-        url = self._messages_url()
-
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                fake = self._make_fake_generate(
-                    ["internal reasoning", "</think>", "Hello"],
-                    has_thinking=True,
-                    think_start_id=11,
-                    think_end_id=12,
-                    think_end="</think>",
-                    prompt=[11],
-                )
-                request_body = {
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                }
-                if stream:
-                    request_body["stream"] = True
-
-                with patch.object(self.response_generator, "generate", side_effect=fake):
-                    response = requests.post(
-                        url,
-                        json=request_body,
-                        stream=stream,
-                    )
-                    self.assertEqual(response.status_code, 200)
-                    if stream:
-                        events = collect_sse_events(response)
-                        visible_text = "".join(
-                            payload["delta"]["text"]
-                            for event, payload in events
-                            if event == "content_block_delta"
-                            and payload.get("delta", {}).get("type") == "text_delta"
-                        )
-                    else:
-                        response_body = json.loads(response.text)
-                        visible_text = "".join(
-                            block["text"]
-                            for block in response_body["content"]
-                            if block.get("type") == "text"
-                        )
-
-                self.assertEqual(visible_text, "Hello")
-                self.assertNotIn("internal reasoning", visible_text)
-
-    def test_handle_anthropic_messages_streaming_hidden_keepalive(self):
-        url = self._messages_url()
-        fake = self._make_fake_generate(
-            ["<tool_call>", '{"name":"x"}', "</tool_call>", "Hello"],
-            has_tool_calling=True,
-            tool_call_start="<tool_call>",
-            tool_call_end="</tool_call>",
-            tool_parser=lambda text, tools: {"name": "x", "arguments": {}},
-        )
-
-        with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "stream": True,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                },
-                stream=True,
-            )
-            self.assertEqual(response.status_code, 200)
-            events = collect_sse_events(response)
-
-        self.assertTrue(any(event == "ping" for event, _ in events))
-        self.assertFalse(any(event == "error" for event, _ in events))
-        text_deltas = [
-            payload["delta"]["text"]
-            for event, payload in events
-            if event == "content_block_delta"
-            and payload.get("delta", {}).get("type") == "text_delta"
-        ]
-        self.assertIn("Hello", "".join(text_deltas))
 
 
 if __name__ == "__main__":
