@@ -220,6 +220,75 @@ def convert_anthropic_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
     return out
 
 
+def _handle_non_stream_completion(
+    handler: Any,
+    request: CompletionRequest,
+    args: Any,
+    ctx: Any,
+    response: Any,
+    emit_parsed_tool_uses: Any,
+    effective_finish_reason: Any,
+) -> None:
+    content_blocks: List[Dict[str, Any]] = []
+
+    def append_text(text_segment: str) -> None:
+        if not text_segment:
+            return
+        if content_blocks and content_blocks[-1].get("type") == "text":
+            content_blocks[-1]["text"] += text_segment
+        else:
+            content_blocks.append({"type": "text", "text": text_segment})
+
+    try:
+        result = run_generation_loop(
+            ctx,
+            response,
+            args.stop_words,
+            on_text_segment=append_text,
+            on_tool_call_done=lambda raw: emit_parsed_tool_uses(
+                raw, lambda tu: content_blocks.append(tu)
+            ),
+        )
+    except ValueError as e:
+        write_json_response(
+            handler,
+            status_code=400,
+            payload=error_payload(str(e), "invalid_request_error"),
+        )
+        return
+    except Exception:
+        logging.exception("Unexpected error in Anthropic completion")
+        write_json_response(
+            handler,
+            status_code=500,
+            payload=error_payload("Internal server error", "api_error"),
+        )
+        return
+
+    if not content_blocks:
+        content_blocks = [{"type": "text", "text": ""}]
+
+    out = build_response(
+        request_id=handler.request_id,
+        model=handler.requested_model,
+        finish_reason=effective_finish_reason(result),
+        prompt_token_count=len(ctx.prompt),
+        completion_token_count=len(result.tokens),
+        stop_sequence=result.stop_sequence,
+        content_blocks=content_blocks,
+    )
+    write_json_response(
+        handler,
+        status_code=200,
+        payload=out,
+        headers={
+            "anthropic-version": "2023-06-01",
+            "request-id": handler.request_id,
+        },
+        flush=True,
+    )
+
+
 def handle_post(handler: Any) -> None:
     """Handle POST /v1/messages using APIHandler primitives."""
     success, decoded = load_json_body(handler)
@@ -322,63 +391,14 @@ def handle_post(handler: Any) -> None:
         return result.finish_reason
 
     if not handler.stream:
-        content_blocks: List[Dict[str, Any]] = []
-
-        def append_text(text_segment: str) -> None:
-            if not text_segment:
-                return
-            if content_blocks and content_blocks[-1].get("type") == "text":
-                content_blocks[-1]["text"] += text_segment
-            else:
-                content_blocks.append({"type": "text", "text": text_segment})
-
-        try:
-            result = run_generation_loop(
-                ctx,
-                response,
-                args.stop_words,
-                on_text_segment=append_text,
-                on_tool_call_done=lambda raw: emit_parsed_tool_uses(
-                    raw, lambda tu: content_blocks.append(tu)
-                ),
-            )
-        except ValueError as e:
-            write_json_response(
-                handler,
-                status_code=400,
-                payload=error_payload(str(e), "invalid_request_error"),
-            )
-            return
-        except Exception:
-            logging.exception("Unexpected error in Anthropic completion")
-            write_json_response(
-                handler,
-                status_code=500,
-                payload=error_payload("Internal server error", "api_error"),
-            )
-            return
-
-        if not content_blocks:
-            content_blocks = [{"type": "text", "text": ""}]
-
-        out = build_response(
-            request_id=handler.request_id,
-            model=handler.requested_model,
-            finish_reason=effective_finish_reason(result),
-            prompt_token_count=len(ctx.prompt),
-            completion_token_count=len(result.tokens),
-            stop_sequence=result.stop_sequence,
-            content_blocks=content_blocks,
-        )
-        write_json_response(
+        _handle_non_stream_completion(
             handler,
-            status_code=200,
-            payload=out,
-            headers={
-                "anthropic-version": "2023-06-01",
-                "request-id": handler.request_id,
-            },
-            flush=True,
+            request,
+            args,
+            ctx,
+            response,
+            emit_parsed_tool_uses,
+            effective_finish_reason,
         )
         return
 
