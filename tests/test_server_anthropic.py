@@ -1059,122 +1059,90 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertFalse(unmatched.stop_met)
         self.assertIsNone(unmatched.stop_word)
 
-    def test_handle_anthropic_messages_streaming_uses_progress_callback(self):
+    def test_handle_anthropic_messages_progress_callback_by_stream_mode(self):
         url = self._messages_url()
-        captured = {"called": False, "has_callback": False}
-
-        def on_call(req, args, cb):
-            captured["called"] = True
-            captured["has_callback"] = cb is not None
-
-        fake = self._make_fake_generate(["Hello"], on_call=on_call)
-
-        with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "stream": True,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                },
-                stream=True,
-            )
-            self.assertEqual(response.status_code, 200)
-            for _ in response.iter_lines():
-                pass
-
-        self.assertTrue(captured["called"])
-        self.assertTrue(captured["has_callback"])
-
-    def test_handle_anthropic_messages_non_stream_skips_progress_callback(self):
-        url = self._messages_url()
-        captured = {"called": False, "has_callback": False}
-
-        def on_call(req, args, cb):
-            captured["called"] = True
-            captured["has_callback"] = cb is not None
-
-        fake = self._make_fake_generate(["Hello"], on_call=on_call)
-
-        with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
-                    "model": "chat_model",
-                    "max_tokens": 10,
-                    "messages": [{"role": "user", "content": "Hello!"}],
-                },
-            )
-            self.assertEqual(response.status_code, 200)
-
-        self.assertTrue(captured["called"])
-        self.assertFalse(captured["has_callback"])
-
-    def test_handle_anthropic_messages_non_stream_hides_thinking_text(self):
-        url = self._messages_url()
-        fake = self._make_fake_generate(
-            ["internal reasoning", "</think>", "Hello"],
-            has_thinking=True,
-            think_start_id=11,
-            think_end_id=12,
-            think_end="</think>",
-            prompt=[11],
+        cases = (
+            (False, False),
+            (True, True),
         )
 
-        with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
+        for stream, expected_callback in cases:
+            with self.subTest(stream=stream):
+                captured = {"called": False, "has_callback": False}
+
+                def on_call(req, args, cb):
+                    captured["called"] = True
+                    captured["has_callback"] = cb is not None
+
+                fake = self._make_fake_generate(["Hello"], on_call=on_call)
+                request_body = {
                     "model": "chat_model",
                     "max_tokens": 10,
                     "messages": [{"role": "user", "content": "Hello!"}],
-                },
-            )
+                }
+                if stream:
+                    request_body["stream"] = True
 
-        self.assertEqual(response.status_code, 200)
-        response_body = json.loads(response.text)
-        text_blocks = [
-            block["text"]
-            for block in response_body["content"]
-            if block.get("type") == "text"
-        ]
-        self.assertEqual("".join(text_blocks), "Hello")
-        self.assertNotIn("internal reasoning", "".join(text_blocks))
+                with patch.object(self.response_generator, "generate", side_effect=fake):
+                    response = requests.post(
+                        url,
+                        json=request_body,
+                        stream=stream,
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    if stream:
+                        for _ in response.iter_lines():
+                            pass
 
-    def test_handle_anthropic_messages_streaming_hides_thinking_text(self):
+                self.assertTrue(captured["called"])
+                self.assertEqual(captured["has_callback"], expected_callback)
+
+    def test_handle_anthropic_messages_hides_thinking_text(self):
         url = self._messages_url()
-        fake = self._make_fake_generate(
-            ["internal reasoning", "</think>", "Hello"],
-            has_thinking=True,
-            think_start_id=11,
-            think_end_id=12,
-            think_end="</think>",
-            prompt=[11],
-        )
 
-        with patch.object(self.response_generator, "generate", side_effect=fake):
-            response = requests.post(
-                url,
-                json={
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                fake = self._make_fake_generate(
+                    ["internal reasoning", "</think>", "Hello"],
+                    has_thinking=True,
+                    think_start_id=11,
+                    think_end_id=12,
+                    think_end="</think>",
+                    prompt=[11],
+                )
+                request_body = {
                     "model": "chat_model",
                     "max_tokens": 10,
-                    "stream": True,
                     "messages": [{"role": "user", "content": "Hello!"}],
-                },
-                stream=True,
-            )
-            self.assertEqual(response.status_code, 200)
-            events = collect_sse_events(response)
+                }
+                if stream:
+                    request_body["stream"] = True
 
-        text_deltas = [
-            payload["delta"]["text"]
-            for event, payload in events
-            if event == "content_block_delta"
-            and payload.get("delta", {}).get("type") == "text_delta"
-        ]
-        self.assertEqual("".join(text_deltas), "Hello")
-        self.assertNotIn("internal reasoning", "".join(text_deltas))
+                with patch.object(self.response_generator, "generate", side_effect=fake):
+                    response = requests.post(
+                        url,
+                        json=request_body,
+                        stream=stream,
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    if stream:
+                        events = collect_sse_events(response)
+                        visible_text = "".join(
+                            payload["delta"]["text"]
+                            for event, payload in events
+                            if event == "content_block_delta"
+                            and payload.get("delta", {}).get("type") == "text_delta"
+                        )
+                    else:
+                        response_body = json.loads(response.text)
+                        visible_text = "".join(
+                            block["text"]
+                            for block in response_body["content"]
+                            if block.get("type") == "text"
+                        )
+
+                self.assertEqual(visible_text, "Hello")
+                self.assertNotIn("internal reasoning", visible_text)
 
     def test_handle_anthropic_messages_streaming_hidden_keepalive(self):
         url = self._messages_url()
