@@ -1045,14 +1045,14 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
 
     def test_trim_visible_stop_text(self):
-        from mlx_lm.server_anthropic import trim_visible_stop_text
+        from mlx_lm.server_common import trim_visible_stop_text
 
         self.assertEqual(trim_visible_stop_text("hello STOP", "STOP", 4), "hello ")
         self.assertEqual(trim_visible_stop_text("hello", "STOP", 4), "hello")
         self.assertEqual(trim_visible_stop_text("hello", None, 4), "hello")
 
     def test_stopping_criteria_returns_matched_stop_word(self):
-        from mlx_lm.server import stopping_criteria
+        from mlx_lm.server_common import stopping_criteria
 
         matched = stopping_criteria(
             tokens=[1, 2, 3],

@@ -7,15 +7,15 @@
 import json
 import logging
 import uuid
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .server_common import (
     load_json_body,
     make_progress_callback,
+    run_generation_loop,
     write_json_response,
 )
-from .server import CompletionRequest, sequence_overlap, stopping_criteria
+from .server import CompletionRequest
 
 
 # Request conversion (Anthropic -> OpenAI internal)
@@ -305,6 +305,22 @@ def handle_post(handler: Any) -> None:
         )
         return
 
+    # Shared state for tool-use tracking. The shared loop sets
+    # made_tool_call when delimiters are seen; has_tool_use tracks whether
+    # parsed tool uses were actually produced (parser may return empty).
+    has_tool_use = False
+
+    def emit_parsed_tool_uses(raw_tool_text, on_emit):
+        nonlocal has_tool_use
+        for tu in _parse_generated_tool_uses(raw_tool_text, ctx, request.tools):
+            has_tool_use = True
+            on_emit(tu)
+
+    def effective_finish_reason(result):
+        if result.finish_reason == "tool_calls" and not has_tool_use:
+            return "stop"
+        return result.finish_reason
+
     if not handler.stream:
         content_blocks: List[Dict[str, Any]] = []
 
@@ -318,12 +334,13 @@ def handle_post(handler: Any) -> None:
 
         try:
             result = run_generation_loop(
-                request=request,
-                ctx=ctx,
-                response=response,
-                stop_words=args.stop_words,
+                ctx,
+                response,
+                args.stop_words,
                 on_text_segment=append_text,
-                on_tool_use=lambda tu: content_blocks.append(tu),
+                on_tool_call_done=lambda raw: emit_parsed_tool_uses(
+                    raw, lambda tu: content_blocks.append(tu)
+                ),
             )
         except ValueError as e:
             write_json_response(
@@ -347,7 +364,7 @@ def handle_post(handler: Any) -> None:
         out = build_response(
             request_id=handler.request_id,
             model=handler.requested_model,
-            finish_reason=result.finish_reason,
+            finish_reason=effective_finish_reason(result),
             prompt_token_count=len(ctx.prompt),
             completion_token_count=len(result.tokens),
             stop_sequence=result.stop_sequence,
@@ -466,12 +483,13 @@ def handle_post(handler: Any) -> None:
 
     try:
         result = run_generation_loop(
-            request=request,
-            ctx=ctx,
-            response=response,
-            stop_words=args.stop_words,
+            ctx,
+            response,
+            args.stop_words,
             on_text_segment=emit_text_segment,
-            on_tool_use=emit_tool_use_block,
+            on_tool_call_done=lambda raw: emit_parsed_tool_uses(
+                raw, emit_tool_use_block
+            ),
             on_hidden_progress=write_sse_ping,
             on_tool_call_start=close_text_block,
         )
@@ -502,7 +520,7 @@ def handle_post(handler: Any) -> None:
             "type": "message_delta",
             "delta": {
                 "stop_reason": anthropic_stop_reason(
-                    result.finish_reason, result.stop_sequence
+                    effective_finish_reason(result), result.stop_sequence
                 ),
                 "stop_sequence": result.stop_sequence,
             },
@@ -512,58 +530,34 @@ def handle_post(handler: Any) -> None:
     write_sse_event("message_stop", {"type": "message_stop"})
 
 
-# Generation loop and response formatting
-
-
-@dataclass
-class GenerationResult:
-    tokens: List[int]
-    finish_reason: str
-    stop_sequence: Optional[str]
-    has_tool_use: bool
-
-
-def trim_visible_stop_text(
-    text: str, stop_sequence: Optional[str], trim_text_length: int
-) -> str:
-    if trim_text_length <= 0 or not stop_sequence:
-        return text
-    if not text.endswith(stop_sequence):
-        return text
-    return text[: max(0, len(text) - trim_text_length)]
+# Tool parsing
 
 
 def _parse_generated_tool_uses(
-    tool_calls: List[str], ctx: Any, tools: Optional[List[Any]]
+    raw_text: str, ctx: Any, tools: Optional[List[Any]]
 ) -> List[Dict[str, Any]]:
-    if not tool_calls:
-        return []
+    """Parse raw tool-call text into Anthropic tool_use content blocks."""
     if ctx.tool_parser is None:
         raise ValueError("Model does not support tool calling.")
 
-    parsed_calls = []
-    for tool_text in tool_calls:
-        parsed = ctx.tool_parser(tool_text, tools)
-        if isinstance(parsed, list):
-            parsed_calls.extend(parsed)
-        else:
-            parsed_calls.append(parsed)
+    parsed = ctx.tool_parser(raw_text, tools)
+    parsed_calls = parsed if isinstance(parsed, list) else [parsed]
 
     out = []
-    for parsed in parsed_calls:
-        if not isinstance(parsed, dict):
+    for call in parsed_calls:
+        if not isinstance(call, dict):
             raise ValueError("Parsed tool call must be an object.")
-        name = parsed.get("name")
+        name = call.get("name")
         if not isinstance(name, str):
             raise ValueError("Parsed tool call is missing `name`.")
 
-        arguments = parsed.get("arguments", {})
+        arguments = call.get("arguments", {})
         if isinstance(arguments, str):
             arguments = json.loads(arguments)
         if not isinstance(arguments, dict):
             raise ValueError("Parsed tool call `arguments` must be an object.")
 
-        call_id = parsed.get("id")
+        call_id = call.get("id")
         if call_id is not None and not isinstance(call_id, str):
             raise ValueError("Parsed tool call `id` must be a string.")
         out.append(
@@ -575,127 +569,6 @@ def _parse_generated_tool_uses(
             }
         )
     return out
-
-
-def run_generation_loop(
-    request: CompletionRequest,
-    ctx: Any,
-    response: Any,
-    stop_words: List[str],
-    on_text_segment: Callable[[str], None],
-    on_tool_use: Callable[[Dict[str, Any]], None],
-    on_hidden_progress: Callable[[], None] = lambda: None,
-    on_tool_call_start: Callable[[], None] = lambda: None,
-) -> GenerationResult:
-    """Token-by-token generation loop that emits Anthropic content blocks.
-
-    Parallels handle_completion's token loop in server.py. They share most
-    logic (stop checking, tool parsing, reasoning state) but diverge on
-    output formatting.
-    TODO: fold both loops behind shared callbacks to avoid drift.
-    """
-    tokens: List[int] = []
-    segment = ""
-    finish_reason = "length"
-    stop_sequence = None
-    tool_text = ""
-    has_tool_use = False
-    in_tool_call = False
-    in_reasoning = False
-    if ctx.has_thinking:
-        for i in range(len(ctx.prompt) - 1, -1, -1):
-            if ctx.prompt[i] == ctx.think_end_id:
-                break
-            elif ctx.prompt[i] == ctx.think_start_id:
-                in_reasoning = True
-                break
-
-    def flush_segment():
-        nonlocal segment
-        if not segment:
-            return
-        on_text_segment(segment)
-        segment = ""
-
-    def emit_tool_uses(raw_tool_text: str):
-        nonlocal has_tool_use
-        parsed_tool_uses = _parse_generated_tool_uses(
-            [raw_tool_text], ctx, request.tools
-        )
-        for tool_use in parsed_tool_uses:
-            has_tool_use = True
-            on_tool_use(tool_use)
-
-    for gen in response:
-        tokens.append(gen.token)
-        visible = ""
-
-        if in_reasoning:
-            if gen.text == ctx.think_end:
-                in_reasoning = False
-        elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-            flush_segment()
-            on_tool_call_start()
-            in_tool_call = True
-        elif in_tool_call:
-            if gen.text == ctx.tool_call_end:
-                emit_tool_uses(tool_text)
-                tool_text = ""
-                in_tool_call = False
-            else:
-                tool_text += gen.text
-        else:
-            visible = gen.text
-
-        segment += visible
-
-        if gen.finish_reason is not None:
-            finish_reason = gen.finish_reason
-
-        stop_condition = stopping_criteria(
-            tokens,
-            ctx.eos_token_ids,
-            ctx.stop_token_sequences,
-            stop_words,
-        )
-        if stop_condition.stop_met:
-            finish_reason = "stop"
-            if stop_condition.trim_length > 0:
-                stop_sequence = stop_condition.stop_word
-                tokens = tokens[: len(tokens) - stop_condition.trim_length]
-            segment = trim_visible_stop_text(
-                segment, stop_sequence, stop_condition.trim_text_length
-            )
-            ctx.stop()
-            flush_segment()
-            break
-
-        if any(
-            sequence_overlap(tokens, sequence) for sequence in ctx.stop_token_sequences
-        ):
-            if not visible and not segment:
-                on_hidden_progress()
-            continue
-
-        if segment:
-            flush_segment()
-        elif not visible:
-            on_hidden_progress()
-
-    if in_tool_call and tool_text:
-        emit_tool_uses(tool_text)
-
-    flush_segment()
-
-    if has_tool_use:
-        finish_reason = "tool_calls"
-
-    return GenerationResult(
-        tokens=tokens,
-        finish_reason=finish_reason,
-        stop_sequence=stop_sequence,
-        has_tool_use=has_tool_use,
-    )
 
 
 # Stop reason mapping

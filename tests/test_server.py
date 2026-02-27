@@ -140,7 +140,7 @@ class TestServer(ServerAPITestBase, unittest.TestCase):
         self.assertIn("created", model)
 
     def test_sequence_overlap(self):
-        from mlx_lm.server import sequence_overlap
+        from mlx_lm.server_common import sequence_overlap
 
         self.assertTrue(sequence_overlap([1], [1]))
         self.assertTrue(sequence_overlap([1, 2], [1, 2]))
