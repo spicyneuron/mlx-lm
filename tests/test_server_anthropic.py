@@ -94,6 +94,12 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             body["stream"] = True
         return body
 
+    def _messages_url(self, query=""):
+        url = f"http://localhost:{self.port}/v1/messages"
+        if query:
+            return f"{url}?{query}"
+        return url
+
     def _assert_anthropic_error(
         self, body, error_type=None, message_substring=None
     ):
@@ -108,7 +114,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
     # Tests
 
     def test_handle_anthropic_messages(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         post_data = {
             "model": "chat_model",
             "max_tokens": 10,
@@ -135,7 +141,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertIn("output_tokens", response_body["usage"])
 
     def test_handle_anthropic_messages_requires_messages(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         response = requests.post(url, json={"model": "chat_model", "max_tokens": 10})
         self.assertEqual(response.status_code, 400)
         response_body = json.loads(response.text)
@@ -146,7 +152,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_handle_anthropic_messages_requires_object_body(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         response = requests.post(url, json=["not", "an", "object"])
         self.assertEqual(response.status_code, 400)
         body = json.loads(response.text)
@@ -157,10 +163,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_handle_anthropic_messages_with_query_string(self):
-        url = (
-            f"http://localhost:{self.port}/v1/messages"
-            "?beta=true&anthropic-version=2023-06-01"
-        )
+        url = self._messages_url("beta=true&anthropic-version=2023-06-01")
         post_data = {
             "model": "chat_model",
             "max_tokens": 10,
@@ -173,7 +176,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(response_body["role"], "assistant")
 
     def test_handle_anthropic_messages_rejects_text_block_missing_text_field(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         response = requests.post(
             url,
             json={
@@ -192,7 +195,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_handle_anthropic_messages_uses_stop_sequences_field(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         captured = {"stop_words": None}
 
         def on_call(req, args, cb):
@@ -216,7 +219,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(captured["stop_words"], ["take-this-stop"])
 
     def test_handle_anthropic_messages_stop_sequences_stops_generation(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake = self._make_fake_generate(
             ["Hello ", "STOP", "ignored"],
             stop_token_sequences=[[2]],
@@ -243,7 +246,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual("".join(text_blocks), "Hello ")
 
     def test_handle_anthropic_messages_defaults_model_and_max_tokens(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         captured = {"model": None, "max_tokens": None}
 
         def on_call(req, args, cb):
@@ -269,7 +272,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_handle_anthropic_messages_generate_error_uses_anthropic_schema(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         for stream in (False, True):
             with self.subTest(stream=stream):
                 request_body = {
@@ -296,7 +299,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
                 )
 
     def test_handle_anthropic_messages_unexpected_loop_error_is_server_error(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake = self._make_fake_generate(["Hello"])
 
         with patch.object(self.response_generator, "generate", side_effect=fake):
@@ -576,7 +579,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
             )
 
     def test_handle_anthropic_messages_with_blocks_and_system(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         post_data = {
             "model": "chat_model",
             "max_tokens": 10,
@@ -597,7 +600,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(response_body["content"][0]["type"], "text")
 
     def test_handle_anthropic_messages_with_tools_non_stream(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake = self._make_fake_tool_generate(
             [
                 "<tool_call>",
@@ -635,7 +638,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(body["content"][0]["input"], {"location": "sf"})
 
     def test_handle_anthropic_messages_streaming(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         post_data = {
             "model": "chat_model",
             "max_tokens": 10,
@@ -676,7 +679,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertGreaterEqual(message_delta["usage"]["output_tokens"], 0)
 
     def test_handle_anthropic_messages_streaming_tool_use(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake = self._make_fake_tool_generate(
             [
                 "<tool_call>",
@@ -735,7 +738,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
 
     def test_handle_anthropic_messages_non_stream_interleaved_text_tool_order(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake_generate = self._make_fake_tool_generate(
             [
                 "Before ",
@@ -761,7 +764,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(body["stop_reason"], "tool_use")
 
     def test_handle_anthropic_messages_streaming_interleaved_text_tool_order(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake_generate = self._make_fake_tool_generate(
             [
                 "Before ",
@@ -794,7 +797,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
 
     def test_handle_anthropic_messages_non_stream_tool_parse_error_returns_400(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
 
         def bad_parser(text, tools):
             raise ValueError("bad tool call json")
@@ -816,7 +819,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_handle_anthropic_messages_streaming_tool_parse_error_emits_error_event(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
 
         def bad_parser(text, tools):
             raise ValueError("bad tool call json")
@@ -844,7 +847,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertNotEqual(events[-1][0], "message_stop")
 
     def test_handle_anthropic_messages_no_tool_use_stop_reason_when_tool_list_empty(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake_generate = self._make_fake_tool_generate(
             ["<tool_call>", '{"name":"noop","arguments":{}}', "</tool_call>"],
             lambda text, tools: [],
@@ -859,7 +862,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(body["content"], [{"type": "text", "text": ""}])
 
     def test_handle_anthropic_messages_rejects_non_text_content(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         post_data = {
             "model": "chat_model",
             "max_tokens": 10,
@@ -883,24 +886,8 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         response_body = json.loads(response.text)
         self._assert_anthropic_error(response_body, error_type="invalid_request_error")
 
-    def test_handle_anthropic_messages_malformed_request_returns_anthropic_error(self):
-        url = f"http://localhost:{self.port}/v1/messages"
-        # Missing required "messages" field triggers an error during request
-        # construction; verify we get back an Anthropic-shaped error envelope.
-        response = requests.post(
-            url,
-            json={
-                "model": "chat_model",
-                "max_tokens": 10,
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
-        body = json.loads(response.text)
-        self._assert_anthropic_error(body, error_type="invalid_request_error")
-
     def test_handle_anthropic_messages_unexpected_request_factory_error_returns_500(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         with patch.object(
             server_anthropic,
             "handle_post",
@@ -943,7 +930,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(converted[0]["function"]["name"], "get_weather")
 
     def test_handle_anthropic_messages_malformed_json_returns_anthropic_error(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         response = requests.post(
             url,
             data=b"{not valid json",
@@ -958,7 +945,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         )
 
     def test_handle_anthropic_messages_multiple_tool_calls_non_stream(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake_generate = self._make_fake_tool_generate(
             [
                 "<tool_call>",
@@ -987,7 +974,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertEqual(body["stop_reason"], "tool_use")
 
     def test_handle_anthropic_messages_multiple_tool_calls_streaming(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake_generate = self._make_fake_tool_generate(
             [
                 "<tool_call>",
@@ -1073,7 +1060,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertIsNone(unmatched.stop_word)
 
     def test_handle_anthropic_messages_streaming_uses_progress_callback(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         captured = {"called": False, "has_callback": False}
 
         def on_call(req, args, cb):
@@ -1101,7 +1088,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertTrue(captured["has_callback"])
 
     def test_handle_anthropic_messages_non_stream_skips_progress_callback(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         captured = {"called": False, "has_callback": False}
 
         def on_call(req, args, cb):
@@ -1125,7 +1112,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertFalse(captured["has_callback"])
 
     def test_handle_anthropic_messages_non_stream_hides_thinking_text(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake = self._make_fake_generate(
             ["internal reasoning", "</think>", "Hello"],
             has_thinking=True,
@@ -1156,7 +1143,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertNotIn("internal reasoning", "".join(text_blocks))
 
     def test_handle_anthropic_messages_streaming_hides_thinking_text(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake = self._make_fake_generate(
             ["internal reasoning", "</think>", "Hello"],
             has_thinking=True,
@@ -1190,7 +1177,7 @@ class TestAnthropicServer(ServerAPITestBase, unittest.TestCase):
         self.assertNotIn("internal reasoning", "".join(text_deltas))
 
     def test_handle_anthropic_messages_streaming_hidden_keepalive(self):
-        url = f"http://localhost:{self.port}/v1/messages"
+        url = self._messages_url()
         fake = self._make_fake_generate(
             ["<tool_call>", '{"name":"x"}', "</tool_call>", "Hello"],
             has_tool_calling=True,
