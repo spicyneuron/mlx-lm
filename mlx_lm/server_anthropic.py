@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, List, Optional
 from .server_common import (
     load_json_body,
     make_progress_callback,
-    normalize_stop_words,
     write_json_response,
 )
 from .server import CompletionRequest, sequence_overlap, stopping_criteria
@@ -248,11 +247,10 @@ def handle_post(handler: Any) -> None:
         return
 
     # Anthropic uses stop_sequences instead of stop
-    stop_words = normalize_stop_words(handler.body.get("stop_sequences"))
-    max_tokens = handler.body.get(
-        "max_tokens", handler.response_generator.cli_args.max_tokens
+    args = handler._parse_and_build_args(
+        handler.body.get("stop_sequences"),
+        handler.body.get("max_tokens"),
     )
-    args = handler._parse_and_build_args(stop_words, max_tokens)
 
     handler.request_id = f"msg_{uuid.uuid4().hex}"
 

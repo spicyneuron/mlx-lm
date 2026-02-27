@@ -36,11 +36,6 @@ def write_json_response(
         handler.wfile.flush()
 
 
-def normalize_stop_words(stop_words: Any) -> Any:
-    stop_words = stop_words or []
-    return [stop_words] if isinstance(stop_words, str) else stop_words
-
-
 def make_progress_callback(
     stream: bool, on_stream_progress: Callable[[int, int], None]
 ) -> Callable[[int, int], None]:

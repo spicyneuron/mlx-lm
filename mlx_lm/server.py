@@ -45,7 +45,6 @@ from .sample_utils import make_logits_processors, make_sampler
 from .server_common import (
     load_json_body,
     make_progress_callback,
-    normalize_stop_words,
     write_json_response,
 )
 from .utils import load, sharded_load
@@ -1138,13 +1137,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Extract request parameters from the body
         self.stream_options = self.body.get("stream_options", None)
-        max_tokens = self.body.get("max_completion_tokens", None)
-        if max_tokens is None:
-            max_tokens = self.body.get(
-                "max_tokens", self.response_generator.cli_args.max_tokens
-            )
-        stop_words = normalize_stop_words(self.body.get("stop"))
-        args = self._parse_and_build_args(stop_words, max_tokens)
+        args = self._parse_and_build_args(
+            self.body.get("stop"),
+            self.body.get("max_completion_tokens") or self.body.get("max_tokens"),
+        )
         self.validate_model_parameters()
 
         # Create the completion request
@@ -1168,13 +1164,18 @@ class APIHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
-    def _parse_and_build_args(self, stop_words, max_tokens):
+    def _parse_and_build_args(self, stop_words, max_tokens=None):
         """Parse common request params and return GenerationArguments.
 
         Sets instance attributes consumed by downstream formatting (stream,
         requested_model, etc.) and builds the GenerationArguments in one step.
         Callers supply stop_words and max_tokens since those differ by API format.
         """
+        stop_words = stop_words or []
+        if isinstance(stop_words, str):
+            stop_words = [stop_words]
+        if max_tokens is None:
+            max_tokens = self.response_generator.cli_args.max_tokens
         cli = self.response_generator.cli_args
         self.stream = self.body.get("stream", False)
         self.requested_model = self.body.get("model", "default_model")
