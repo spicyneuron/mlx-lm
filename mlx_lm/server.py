@@ -11,7 +11,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -41,12 +41,9 @@ from .models.cache import (
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .server_common import (
-    StopCondition,
     load_json_body,
     make_progress_callback,
     run_generation_loop,
-    sequence_overlap,
-    stopping_criteria,
     write_json_response,
 )
 from .utils import load, sharded_load
@@ -669,7 +666,6 @@ class ResponseGenerator:
 
     def _generate(self):
         current_model = None
-        current_sampling = None
         current_tokenizer = None
         current_model_key = None
         batch_generator = None
@@ -720,17 +716,19 @@ class ResponseGenerator:
                         continue
 
                     ctx = GenerationContext(
-                        has_tool_calling=tokenizer.has_tool_calling,
-                        tool_call_start=tokenizer.tool_call_start,
-                        tool_call_end=tokenizer.tool_call_end,
-                        tool_parser=tokenizer.tool_parser,
-                        has_thinking=tokenizer.has_thinking,
-                        think_start_id=tokenizer.think_start_id,
-                        think_end=tokenizer.think_end,
-                        think_end_id=tokenizer.think_end_id,
-                        eos_token_ids=tokenizer.eos_token_ids,
+                        has_tool_calling=current_tokenizer.has_tool_calling,
+                        tool_call_start=current_tokenizer.tool_call_start,
+                        tool_call_end=current_tokenizer.tool_call_end,
+                        tool_parser=current_tokenizer.tool_parser,
+                        has_thinking=current_tokenizer.has_thinking,
+                        think_start_id=current_tokenizer.think_start_id,
+                        think_end=current_tokenizer.think_end,
+                        think_end_id=current_tokenizer.think_end_id,
+                        eos_token_ids=current_tokenizer.eos_token_ids,
                         stop_token_sequences=[
-                            tokenizer.encode(stop_word, add_special_tokens=False)
+                            current_tokenizer.encode(
+                                stop_word, add_special_tokens=False
+                            )
                             for stop_word in args.stop_words
                         ],
                         prompt=prompt,
@@ -753,14 +751,14 @@ class ResponseGenerator:
                         [rest],
                         args.max_tokens,
                         caches=[cache],
-                        samplers=[_make_sampler(args, tokenizer)],
+                        samplers=[_make_sampler(args, current_tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "cache_key": prompt[:],
                         "rqueue": rqueue,
-                        "detokenizer": tokenizer.detokenizer,
+                        "detokenizer": current_tokenizer.detokenizer,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -813,7 +811,6 @@ class ResponseGenerator:
                 if len(batch_results) == 0:
                     if drain_batch:
                         current_model = None
-                        current_sampling = None
                         current_tokenizer = None
                         current_model_key = None
                         batch_generator.close()
