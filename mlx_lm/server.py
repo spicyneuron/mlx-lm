@@ -11,7 +11,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -23,12 +23,11 @@ from typing import (
     Dict,
     List,
     Literal,
-    NamedTuple,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
+from urllib.parse import urlsplit
 
 import mlx.core as mx
 from huggingface_hub import scan_cache_dir
@@ -41,6 +40,12 @@ from .models.cache import (
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
+from .server_common import (
+    load_json_body,
+    make_progress_callback,
+    run_generation_loop,
+    write_json_response,
+)
 from .utils import load, sharded_load
 
 
@@ -60,68 +65,6 @@ def parse_size(x):
     size = (x[split:]).strip().upper()
     return int(digits * sizes[size])
 
-
-class StopCondition(NamedTuple):
-    stop_met: bool
-    trim_length: int
-    trim_text_length: int
-
-
-def stopping_criteria(
-    tokens: List[int],
-    eos_token_ids: set,
-    stop_id_sequences: List[List[int]],
-    stop_words: List[str],
-) -> StopCondition:
-    """
-    Determines whether the token generation should stop based on predefined
-    conditions.
-
-    Args:
-        tokens (List[int]): The current sequence of generated tokens.
-        eos_token_ids (set): The token IDs that represents the
-          end-of-sequence. If the last token in ``tokens`` is in the set,
-          the generation should stop.
-        stop_id_sequences (List[List[[int]]): A list of integer lists, each
-          representing a sequence of token IDs. If the end of the `tokens`
-          list matches any of these sequences, the generation should stop.
-        stop_words (List[str]): The stop words that correspond to the
-            ``stop_id_sequences``.
-
-    Returns:
-        StopCondition: A named tuple indicating whether the stop condition has
-          been met (`stop_met`) and how many tokens should be trimmed from the
-          end if it has (`trim_length`) as well as the text that should be
-          trimmed.
-    """
-    if tokens and tokens[-1] in eos_token_ids:
-        return StopCondition(stop_met=True, trim_length=0, trim_text_length=0)
-
-    for stop_ids, stop_word in zip(stop_id_sequences, stop_words):
-        if len(tokens) >= len(stop_ids):
-            if tokens[-len(stop_ids) :] == stop_ids:
-                return StopCondition(
-                    stop_met=True,
-                    trim_length=len(stop_ids),
-                    trim_text_length=len(stop_word),
-                )
-
-    return StopCondition(stop_met=False, trim_length=0, trim_text_length=0)
-
-
-def sequence_overlap(s1: Sequence, s2: Sequence) -> bool:
-    """
-    Checks if a suffix of s1 has overlap with a prefix of s2
-
-    Args:
-        s1 (Sequence): The first sequence
-        s2 (Sequence): The second sequence
-
-    Returns:
-        bool: If the two sequences have overlap
-    """
-    max_overlap = min(len(s1), len(s2))
-    return any(s1[-i:] == s2[:i] for i in range(1, max_overlap + 1))
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -183,7 +126,6 @@ def process_message_content(messages):
 
 
 class LRUPromptCache:
-
     @dataclass
     class CacheEntry:
         prompt_cache: List[Any]
@@ -724,7 +666,6 @@ class ResponseGenerator:
 
     def _generate(self):
         current_model = None
-        current_sampling = None
         current_tokenizer = None
         current_model_key = None
         batch_generator = None
@@ -775,17 +716,19 @@ class ResponseGenerator:
                         continue
 
                     ctx = GenerationContext(
-                        has_tool_calling=tokenizer.has_tool_calling,
-                        tool_call_start=tokenizer.tool_call_start,
-                        tool_call_end=tokenizer.tool_call_end,
-                        tool_parser=tokenizer.tool_parser,
-                        has_thinking=tokenizer.has_thinking,
-                        think_start_id=tokenizer.think_start_id,
-                        think_end=tokenizer.think_end,
-                        think_end_id=tokenizer.think_end_id,
-                        eos_token_ids=tokenizer.eos_token_ids,
+                        has_tool_calling=current_tokenizer.has_tool_calling,
+                        tool_call_start=current_tokenizer.tool_call_start,
+                        tool_call_end=current_tokenizer.tool_call_end,
+                        tool_parser=current_tokenizer.tool_parser,
+                        has_thinking=current_tokenizer.has_thinking,
+                        think_start_id=current_tokenizer.think_start_id,
+                        think_end=current_tokenizer.think_end,
+                        think_end_id=current_tokenizer.think_end_id,
+                        eos_token_ids=current_tokenizer.eos_token_ids,
                         stop_token_sequences=[
-                            tokenizer.encode(stop_word, add_special_tokens=False)
+                            current_tokenizer.encode(
+                                stop_word, add_special_tokens=False
+                            )
                             for stop_word in args.stop_words
                         ],
                         prompt=prompt,
@@ -801,21 +744,21 @@ class ResponseGenerator:
 
                     ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
                     logging.info(
-                        f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB"
+                        f"We have {ncaches} kv caches that take {nbytes / 1e9:.2f} GB"
                     )
 
                     (uid,) = batch_generator.insert(
                         [rest],
                         args.max_tokens,
                         caches=[cache],
-                        samplers=[_make_sampler(args, tokenizer)],
+                        samplers=[_make_sampler(args, current_tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "cache_key": prompt[:],
                         "rqueue": rqueue,
-                        "detokenizer": tokenizer.detokenizer,
+                        "detokenizer": current_tokenizer.detokenizer,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -868,7 +811,6 @@ class ResponseGenerator:
                 if len(batch_results) == 0:
                     if drain_batch:
                         current_model = None
-                        current_sampling = None
                         current_tokenizer = None
                         current_model_key = None
                         batch_generator.close()
@@ -980,7 +922,7 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
-            logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
+            logging.info(f"We have {ncaches} kv caches that take {nbytes / 1e9:.2f} GB")
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1096,6 +1038,11 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
+        # Anthropic clients may append query params, so strip them for matching
+        if urlsplit(self.path).path == "/v1/messages":
+            self._handle_anthropic_messages()
+            return
+
         request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
@@ -1109,45 +1056,73 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # Fetch and parse request body
-        content_length = int(self.headers["Content-Length"])
-        raw_body = self.rfile.read(content_length)
-        try:
-            self.body = json.loads(raw_body.decode())
-        except json.JSONDecodeError as e:
-            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+        success, decoded = load_json_body(self)
+        if not success:
+            write_json_response(
+                self,
+                status_code=400,
+                payload={"error": f"Invalid JSON in request body: {decoded}"},
             )
             return
+        self.body = decoded
 
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
-        assert isinstance(
-            self.body, dict
-        ), f"Request should be dict, but got {type(self.body)}"
+        assert isinstance(self.body, dict), (
+            f"Request should be dict, but got {type(self.body)}"
+        )
 
         # Extract request parameters from the body
-        self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
+        args = self._parse_and_build_args(
+            self.body.get("stop"),
+            self.body.get("max_completion_tokens") or self.body.get("max_tokens"),
+        )
+        self.validate_model_parameters()
+
+        # Create the completion request
+        request = request_factories[self.path]()
+        self.handle_completion(request, args)
+
+    def _handle_anthropic_messages(self):
+        from . import server_anthropic as anth
+
+        try:
+            anth.handle_post(self)
+        except Exception:
+            logging.exception("Unexpected error in Anthropic messages handler")
+            try:
+                write_json_response(
+                    self,
+                    status_code=500,
+                    payload=anth.error_payload("Internal server error", "api_error"),
+                    flush=True,
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    def _parse_and_build_args(self, stop_words, max_tokens=None):
+        """Parse common request params and return GenerationArguments.
+
+        Sets instance attributes consumed by downstream formatting (stream,
+        requested_model, etc.) and builds the GenerationArguments in one step.
+        Callers supply stop_words and max_tokens since those differ by API format.
+        """
+        stop_words = stop_words or []
+        if isinstance(stop_words, str):
+            stop_words = [stop_words]
+        if max_tokens is None:
+            max_tokens = self.response_generator.cli_args.max_tokens
+        cli = self.response_generator.cli_args
+        self.stream = self.body.get("stream", False)
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get(
-            "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
-        )
+        self.num_draft_tokens = self.body.get("num_draft_tokens", cli.num_draft_tokens)
         self.adapter = self.body.get("adapters", None)
-        self.max_tokens = self.body.get("max_completion_tokens", None)
-        if self.max_tokens is None:
-            self.max_tokens = self.body.get(
-                "max_tokens", self.response_generator.cli_args.max_tokens
-            )
-        self.temperature = self.body.get(
-            "temperature", self.response_generator.cli_args.temp
-        )
-        self.top_p = self.body.get("top_p", self.response_generator.cli_args.top_p)
-        self.top_k = self.body.get("top_k", self.response_generator.cli_args.top_k)
-        self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
+        self.temperature = self.body.get("temperature", cli.temp)
+        self.top_p = self.body.get("top_p", cli.top_p)
+        self.top_k = self.body.get("top_k", cli.top_k)
+        self.min_p = self.body.get("min_p", cli.min_p)
         self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
@@ -1157,16 +1132,35 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        self.max_tokens = max_tokens
 
-        # Get stop sequences
-        stop_words = self.body.get("stop")
-        stop_words = stop_words or []
-        stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
-
-        # Create the completion request
-        request = request_factories[self.path]()
-        self.handle_completion(request, stop_words)
+        return GenerationArguments(
+            model=ModelDescription(
+                model=self.requested_model,
+                draft=self.requested_draft_model,
+                adapter=self.adapter,
+            ),
+            sampling=SamplingArguments(
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                min_p=self.min_p,
+                xtc_probability=self.xtc_probability,
+                xtc_threshold=self.xtc_threshold,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=self.logit_bias,
+                repetition_penalty=self.repetition_penalty,
+                repetition_context_size=self.repetition_context_size,
+            ),
+            stop_words=stop_words,
+            max_tokens=max_tokens,
+            num_draft_tokens=self.num_draft_tokens,
+            logprobs=self.logprobs,
+            top_logprobs=self.top_logprobs,
+            seed=self.seed,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
 
     def validate_model_parameters(self):
         """
@@ -1345,62 +1339,23 @@ class APIHandler(BaseHTTPRequestHandler):
 
         return response
 
-    def handle_completion(self, request: CompletionRequest, stop_words: List[str]):
-        """
-        Generate a response to a prompt and send it to the client in a single batch.
+    def handle_completion(self, request: CompletionRequest, args: GenerationArguments):
 
-        Args:
-            prompt (List[int]): The tokenized prompt.
-            stop_words (List[str]): A list of stop words passed to the
-                stopping_criteria function
-        """
-        args = GenerationArguments(
-            model=ModelDescription(
-                model=self.requested_model,
-                draft=self.requested_draft_model,
-                adapter=self.adapter,
-            ),
-            sampling=SamplingArguments(
-                temperature=self.temperature,
-                top_p=self.top_p,
-                top_k=self.top_k,
-                min_p=self.min_p,
-                xtc_probability=self.xtc_probability,
-                xtc_threshold=self.xtc_threshold,
-            ),
-            logits=LogitsProcessorArguments(
-                logit_bias=self.logit_bias,
-                repetition_penalty=self.repetition_penalty,
-                repetition_context_size=self.repetition_context_size,
-            ),
-            stop_words=stop_words,
-            max_tokens=self.max_tokens,
-            num_draft_tokens=self.num_draft_tokens,
-            logprobs=self.logprobs,
-            top_logprobs=self.top_logprobs,
-            seed=self.seed,
-            chat_template_kwargs=self.chat_template_kwargs,
+        def write_keepalive_comment(processed_tokens, total_tokens):
+            try:
+                self.wfile.write(
+                    f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                )
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        keepalive_callback = make_progress_callback(
+            self.stream, write_keepalive_comment
         )
 
-        # Create keepalive callback to send SSE comments during long prompt processing
-        def keepalive_callback(processed_tokens, total_tokens):
-            logging.info(
-                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
-            )
-            if self.stream:
-                try:
-                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
-                    self.wfile.write(
-                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
-                    )
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    # Client disconnected, ignore
-                    pass
-
-        # Create the token generator
         try:
-            ctx, response = self.response_generator.generate(
+            ctx, token_stream = self.response_generator.generate(
                 request,
                 args,
                 progress_callback=keepalive_callback,
@@ -1411,7 +1366,6 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": f"{e}"}).encode())
             return
 
-        # Prepare the headers
         if self.stream:
             self._set_stream_headers(200)
             self.end_headers()
@@ -1420,12 +1374,12 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             logging.debug("Starting completion:")
 
-        # Variables to save the tool calls in as they are being generated by
-        # the model.
-        in_tool_call = False
-        made_tool_call = False
-        tool_calls = []
-        tool_text = ""
+        # Accumulated state filled by callbacks
+        text = ""
+        reasoning_text = ""
+        tool_calls_raw: List[str] = []
+        token_logprobs: List[float] = []
+        top_tokens: List[Tuple[Dict[str, Any]]] = []
         tool_idx = 0
 
         def format_tool_call(tool_call):
@@ -1444,156 +1398,109 @@ class APIHandler(BaseHTTPRequestHandler):
                 tool_idx += 1
             return out
 
-        def parse_tools(tool_calls):
-            if not tool_calls:
+        def parse_tools(raw_calls):
+            if not raw_calls:
                 return []
             result = []
-            for tool_text in tool_calls:
-                parsed = ctx.tool_parser(tool_text, request.tools)
+            for raw in raw_calls:
+                parsed = ctx.tool_parser(raw, request.tools)
                 if isinstance(parsed, list):
                     result.extend(format_tool_call(tc) for tc in parsed)
                 else:
                     result.append(format_tool_call(parsed))
             return result
 
-        # Start out in reasoning if the model is a reasoning model and the
-        # prompt has an open think token but no closing think token
-        in_reasoning = False
-        if ctx.has_thinking:
-            for i in range(len(ctx.prompt) - 1, -1, -1):
-                if ctx.prompt[i] == ctx.think_end_id:
-                    break
-                elif ctx.prompt[i] == ctx.think_start_id:
-                    in_reasoning = True
-                    break
-        reasoning_text = ""
+        # -- Callbacks --
 
-        # Variables to save the generated tokens and the corresponding probs
-        tokens = []
-        token_logprobs = []
-        top_tokens = []
+        def on_text(segment):
+            nonlocal text, reasoning_text, tool_calls_raw
+            text += segment
+            if self.stream:
+                resp = self.generate_response(
+                    segment,
+                    None,
+                    tool_calls=parse_tools(tool_calls_raw),
+                    reasoning_text=reasoning_text,
+                )
+                self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                self.wfile.flush()
+                reasoning_text = ""
+                tool_calls_raw = []
 
-        # Variables to save the generated text
-        text = ""
-        segment = ""
+        def on_reasoning(segment):
+            nonlocal reasoning_text, tool_calls_raw
+            reasoning_text += segment
+            if self.stream:
+                resp = self.generate_response(
+                    "",
+                    None,
+                    tool_calls=parse_tools(tool_calls_raw),
+                    reasoning_text=reasoning_text,
+                )
+                self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                self.wfile.flush()
+                reasoning_text = ""
+                tool_calls_raw = []
 
-        # Well finally save the reason for stopping
-        finish_reason = "length"
-        # Process the generated tokens
-        for gen in response:
+        def on_tool_done(raw):
+            tool_calls_raw.append(raw)
+
+        def on_token(gen):
             logging.debug(gen.text)
-
-            # Gather the text in tool calling or text variables
-            if in_reasoning:
-                if gen.text == ctx.think_end:
-                    in_reasoning = False
-                else:
-                    reasoning_text += gen.text
-            elif ctx.has_tool_calling and gen.text == ctx.tool_call_start:
-                made_tool_call = True
-                in_tool_call = True
-            elif in_tool_call:
-                if gen.text == ctx.tool_call_end:
-                    tool_calls.append(tool_text)
-                    tool_text = ""
-                    in_tool_call = False
-                else:
-                    tool_text += gen.text
-            else:
-                text += gen.text
-                segment += gen.text
-
-            # Save the token and its logprob
-            tokens.append(gen.token)
             if args.logprobs:
                 token_logprobs.append(gen.logprob)
-
-            # If requested save the k top logprobs
             if args.top_logprobs > 0:
                 top_tokens.append(gen.top_tokens)
 
-            # Check if we should stop early
-            stop_condition = stopping_criteria(
-                tokens,
-                ctx.eos_token_ids,
-                ctx.stop_token_sequences,
-                stop_words,
-            )
-            if stop_condition.stop_met:
-                finish_reason = "tool_calls" if made_tool_call else "stop"
-                ctx.stop()
-                tokens = tokens[: len(tokens) - stop_condition.trim_length]
-                text = text[: len(text) - stop_condition.trim_text_length]
-                segment = ""
-                break
+        result = run_generation_loop(
+            ctx,
+            token_stream,
+            args.stop_words,
+            on_text_segment=on_text,
+            on_reasoning_segment=on_reasoning,
+            on_tool_call_done=on_tool_done,
+            on_token=on_token,
+        )
 
-            if self.stream and not in_tool_call:
-                # If the end of tokens overlaps with a stop sequence, generate new
-                # tokens until we know if the stop sequence is hit or not
-                if any(
-                    (
-                        sequence_overlap(tokens, sequence)
-                        for sequence in ctx.stop_token_sequences
-                    )
-                ):
-                    continue
-                elif segment or tool_calls or reasoning_text:
-                    response = self.generate_response(
-                        segment,
-                        None,
-                        tool_calls=parse_tools(tool_calls),
-                        reasoning_text=reasoning_text,
-                    )
-                    self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
-                    self.wfile.flush()
-                    reasoning_text = ""
-                    segment = ""
-                    tool_calls = []
-
-            if gen.finish_reason is not None:
-                finish_reason = gen.finish_reason
-
-        # Flush any remaining tool text (e.g. when tool_call_end is empty)
-        if in_tool_call and tool_text:
-            tool_calls.append(tool_text)
+        finish_reason = result.finish_reason
 
         if self.stream:
-            response = self.generate_response(
-                segment,
+            # Final streaming chunk with finish_reason
+            resp = self.generate_response(
+                "",
                 finish_reason,
-                tool_calls=parse_tools(tool_calls),
+                tool_calls=parse_tools(tool_calls_raw),
                 reasoning_text=reasoning_text,
             )
-            self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+            self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(
+                resp = self.completion_usage_response(
                     len(ctx.prompt),
-                    len(tokens),
+                    len(result.tokens),
                     ctx.prompt_cache_count,
                 )
-                self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
+                self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
             self.wfile.flush()
         else:
-            response = self.generate_response(
+            resp = self.generate_response(
                 text,
                 finish_reason,
                 len(ctx.prompt),
-                len(tokens),
+                len(result.tokens),
                 ctx.prompt_cache_count,
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
-                tokens=tokens,
+                tokens=result.tokens,
                 reasoning_text=reasoning_text,
-                tool_calls=parse_tools(tool_calls),
+                tool_calls=parse_tools(tool_calls_raw),
             )
-            response_json = json.dumps(response).encode()
+            response_json = json.dumps(resp).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings
-            logging.debug(f"Outgoing Response: {json.dumps(response, indent=indent)}")
+            logging.debug(f"Outgoing Response: {json.dumps(resp, indent=indent)}")
 
-            # Send an additional Content-Length header when it is known
             self.send_header("Content-Length", str(len(response_json)))
             self.end_headers()
             self.wfile.write(response_json)
