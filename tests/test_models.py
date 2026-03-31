@@ -612,6 +612,85 @@ class TestModels(unittest.TestCase):
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
 
+    def test_qwen3_5_moe_sanitize_accepts_packed_and_indexed_experts(self):
+        from mlx_lm.models import qwen3_5_moe
+
+        text_config = {
+            "model_type": "qwen3_5_moe",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 32,
+            "linear_num_value_heads": 1,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 1,
+            "full_attention_interval": 1,
+            "tie_word_embeddings": False,
+            "max_position_embeddings": 64,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+            "shared_expert_intermediate_size": 8,
+            "moe_intermediate_size": 3,
+        }
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5_moe",
+                "text_config": text_config,
+            }
+        )
+        model = qwen3_5_moe.Model(args)
+
+        prefix = "model.language_model.layers.0.mlp"
+        gate = [
+            mx.arange(12, dtype=mx.float32).reshape(3, 4),
+            mx.arange(12, 24, dtype=mx.float32).reshape(3, 4),
+        ]
+        up = [
+            mx.arange(24, 36, dtype=mx.float32).reshape(3, 4),
+            mx.arange(36, 48, dtype=mx.float32).reshape(3, 4),
+        ]
+        down = [
+            mx.arange(48, 60, dtype=mx.float32).reshape(4, 3),
+            mx.arange(60, 72, dtype=mx.float32).reshape(4, 3),
+        ]
+
+        packed = model.sanitize(
+            {
+                f"{prefix}.experts.gate_up_proj": mx.stack(
+                    [mx.concatenate([g, u], axis=0) for g, u in zip(gate, up)]
+                ),
+                f"{prefix}.experts.down_proj": mx.stack(down),
+            }
+        )
+        indexed = model.sanitize(
+            {
+                f"{prefix}.experts.0.gate_proj.weight": gate[0],
+                f"{prefix}.experts.1.gate_proj.weight": gate[1],
+                f"{prefix}.experts.0.up_proj.weight": up[0],
+                f"{prefix}.experts.1.up_proj.weight": up[1],
+                f"{prefix}.experts.0.down_proj.weight": down[0],
+                f"{prefix}.experts.1.down_proj.weight": down[1],
+            }
+        )
+
+        gate_key = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        up_key = "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+        down_key = "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight"
+
+        self.assertTrue(mx.array_equal(packed[gate_key], mx.stack(gate)))
+        self.assertTrue(mx.array_equal(packed[up_key], mx.stack(up)))
+        self.assertTrue(mx.array_equal(packed[down_key], mx.stack(down)))
+        self.assertTrue(mx.array_equal(indexed[gate_key], mx.stack(gate)))
+        self.assertTrue(mx.array_equal(indexed[up_key], mx.stack(up)))
+        self.assertTrue(mx.array_equal(indexed[down_key], mx.stack(down)))
+        self.assertFalse(any(".experts." in key for key in packed))
+        self.assertFalse(any(".experts." in key for key in indexed))
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 

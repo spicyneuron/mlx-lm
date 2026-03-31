@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import mlx.core as mx
+
 from .base import BaseModelArgs
 from .qwen3_5 import Model as Qwen3_5Model
 
@@ -35,8 +37,17 @@ class Model(Qwen3_5Model):
 
         for l in range(self.language_model.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.mlp"
+            expert_key = f"{prefix}.experts.0.gate_proj.weight"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key in new_weights:
+            if expert_key in new_weights:
+                for name in ["gate_proj", "up_proj", "down_proj"]:
+                    new_weights[f"{prefix}.switch_mlp.{name}.weight"] = mx.stack(
+                        [
+                            new_weights.pop(f"{prefix}.experts.{e}.{name}.weight")
+                            for e in range(self.language_model.args.num_experts)
+                        ]
+                    )
+            elif gate_up_key in new_weights:
                 gate_up = new_weights.pop(gate_up_key)
                 mid = gate_up.shape[-2] // 2
                 new_weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
