@@ -45,9 +45,9 @@ setup(
         "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
-        "cuda13": ["git+https://github.com/PrismML-Eng/mlx.git@prism#egg=mlx[cuda13]"],
-        "cuda12": ["git+https://github.com/PrismML-Eng/mlx.git@prism#egg=mlx[cuda12]"],
-        "cpu": ["git+https://github.com/PrismML-Eng/mlx.git@prism#egg=mlx[cpu]"],
+        "cuda13": ["mlx[cuda13]"],
+        "cuda12": ["mlx[cuda12]"],
+        "cpu": ["mlx[cpu]"],
     },
     entry_points={
         "console_scripts": [
