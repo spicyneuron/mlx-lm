@@ -24,7 +24,7 @@ setup(
     url="https://github.com/ml-explore/mlx-lm",
     license="MIT",
     install_requires=[
-        f"git+https://github.com/PrismML-Eng/mlx.git@prism#egg=mlx; platform_system == 'Darwin'",
+        *(["git+https://github.com/PrismML-Eng/mlx.git@prism#egg=mlx"] if sys.platform == "darwin" else []),
         "numpy",
         "transformers>=5.0.0",
         "sentencepiece",
