@@ -24,7 +24,7 @@ setup(
     url="https://github.com/ml-explore/mlx-lm",
     license="MIT",
     install_requires=[
-        f"mlx @ git+https://github.com/PrismML-Eng/mlx.git@prism; platform_system == 'Darwin'",
+        f"git+https://github.com/PrismML-Eng/mlx.git@prism#egg=mlx; platform_system == 'Darwin'",
         "numpy",
         "transformers>=5.0.0",
         "sentencepiece",
@@ -45,9 +45,9 @@ setup(
         "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
         "evaluate": ["lm-eval", "tqdm"],
-        "cuda13": ["mlx[cuda13] @ git+https://github.com/PrismML-Eng/mlx.git@prism"],
-        "cuda12": ["mlx[cuda12] @ git+https://github.com/PrismML-Eng/mlx.git@prism"],
-        "cpu": ["mlx[cpu] @ git+https://github.com/PrismML-Eng/mlx.git@prism"],
+        "cuda13": ["git+https://github.com/PrismML-Eng/mlx.git@prism#egg=mlx[cuda13]"],
+        "cuda12": ["git+https://github.com/PrismML-Eng/mlx.git@prism#egg=mlx[cuda12]"],
+        "cpu": ["git+https://github.com/PrismML-Eng/mlx.git@prism#egg=mlx[cpu]"],
     },
     entry_points={
         "console_scripts": [
