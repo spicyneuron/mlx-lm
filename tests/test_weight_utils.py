@@ -11,21 +11,16 @@ from mlx_lm.utils import (
     format_weight_compatibility_error,
     inspect_weight_compatibility,
     load_model,
+    strip_unsupported_weights,
 )
 
 
 def test_canonicalize_weight_keys_remaps_common_aliases():
     weights = {
-        "model.language_model.visual.blocks.0.weight": mx.array([1]),
-        "language_model.model.visual.blocks.1.weight": mx.array([2]),
-        "model.visual.blocks.2.weight": mx.array([3]),
-        "model.language_model.layers.0.weight": mx.array([4]),
-        "lm_head.weight": mx.array([5]),
+        "model.language_model.layers.0.weight": mx.array([1]),
+        "lm_head.weight": mx.array([2]),
     }
     expected_keys = {
-        "vision_tower.blocks.0.weight",
-        "vision_tower.blocks.1.weight",
-        "vision_tower.blocks.2.weight",
         "language_model.model.layers.0.weight",
         "language_model.lm_head.weight",
     }
@@ -39,7 +34,7 @@ def test_canonicalize_weight_keys_keeps_existing_targets_and_unknown_aliases():
     weights = {
         "lm_head.weight": mx.array([1]),
         "language_model.lm_head.weight": mx.array([2]),
-        "model.language_model.visual.blocks.0.weight": mx.array([3]),
+        "unknown.prefix.weight": mx.array([3]),
     }
     expected_keys = {"language_model.lm_head.weight"}
 
@@ -47,7 +42,24 @@ def test_canonicalize_weight_keys_keeps_existing_targets_and_unknown_aliases():
 
     assert "language_model.lm_head.weight" in canonicalized
     assert "lm_head.weight" in canonicalized
-    assert "model.language_model.visual.blocks.0.weight" in canonicalized
+    assert "unknown.prefix.weight" in canonicalized
+
+
+def test_strip_unsupported_weights_removes_multimodal_modules():
+    weights = {
+        "vision_tower.blocks.0.weight": mx.array([1]),
+        "model.visual.blocks.1.weight": mx.array([2]),
+        "audio_tower.layers.0.weight": mx.array([3]),
+        "mm_projector.weight": mx.array([4]),
+        "language_model.model.layers.0.weight": mx.array([5]),
+    }
+
+    stripped = strip_unsupported_weights(weights)
+
+    assert set(stripped) == {"language_model.model.layers.0.weight"}
+    assert mx.array_equal(
+        stripped["language_model.model.layers.0.weight"], weights["language_model.model.layers.0.weight"]
+    )
 
 
 def test_adapt_weight_structure_splits_in_proj_weights_and_biases():
@@ -124,12 +136,12 @@ def test_adapt_weight_structure_keeps_existing_targets():
 
 def test_inspect_weight_compatibility_finds_missing_unexpected_and_shape_mismatches():
     expected_weights = {
-        "vision_tower.weight": mx.zeros((4, 4)),
+        "language_model.embed.weight": mx.zeros((4, 4)),
         "language_model.lm_head.weight": mx.zeros((4, 4)),
         "language_model.model.layers.0.weight": mx.zeros((4, 4)),
     }
     weights = {
-        "vision_tower.weight": mx.zeros((8, 4)),
+        "language_model.embed.weight": mx.zeros((8, 4)),
         "lm_head.weight": mx.zeros((4, 4)),
         "extra.weight": mx.zeros((2, 2)),
     }
@@ -142,7 +154,7 @@ def test_inspect_weight_compatibility_finds_missing_unexpected_and_shape_mismatc
     ]
     assert issues["unexpected"] == ["extra.weight", "lm_head.weight"]
     assert issues["shape_mismatches"] == [
-        ("vision_tower.weight", (4, 4), (8, 4))
+        ("language_model.embed.weight", (4, 4), (8, 4))
     ]
     assert issues["suggestions"] == [
         ("lm_head.weight", "language_model.lm_head.weight")
@@ -155,7 +167,7 @@ def test_format_weight_compatibility_error_includes_actionable_sections():
         "provided_count": 2,
         "missing": ["language_model.lm_head.weight"],
         "unexpected": ["lm_head.weight"],
-        "shape_mismatches": [("vision_tower.weight", (4, 4), (8, 4))],
+        "shape_mismatches": [("language_model.embed.weight", (4, 4), (8, 4))],
         "suggestions": [("lm_head.weight", "language_model.lm_head.weight")],
     }
 
@@ -222,6 +234,8 @@ def test_load_model_adapts_common_exported_weights(tmp_path):
         "resampler.attn.in_proj_weight": mx.arange(48, dtype=mx.float32).reshape(12, 4),
         "resampler.attn.in_proj_bias": mx.arange(12, dtype=mx.float32),
         "lm_head.weight": mx.arange(16, dtype=mx.float32).reshape(4, 4),
+        "vision_tower.stub": mx.arange(1, dtype=mx.float32),
+        "model.multi_modal_projector.stub": mx.arange(1, dtype=mx.float32),
     }
 
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "dummy"}))
