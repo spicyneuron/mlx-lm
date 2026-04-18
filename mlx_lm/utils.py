@@ -58,9 +58,6 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 WEIGHT_KEY_ALIASES = (
-    ("model.language_model.visual.", "vision_tower."),
-    ("language_model.model.visual.", "vision_tower."),
-    ("model.visual.", "vision_tower."),
     ("model.language_model.", "language_model.model."),
     ("lm_head.", "language_model.lm_head."),
 )
@@ -93,6 +90,28 @@ DOWN_PROJ_SUFFIXES = (
 )
 
 WEIGHT_DIAGNOSTIC_LIMIT = 8
+
+UNSUPPORTED_WEIGHT_PREFIXES = (
+    "audio_model.",
+    "audio_tower.",
+    "embed_audio.",
+    "embed_vision.",
+    "language_model.model.visual.",
+    "mm_projector.",
+    "model.audio_model.",
+    "model.audio_tower.",
+    "model.embed_audio.",
+    "model.embed_vision.",
+    "model.mm_projector.",
+    "model.multi_modal_projector.",
+    "model.vision_model.",
+    "model.vision_tower.",
+    "model.visual.",
+    "multi_modal_projector.",
+    "vision_model.",
+    "vision_tower.",
+    "visual.",
+)
 
 
 def _parse_size(x):
@@ -315,6 +334,24 @@ def load_config(model_path: Path) -> dict:
             config["eos_token_id"] = eos_token_id
 
     return config
+
+
+def strip_unsupported_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    """Drop checkpoint tensors for modules this repo does not load."""
+
+    filtered = {}
+    removed = 0
+
+    for key, value in weights.items():
+        if key.startswith(UNSUPPORTED_WEIGHT_PREFIXES):
+            removed += 1
+            continue
+        filtered[key] = value
+
+    if removed:
+        logging.info("Stripped %d unsupported checkpoint weight key(s)", removed)
+
+    return filtered
 
 
 def canonicalize_weight_keys(
@@ -629,6 +666,7 @@ def load_model(
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
+    weights = strip_unsupported_weights(weights)
     weights = canonicalize_weight_keys(weights, expected_keys)
     weights = adapt_weight_structure(weights, expected_keys)
 
