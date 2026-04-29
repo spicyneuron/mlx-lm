@@ -55,6 +55,9 @@ class DummyModelProvider:
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
                 "allowed_origins": ["*"],
+                "kv_bits": None,
+                "kv_group_size": 64,
+                "quantized_kv_start": 5000,
             },
         )
 
@@ -155,6 +158,29 @@ class TestProcessControlTokens(unittest.TestCase):
             [t.state for t in out],
             ["tool", "tool", "tool", "normal", "normal"],
         )
+
+
+class TestResponseGenerator(unittest.TestCase):
+    def test_is_batchable_requires_seedless_request(self):
+        provider = types.SimpleNamespace(
+            is_batchable=True,
+            cli_args=types.SimpleNamespace(kv_bits=None),
+        )
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = provider
+
+        self.assertTrue(generator._is_batchable(types.SimpleNamespace(seed=None)))
+        self.assertFalse(generator._is_batchable(types.SimpleNamespace(seed=7)))
+
+    def test_is_batchable_disables_batching_for_quantized_kv_cache(self):
+        provider = types.SimpleNamespace(
+            is_batchable=True,
+            cli_args=types.SimpleNamespace(kv_bits=4),
+        )
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = provider
+
+        self.assertFalse(generator._is_batchable(types.SimpleNamespace(seed=None)))
 
 
 class TestServer(unittest.TestCase):

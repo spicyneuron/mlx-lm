@@ -35,6 +35,7 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import (
     BatchGenerator,
+    DEFAULT_QUANTIZED_KV_START,
     SequenceStateMachine,
     stream_generate,
 )
@@ -683,7 +684,11 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and self.cli_args.kv_bits is None
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -985,6 +990,9 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1878,6 +1886,27 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        help="Number of bits for KV cache quantization. Defaults to no quantization.",
+        default=None,
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        help="Group size for KV cache quantization.",
+        default=64,
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        help=(
+            "When --kv-bits is set, start quantizing the KV cache from this "
+            "step onwards."
+        ),
+        type=int,
+        default=DEFAULT_QUANTIZED_KV_START,
     )
     parser.add_argument(
         "--pipeline",
