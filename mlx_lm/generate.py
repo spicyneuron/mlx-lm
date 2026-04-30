@@ -9,7 +9,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from functools import partial
 from typing import (
     Any,
     Callable,
@@ -30,9 +29,11 @@ from .models import cache
 from .models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchMLACache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
+    MLACache,
     QuantizedKVCache,
     RotatingKVCache,
     TokenBuffer,
@@ -844,6 +845,8 @@ def _make_cache(model, left_padding, max_kv_size):
     def to_batch_cache(c):
         if type(c) is KVCache:
             return BatchKVCache(left_padding)
+        elif type(c) is MLACache:
+            return BatchMLACache(c.kv_lora_rank, left_padding)
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c

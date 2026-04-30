@@ -322,6 +322,196 @@ class QuantizedKVCache(_BaseCache):
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
+class QuantizedMLACache(_BaseCache):
+    step = 256
+
+    def __init__(self, kv_lora_rank: int, group_size: int = 64, bits: int = 8):
+        self.keys = None
+        self.offset = 0
+        self.kv_lora_rank = kv_lora_rank
+        self.group_size = group_size
+        self.bits = bits
+
+    def _latent_view(self, keys):
+        el_per_int = 8 * mx.uint32.size // self.bits
+        return (
+            keys[0][..., : self.kv_lora_rank // el_per_int],
+            keys[1][..., : self.kv_lora_rank // self.group_size],
+            keys[2][..., : self.kv_lora_rank // self.group_size],
+        )
+
+    def update_and_fetch(self, kv_latent, k_pe):
+        keys = mx.concatenate([kv_latent, k_pe], axis=-1)
+        B, n_kv_heads, num_steps, head_dim = keys.shape
+        prev = self.offset
+
+        if head_dim % self.group_size != 0:
+            raise ValueError(
+                "MLA cache head dimension must be divisible by kv group size."
+            )
+        if self.kv_lora_rank % self.group_size != 0:
+            raise ValueError("MLA latent dimension must be divisible by kv group size.")
+
+        if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
+            el_per_int = 8 * mx.uint32.size // self.bits
+            new_steps = (self.step + num_steps - 1) // self.step * self.step
+            shape = (B, n_kv_heads, new_steps)
+
+            def init_quant():
+                return (
+                    mx.zeros((*shape, head_dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*shape, head_dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*shape, head_dim // self.group_size), dtype=keys.dtype),
+                )
+
+            def expand_quant(x):
+                new_x = mx.zeros((*shape, x.shape[-1]), dtype=x.dtype)
+                return mx.concatenate([x, new_x], axis=-2)
+
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = tuple(x[..., :prev, :] for x in self.keys)
+                self.keys = tuple(expand_quant(x) for x in self.keys)
+            else:
+                self.keys = init_quant()
+
+        self.offset += num_steps
+
+        keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        for i in range(len(self.keys)):
+            self.keys[i][..., prev : self.offset, :] = keys[i]
+
+        keys = tuple(x[..., : self.offset, :] for x in self.keys)
+        return keys, self._latent_view(keys)
+
+    @property
+    def state(self):
+        if self.keys is None or self.offset == self.keys[0].shape[2]:
+            return self.keys
+        return tuple(x[..., : self.offset, :] for x in self.keys)
+
+    @state.setter
+    def state(self, v):
+        self.keys = v
+        self.offset = 0 if self.keys is None else self.keys[0].shape[2]
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(str, (self.offset, self.kv_lora_rank, self.group_size, self.bits))
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset, self.kv_lora_rank, self.group_size, self.bits = map(int, v)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return tree_reduce(lambda a, x: a + x.nbytes, self.keys, 0)
+
+
+class MLACache(_BaseCache):
+    step = 256
+
+    def __init__(self, kv_lora_rank: int):
+        self.keys = None
+        self.offset = 0
+        self.kv_lora_rank = kv_lora_rank
+
+    def update_and_fetch(self, kv_latent, k_pe):
+        keys = mx.concatenate([kv_latent, k_pe], axis=-1)
+        prev = self.offset
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            B, n_kv_heads, _, head_dim = keys.shape
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+            else:
+                self.keys = new_k
+
+        self.offset += keys.shape[2]
+        self.keys[..., prev : self.offset, :] = keys
+        keys = self.keys[..., : self.offset, :]
+        return keys, keys[..., : self.kv_lora_rank]
+
+    def size(self):
+        return self.offset
+
+    @property
+    def state(self):
+        if self.keys is None or self.offset == self.keys.shape[2]:
+            return self.keys
+        return self.keys[..., : self.offset, :]
+
+    @state.setter
+    def state(self, v):
+        self.keys = v
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.offset, self.kv_lora_rank)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset, self.kv_lora_rank = map(int, v)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedMLACache:
+        quant_cache = QuantizedMLACache(
+            self.kv_lora_rank, group_size=group_size, bits=bits
+        )
+        quant_cache.offset = self.offset
+        if self.keys is not None:
+            quant_cache.keys = mx.quantize(
+                self.keys, group_size=group_size, bits=bits
+            )
+        return quant_cache
+
+    @classmethod
+    def merge(_, caches):
+        return BatchMLACache.merge(caches)
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes
+
+
 class KVCache(_BaseCache):
     step = 256
 
@@ -1128,6 +1318,188 @@ class BatchKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class BatchMLACache(_BaseCache):
+    step = 256
+
+    def __init__(self, kv_lora_rank: int, left_padding: List[int]):
+        self.keys = None
+        self.kv_lora_rank = kv_lora_rank
+        self.left_padding = mx.array(left_padding)
+        self.offset = mx.array([-pad for pad in left_padding])
+        self._idx = 0
+        self._right_padding = None
+
+    def update_and_fetch(self, kv_latent, k_pe):
+        keys = mx.concatenate([kv_latent, k_pe], axis=-1)
+        prev = self._idx
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            B, n_kv_heads, _, head_dim = keys.shape
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+            else:
+                self.keys = new_k
+
+        self.offset += keys.shape[2]
+        self._idx += keys.shape[2]
+        self.keys[..., prev : self._idx, :] = keys
+        keys = self.keys[..., : self._idx, :]
+        return keys, keys[..., : self.kv_lora_rank]
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchMLACache"
+                )
+            left_padding = mx.array(left_padding)
+            self.left_padding += left_padding
+            self.offset -= left_padding
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            padding = self._right_padding
+            self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
+            self.offset -= padding
+            self.left_padding += padding
+            self._right_padding = None
+
+    @property
+    def state(self):
+        keys = self.keys
+        if self._idx < keys.shape[2]:
+            keys = keys[..., : self._idx, :]
+        return keys, self.offset, self.left_padding
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.offset, self.left_padding = v
+        self._idx = self.keys.shape[2]
+
+    @property
+    def meta_state(self):
+        return str(self.kv_lora_rank)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.kv_lora_rank = int(v)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
+
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(
+            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+        )
+
+    def filter(self, batch_indices):
+        if self.keys is not None:
+            self.keys = self.keys[batch_indices]
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+
+        min_left_pad = self.left_padding.min().item()
+        if min_left_pad > 0:
+            if self.keys is not None:
+                self.keys = self.keys[..., min_left_pad:, :]
+            self._idx -= min_left_pad
+            self.left_padding -= min_left_pad
+
+    def extend(self, other):
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
+        max_idx = max(self._idx, other._idx)
+        L1 = L2 = 0
+        if self.keys is not None:
+            B, H, L1, D = self.keys.shape
+        if other.keys is not None:
+            B, H, L2, D = other.keys.shape
+        max_size = max(L1, L2)
+
+        def pad(c):
+            k = c.keys
+            if k is None:
+                Bc = c.offset.shape[0]
+                k = mx.array([]).reshape(Bc, H, 0, D)
+            left = max_idx - c._idx
+            right = max_size - k.shape[2] - left
+            if right < 0:
+                k = k[..., :right, :]
+                right = 0
+            if left != 0 or right != 0:
+                k = mx.pad(k, [(0, 0), (0, 0), (left, right), (0, 0)])
+            left_padding = c.left_padding + left
+            return k, c.offset, left_padding
+
+        self.keys, self.offset, self.left_padding = map(
+            mx.concatenate, zip(*(pad(self), pad(other)))
+        )
+        self._idx = max_idx
+
+    def extract(self, idx):
+        cache = MLACache(self.kv_lora_rank)
+        padding = self.left_padding[idx].item()
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
+        cache.offset = cache.keys.shape[2]
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        lengths = [c.size() for c in caches]
+        max_length = max(lengths)
+        kv_lora_rank = caches[0].kv_lora_rank
+
+        if max_length == 0:
+            return cls(kv_lora_rank, [0] * len(caches))
+
+        padding = [max_length - length for length in lengths]
+        B = len(caches)
+        H = max(c.keys.shape[1] for c in caches if c.keys is not None)
+        D = max(c.keys.shape[3] for c in caches if c.keys is not None)
+        dt = next(iter(c.keys.dtype for c in caches if c.keys is not None))
+
+        keys = mx.zeros((B, H, max_length, D), dtype=dt)
+        for i, (pad, c) in enumerate(zip(padding, caches)):
+            if c.keys is None:
+                continue
+            keys[i : i + 1, :, pad : pad + c.offset] = c.keys[..., : c.offset, :]
+
+        cache = cls(kv_lora_rank, padding)
+        cache.keys = keys
+        cache.offset += keys.shape[2]
+        cache._idx = keys.shape[2]
+
+        return cache
+
+    def size(self):
+        return self._idx
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes
 
 
 class BatchRotatingKVCache(_BaseCache):

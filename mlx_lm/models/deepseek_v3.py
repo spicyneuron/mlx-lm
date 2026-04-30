@@ -2,7 +2,6 @@
 
 import math
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
@@ -11,6 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import MLACache
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
@@ -140,30 +140,20 @@ class DeepseekV3Attention(nn.Module):
         k_pe = self.rope(k_pe, offset)
 
         kv_latent = mx.expand_dims(kv_latent, axis=1)
+        q_nope = self.embed_q(q_nope)
 
         if cache is not None:
-            kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
-
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
-        if mask is not None:
-            pe_scores = mx.where(
-                mask,
-                pe_scores,
-                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
-            )
-
-        if L == 1:
-            q_nope = self.embed_q(q_nope)
-            k = v = kv_latent
+            k, v = cache.update_and_fetch(kv_latent, k_pe)
         else:
-            k = self.embed_q(kv_latent, transpose=False)
-            v = self.unembed_out(kv_latent)
+            k = mx.concatenate([kv_latent, k_pe], axis=-1)
+            v = kv_latent
+
+        q = mx.concatenate([q_nope, q_pe], axis=-1)
 
         output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            q, k, v, cache=cache, scale=self.scale, mask=mask
         )
-        if L == 1:
-            output = self.unembed_out(output)
+        output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -376,6 +366,9 @@ class Model(nn.Module):
     ):
         out = self.model(inputs, cache)
         return self.lm_head(out)
+
+    def make_cache(self):
+        return [MLACache(self.args.kv_lora_rank) for _ in self.layers]
 
     def sanitize(self, weights):
         def dequant(weight, scale_inv):
