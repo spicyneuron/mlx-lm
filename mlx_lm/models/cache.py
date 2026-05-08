@@ -1471,6 +1471,7 @@ class DeepseekV4PoolingCache(PoolingCache):
 
     @property
     def meta_state(self):
+        # Safetensors metadata is string-typed.
         return str(self.ratio)
 
     @meta_state.setter
@@ -1483,8 +1484,9 @@ class DeepseekV4PoolingCache(PoolingCache):
 
     @state.setter
     def state(self, v):
-        PoolingCache.state.fset(self, v[:3])
-        self.overlap_kv, self.overlap_gate = v[3], v[4]
+        *base, overlap_kv, overlap_gate = v
+        PoolingCache.state.fset(self, tuple(base))
+        self.overlap_kv, self.overlap_gate = overlap_kv, overlap_gate
 
     def empty(self):
         return (
@@ -1502,12 +1504,11 @@ class DeepseekV4PoolingCache(PoolingCache):
 
     @classmethod
     def merge(cls, caches):
-        if any(c.overlap_kv is not None for c in caches):
-            raise NotImplementedError(
-                "Batched DeepSeek V4 with chunked prefill is unsupported "
-                "(would lose CSA overlap state)."
-            )
-        return BatchPoolingCache.merge(caches)
+        # Base BatchPoolingCache lacks update_overlap_state, so any V4 use
+        # of a merged batch cache would crash on the first CSA compression.
+        raise NotImplementedError(
+            "Batched DeepSeek V4 with chunked prefill is unsupported."
+        )
 
     @classmethod
     def from_state(cls, state, meta_state):

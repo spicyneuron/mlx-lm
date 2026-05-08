@@ -290,6 +290,10 @@ def _simple_compress_kv(kv, gate, ape, head_dim):
     return (kv * weights).sum(axis=-2)
 
 
+# Not shapeless: mx.split and the prior-Ca concats use shape-derived stops,
+# which the shapeless tracer can't infer. Per-shape recompiles are bounded —
+# n_windows takes a small set of values and steady-state generation hits no
+# new shapes.
 @mx.compile
 def _overlap_compress_kv(kv, gate, ape, head_dim, prior_kv, prior_gate):
     D = kv.shape[-1]

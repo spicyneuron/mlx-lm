@@ -1511,8 +1511,11 @@ class TestModels(unittest.TestCase):
         kv = mx.arange(1 * 12 * head_dim * 2, dtype=mx.float32).reshape(
             1, 12, head_dim * 2
         )
-        gate = mx.zeros_like(kv)
-        ape = mx.zeros((ratio, head_dim * 2), dtype=mx.float32)
+        # Non-trivial gate values so the softmax actually depends on the
+        # prior_gate carry, not just on a uniform distribution.
+        mx.random.seed(0)
+        gate = mx.random.normal(kv.shape) * 0.5
+        ape = mx.random.normal((ratio, head_dim * 2)) * 0.5
 
         def csa_compress(kv_chunks, gate_chunks, roundtrip_after=None):
             cache = DeepseekV4PoolingCache(ratio)
@@ -1556,6 +1559,14 @@ class TestModels(unittest.TestCase):
                 roundtrip_after=roundtrip_after,
             )
             self.assertTrue(mx.allclose(chunked, full, rtol=1e-6, atol=1e-6))
+
+        # Batched merge of V4 caches drops the overlap state, so it must fail
+        # eagerly rather than return a base BatchPoolingCache that crashes
+        # later in the compressor.
+        with self.assertRaises(NotImplementedError):
+            DeepseekV4PoolingCache.merge(
+                [DeepseekV4PoolingCache(ratio), DeepseekV4PoolingCache(ratio)]
+            )
 
         # Model test
         args = deepseek_v4.ModelArgs(
