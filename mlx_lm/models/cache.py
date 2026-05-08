@@ -1183,6 +1183,16 @@ class BatchPoolingCache(_BaseCache):
         r_base = mx.array(r_base)
         return r_kv, r_gate, r_base
 
+    def _new_counts(self):
+        """Number of pooled entries each batch element has emitted but not yet
+        appended to ``self.pooled``. Read by ``update_and_fetch`` (and by
+        :class:`BatchDeepseekV4PoolingCache.update_overlap_state`)."""
+        return [
+            (self._processed[i] - self.remainder[i]) // self.ratio
+            - self._pool_lengths[i]
+            for i in range(len(self.remainder))
+        ]
+
     def update_and_fetch(self, px: mx.array):
         B, N, D = px.shape
 
@@ -1191,12 +1201,7 @@ class BatchPoolingCache(_BaseCache):
                 return mx.zeros((B, 0, D), dtype=px.dtype)
             return self.pooled
 
-        # Derive how many new pooled tokens each sequence actually produced.
-        new_counts = [
-            (self._processed[i] - self.remainder[i]) // self.ratio
-            - self._pool_lengths[i]
-            for i in range(B)
-        ]
+        new_counts = self._new_counts()
         max_new = max(new_counts)
         if max_new == 0:
             if self.pooled is None:
@@ -1509,7 +1514,9 @@ class DeepseekV4PoolingCache(PoolingCache):
     @classmethod
     def from_state(cls, state, meta_state):
         obj = cls.__new__(cls)
-        # Ratio must be restored before state, since state may rebuild the buffer.
+        # Inherited PoolingCache state setter calls accumulate_windows when
+        # rehydrating a non-empty remainder buffer, which reads self.ratio.
+        # meta_state (which carries ratio) must be applied first.
         obj.meta_state = meta_state
         obj.state = state
         return obj
@@ -1542,15 +1549,11 @@ class BatchDeepseekV4PoolingCache(BatchPoolingCache):
             prior_gate = mx.full((B, R, half), -mx.inf, dtype=chunk_gate.dtype)
 
         # Only batch elements that emitted a window in this call advance their
-        # overlap slice; others retain their prior.
-        new_counts = [
-            (self._processed[i] - self.remainder[i]) // self.ratio
-            - self._pool_lengths[i]
-            for i in range(B)
-        ]
-        overlap_kv = mx.zeros_like(prior_kv) + prior_kv
-        overlap_gate = mx.zeros_like(prior_gate) + prior_gate
-        for i, count in enumerate(new_counts):
+        # overlap slice; others retain their prior. Element-wise indexed
+        # assignment mutates the storage, so start from a fresh copy.
+        overlap_kv = mx.array(prior_kv)
+        overlap_gate = mx.array(prior_gate)
+        for i, count in enumerate(self._new_counts()):
             if count > 0:
                 overlap_kv[i] = chunk_kv[i, count - 1, :, :half]
                 overlap_gate[i] = chunk_gate[i, count - 1, :, :half]
@@ -1608,7 +1611,10 @@ class BatchDeepseekV4PoolingCache(BatchPoolingCache):
     def extract(self, idx):
         base = super().extract(idx)
         cache = DeepseekV4PoolingCache(self.ratio)
-        cache.state = base.state + (None, None)
+        cache.pooled = base.pooled
+        cache.buf_kv = base.buf_kv
+        cache.buf_gate = base.buf_gate
+        cache.remainder = base.remainder
         if self.overlap_kv is not None:
             cache.overlap_kv = mx.contiguous(self.overlap_kv[idx : idx + 1])
             cache.overlap_gate = mx.contiguous(self.overlap_gate[idx : idx + 1])
