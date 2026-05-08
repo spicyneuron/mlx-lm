@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import tempfile
 import unittest
 
 import mlx.core as mx
@@ -9,7 +10,15 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, PoolingCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    CacheList,
+    DeepseekV4PoolingCache,
+    KVCache,
+    RotatingKVCache,
+    load_prompt_cache,
+    make_prompt_cache,
+    save_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -1505,11 +1514,11 @@ class TestModels(unittest.TestCase):
         gate = mx.zeros_like(kv)
         ape = mx.zeros((ratio, head_dim * 2), dtype=mx.float32)
 
-        def csa_compress(kv_chunks, gate_chunks):
-            cache = PoolingCache(ratio)
+        def csa_compress(kv_chunks, gate_chunks, roundtrip_after=None):
+            cache = DeepseekV4PoolingCache(ratio)
             chunks = []
             offset = 0
-            for kv_chunk, gate_chunk in zip(kv_chunks, gate_chunks):
+            for i, (kv_chunk, gate_chunk) in enumerate(zip(kv_chunks, gate_chunks)):
                 ready_kv, ready_gate, _ = cache.accumulate_windows(
                     kv_chunk, gate_chunk, offset
                 )
@@ -1531,14 +1540,22 @@ class TestModels(unittest.TestCase):
                 )
                 cache.update_and_fetch(chunk)
                 chunks.append(chunk)
+                if i == roundtrip_after:
+                    with tempfile.TemporaryDirectory() as d:
+                        path = f"{d}/cache.safetensors"
+                        save_prompt_cache(path, [CacheList(cache)])
+                        cache = load_prompt_cache(path)[0][0]
+                        self.assertIsInstance(cache, DeepseekV4PoolingCache)
             return mx.concatenate(chunks, axis=1)
 
         full = csa_compress([kv], [gate])
-        chunked = csa_compress(
-            [kv[:, :5], kv[:, 5:8], kv[:, 8:]],
-            [gate[:, :5], gate[:, 5:8], gate[:, 8:]],
-        )
-        self.assertTrue(mx.allclose(chunked, full, rtol=1e-6, atol=1e-6))
+        for roundtrip_after in (0, 1):
+            chunked = csa_compress(
+                [kv[:, :5], kv[:, 5:9], kv[:, 9:]],
+                [gate[:, :5], gate[:, 5:9], gate[:, 9:]],
+                roundtrip_after=roundtrip_after,
+            )
+            self.assertTrue(mx.allclose(chunked, full, rtol=1e-6, atol=1e-6))
 
         # Model test
         args = deepseek_v4.ModelArgs(

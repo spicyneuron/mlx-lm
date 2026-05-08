@@ -9,7 +9,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from functools import partial
 from typing import (
     Any,
     Callable,
@@ -849,7 +848,7 @@ def _make_cache(model, left_padding, max_kv_size):
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
-        elif isinstance(c, PoolingCache):
+        elif type(c) is PoolingCache:
             return BatchPoolingCache(c.ratio, left_padding)
         elif isinstance(c, RotatingKVCache):
             if c.keep > 0:

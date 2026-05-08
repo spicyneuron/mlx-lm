@@ -11,7 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, PoolingCache, RotatingKVCache
+from .cache import CacheList, DeepseekV4PoolingCache, PoolingCache, RotatingKVCache
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
@@ -1046,8 +1046,8 @@ class Model(nn.Module):
                 caches.append(
                     CacheList(
                         RotatingKVCache(max_size=self.args.sliding_window),
-                        PoolingCache(ratio),
-                        PoolingCache(ratio),
+                        DeepseekV4PoolingCache(ratio),
+                        DeepseekV4PoolingCache(ratio),
                     )
                 )
             else:
