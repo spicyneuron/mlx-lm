@@ -9,7 +9,7 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import KVCache, PoolingCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -1495,6 +1495,50 @@ class TestModels(unittest.TestCase):
         expected = expected.astype(block_out.dtype)
         actual = hc_expand(block_out, residual, post, comb)
         self.assertTrue(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5))
+
+        # CSA compression needs the prior Ca slice across cached chunks.
+        ratio = 4
+        head_dim = 8
+        kv = mx.arange(1 * 12 * head_dim * 2, dtype=mx.float32).reshape(
+            1, 12, head_dim * 2
+        )
+        gate = mx.zeros_like(kv)
+        ape = mx.zeros((ratio, head_dim * 2), dtype=mx.float32)
+
+        def csa_compress(kv_chunks, gate_chunks):
+            cache = PoolingCache(ratio)
+            chunks = []
+            offset = 0
+            for kv_chunk, gate_chunk in zip(kv_chunks, gate_chunks):
+                ready_kv, ready_gate, _ = cache.accumulate_windows(
+                    kv_chunk, gate_chunk, offset
+                )
+                offset += kv_chunk.shape[1]
+                if ready_kv.shape[1] == 0:
+                    continue
+                ready_kv = mx.unflatten(ready_kv, 1, (-1, ratio))
+                ready_gate = mx.unflatten(ready_gate, 1, (-1, ratio))
+                prior_kv, prior_gate = cache.update_overlap_state(
+                    ready_kv, ready_gate
+                )
+                chunk = deepseek_v4._overlap_compress_kv(
+                    ready_kv,
+                    ready_gate,
+                    ape,
+                    head_dim,
+                    prior_kv,
+                    prior_gate,
+                )
+                cache.update_and_fetch(chunk)
+                chunks.append(chunk)
+            return mx.concatenate(chunks, axis=1)
+
+        full = csa_compress([kv], [gate])
+        chunked = csa_compress(
+            [kv[:, :5], kv[:, 5:8], kv[:, 8:]],
+            [gate[:, :5], gate[:, 5:8], gate[:, 8:]],
+        )
+        self.assertTrue(mx.allclose(chunked, full, rtol=1e-6, atol=1e-6))
 
         # Model test
         args = deepseek_v4.ModelArgs(
