@@ -291,19 +291,19 @@ def _simple_compress_kv(kv, gate, ape, head_dim):
 
 
 @mx.compile
-def _overlap_compress_kv(kv, gate, ape, head_dim):
-    B, L, R, D = kv.shape
+def _overlap_compress_kv(kv, gate, ape, head_dim, prior_kv, prior_gate):
+    D = kv.shape[-1]
 
+    # Overlap gates are stored raw; add ape for both the new chunk and prior Ca.
     gate = gate + ape.astype(gate.dtype)
+    prior_gate = prior_gate + ape[:, : D // 2].astype(prior_gate.dtype)
 
-    kv_0 = mx.zeros((B, 1, R, D // 2), dtype=kv.dtype)
     kv_a, kv_b = mx.split(kv, 2, axis=-1)
-    kv_a = mx.concatenate([kv_0, kv_a[:, :-1]], axis=1)
+    kv_a = mx.concatenate([prior_kv[:, None], kv_a[:, :-1]], axis=1)
     kv = mx.concatenate([kv_a, kv_b], axis=2)
 
-    gate_0 = mx.full((B, 1, R, D // 2), -mx.inf, dtype=kv.dtype)
     gate_a, gate_b = mx.split(gate, 2, axis=-1)
-    gate_a = mx.concatenate([gate_0, gate_a[:, :-1]], axis=1)
+    gate_a = mx.concatenate([prior_gate[:, None], gate_a[:, :-1]], axis=1)
     gate = mx.concatenate([gate_a, gate_b], axis=2)
 
     weights = mx.softmax(gate, axis=-2, precise=True)
@@ -508,7 +508,28 @@ class Compressor(nn.Module):
             )
             kv = mx.unflatten(ready_kv, 1, (-1, self.compress_ratio))
             gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
-            new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+            if self.overlap:
+                if pool_cache is None:
+                    prior_kv = mx.zeros(
+                        (B, self.compress_ratio, self.head_dim), dtype=kv.dtype
+                    )
+                    prior_gate = mx.full(
+                        (B, self.compress_ratio, self.head_dim),
+                        -mx.inf,
+                        dtype=gate.dtype,
+                    )
+                else:
+                    prior_kv, prior_gate = pool_cache.update_overlap_state(kv, gate)
+                new_pooled = compress_func(
+                    kv,
+                    gate,
+                    self.ape,
+                    self.head_dim,
+                    prior_kv,
+                    prior_gate,
+                )
+            else:
+                new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
             new_pooled = self.norm(new_pooled)
             new_pooled = self.rope(
                 new_pooled[:, None],
