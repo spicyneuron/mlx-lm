@@ -1504,11 +1504,7 @@ class DeepseekV4PoolingCache(PoolingCache):
 
     @classmethod
     def merge(cls, caches):
-        # Base BatchPoolingCache lacks update_overlap_state, so any V4 use
-        # of a merged batch cache would crash on the first CSA compression.
-        raise NotImplementedError(
-            "Batched DeepSeek V4 with chunked prefill is unsupported."
-        )
+        return BatchDeepseekV4PoolingCache.merge(caches)
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -1517,6 +1513,127 @@ class DeepseekV4PoolingCache(PoolingCache):
         obj.meta_state = meta_state
         obj.state = state
         return obj
+
+
+def _zero_overlap(template_kv, template_gate, n):
+    """Empty overlap state shaped like ``template`` for ``n`` batch elements."""
+    R, D = template_kv.shape[1:]
+    return (
+        mx.zeros((n, R, D), dtype=template_kv.dtype),
+        mx.full((n, R, D), -mx.inf, dtype=template_gate.dtype),
+    )
+
+
+class BatchDeepseekV4PoolingCache(BatchPoolingCache):
+    """Batched counterpart to ``DeepseekV4PoolingCache``."""
+
+    def __init__(self, ratio: int, left_padding: List[int]):
+        super().__init__(ratio, left_padding)
+        self.overlap_kv = None
+        self.overlap_gate = None
+
+    def update_overlap_state(self, chunk_kv: mx.array, chunk_gate: mx.array):
+        B, _, R, D = chunk_kv.shape
+        half = D // 2
+
+        prior_kv, prior_gate = self.overlap_kv, self.overlap_gate
+        if prior_kv is None:
+            prior_kv = mx.zeros((B, R, half), dtype=chunk_kv.dtype)
+            prior_gate = mx.full((B, R, half), -mx.inf, dtype=chunk_gate.dtype)
+
+        # Only batch elements that emitted a window in this call advance their
+        # overlap slice; others retain their prior.
+        new_counts = [
+            (self._processed[i] - self.remainder[i]) // self.ratio
+            - self._pool_lengths[i]
+            for i in range(B)
+        ]
+        overlap_kv = mx.zeros_like(prior_kv) + prior_kv
+        overlap_gate = mx.zeros_like(prior_gate) + prior_gate
+        for i, count in enumerate(new_counts):
+            if count > 0:
+                overlap_kv[i] = chunk_kv[i, count - 1, :, :half]
+                overlap_gate[i] = chunk_gate[i, count - 1, :, :half]
+
+        self.overlap_kv = overlap_kv
+        self.overlap_gate = overlap_gate
+        return prior_kv, prior_gate
+
+    @property
+    def state(self):
+        return super().state + (self.overlap_kv, self.overlap_gate)
+
+    @state.setter
+    def state(self, v):
+        *base, overlap_kv, overlap_gate = v
+        BatchPoolingCache.state.fset(self, tuple(base))
+        self.overlap_kv, self.overlap_gate = overlap_kv, overlap_gate
+
+    def empty(self):
+        return (
+            super().empty()
+            and self.overlap_kv is None
+            and self.overlap_gate is None
+        )
+
+    @property
+    def nbytes(self):
+        total = super().nbytes
+        if self.overlap_kv is not None:
+            total += self.overlap_kv.nbytes + self.overlap_gate.nbytes
+        return total
+
+    def filter(self, batch_indices):
+        super().filter(batch_indices)
+        if self.overlap_kv is not None:
+            self.overlap_kv = self.overlap_kv[batch_indices]
+            self.overlap_gate = self.overlap_gate[batch_indices]
+
+    def extend(self, other):
+        self_batch = len(self.remainder)
+        other_batch = len(other.remainder)
+        self_kv, self_gate = self.overlap_kv, self.overlap_gate
+        other_kv, other_gate = other.overlap_kv, other.overlap_gate
+        super().extend(other)
+
+        if self_kv is None and other_kv is None:
+            return
+        if self_kv is None:
+            self_kv, self_gate = _zero_overlap(other_kv, other_gate, self_batch)
+        if other_kv is None:
+            other_kv, other_gate = _zero_overlap(self_kv, self_gate, other_batch)
+        self.overlap_kv = mx.concatenate([self_kv, other_kv], axis=0)
+        self.overlap_gate = mx.concatenate([self_gate, other_gate], axis=0)
+
+    def extract(self, idx):
+        base = super().extract(idx)
+        cache = DeepseekV4PoolingCache(self.ratio)
+        cache.state = base.state + (None, None)
+        if self.overlap_kv is not None:
+            cache.overlap_kv = mx.contiguous(self.overlap_kv[idx : idx + 1])
+            cache.overlap_gate = mx.contiguous(self.overlap_gate[idx : idx + 1])
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        batch_cache = super().merge(caches)
+        template = next((c for c in caches if c.overlap_kv is not None), None)
+        if template is None:
+            return batch_cache
+
+        B = len(caches)
+        R, D = template.overlap_kv.shape[1:]
+        overlap_kv = mx.zeros((B, R, D), dtype=template.overlap_kv.dtype)
+        overlap_gate = mx.full(
+            (B, R, D), -mx.inf, dtype=template.overlap_gate.dtype
+        )
+        for i, c in enumerate(caches):
+            if c.overlap_kv is not None:
+                overlap_kv[i] = c.overlap_kv[0]
+                overlap_gate[i] = c.overlap_gate[0]
+        batch_cache.overlap_kv = overlap_kv
+        batch_cache.overlap_gate = overlap_gate
+        return batch_cache
 
 
 def dynamic_roll(x, shifts, axis):

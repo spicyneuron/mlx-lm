@@ -11,6 +11,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
+    BatchDeepseekV4PoolingCache,
     CacheList,
     DeepseekV4PoolingCache,
     KVCache,
@@ -1560,13 +1561,18 @@ class TestModels(unittest.TestCase):
             )
             self.assertTrue(mx.allclose(chunked, full, rtol=1e-6, atol=1e-6))
 
-        # Batched merge of V4 caches drops the overlap state, so it must fail
-        # eagerly rather than return a base BatchPoolingCache that crashes
-        # later in the compressor.
-        with self.assertRaises(NotImplementedError):
-            DeepseekV4PoolingCache.merge(
-                [DeepseekV4PoolingCache(ratio), DeepseekV4PoolingCache(ratio)]
-            )
+        # Batched merge of V4 caches must produce a BatchDeepseekV4PoolingCache
+        # that carries each per-stream overlap slice across the batch axis.
+        single_a = DeepseekV4PoolingCache(ratio)
+        single_b = DeepseekV4PoolingCache(ratio)
+        single_a.overlap_kv = mx.ones((1, ratio, head_dim), dtype=mx.float32)
+        single_a.overlap_gate = mx.zeros((1, ratio, head_dim), dtype=mx.float32)
+        merged = DeepseekV4PoolingCache.merge([single_a, single_b])
+        self.assertIsInstance(merged, BatchDeepseekV4PoolingCache)
+        self.assertEqual(merged.overlap_kv.shape, (2, ratio, head_dim))
+        self.assertTrue(mx.allclose(merged.overlap_kv[0], single_a.overlap_kv[0]))
+        # Streams that never advanced their overlap slice get zero-padded entries.
+        self.assertTrue((merged.overlap_kv[1] == 0).all().item())
 
         # Model test
         args = deepseek_v4.ModelArgs(
