@@ -633,10 +633,19 @@ class LocalAttention(nn.Module):
         )
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
 
+        # Local (sliding-window) layers do NOT take YaRN scaling on this
+        # checkpoint. Empirically, passing config.rope_scaling here biases
+        # sampled long-decode toward repetition attractors (gen >= ~2500
+        # tokens at temp=1 collapses into stable loops). HF/vLLM
+        # technically reuse the main rope_type for local layers, but for
+        # the V4-Flash YaRN spec (factor=16 over original_max=65536) the
+        # net effect of YaRN on sliding_window=128 is a wash-out of the
+        # lowest-frequency channels' position information. Keep local at
+        # the unscaled base.
         self.rope = DeepseekV4RoPE(
             config.qk_rope_head_dim,
             config.rope_theta,
-            config.rope_scaling,
+            None,
             config.max_position_embeddings,
         )
 
