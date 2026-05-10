@@ -1476,6 +1476,15 @@ class TestModels(unittest.TestCase):
         expected = expected.reshape(*expected.shape[:-2], 4)
         self.assertTrue(mx.allclose(y_scaled, expected, rtol=1e-5, atol=1e-5))
 
+        rope_args = deepseek_v4.ModelArgs(
+            rope_parameters={
+                "type": "yarn",
+                "factor": 4,
+                "original_max_position_embeddings": 1024,
+            }
+        )
+        self.assertEqual(rope_args.rope_scaling["factor"], 4)
+
         # HyperConnection Sinkhorn test
         for hc_mult in (2, 4):
             mix = (2 + hc_mult) * hc_mult
@@ -1573,6 +1582,15 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(merged.overlap_kv[0], single_a.overlap_kv[0]))
         # Streams that never advanced their overlap slice get zero-padded entries.
         self.assertTrue((merged.overlap_kv[1] == 0).all().item())
+
+        batch_pool = BatchDeepseekV4PoolingCache(ratio, [0])
+        batch_pool.pooled = mx.zeros((1, 6, head_dim), dtype=mx.float32)
+        batch_pool._pool_lengths = [6]
+        mask = batch_pool.make_mask(L=3, offset=8)
+        expected = mx.arange(6)[None] < (
+            8 + mx.arange(1, 4)
+        )[:, None] // ratio
+        self.assertTrue(mx.array_equal(mask[0], expected))
 
         # Model test
         args = deepseek_v4.ModelArgs(

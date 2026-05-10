@@ -40,6 +40,7 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     rope_scaling: Optional[Dict] = None
+    rope_parameters: Optional[Dict] = None
     attention_bias: bool = False
     attention_dropout: float = 0.0
     head_dim: int = 512
@@ -62,6 +63,11 @@ class ModelArgs(BaseModelArgs):
     topk_method: str = "noaux_tc"
 
     def __post_init__(self):
+        if self.rope_scaling is None and self.rope_parameters is not None:
+            self.rope_scaling = dict(self.rope_parameters)
+        elif self.rope_scaling is not None and self.rope_parameters is None:
+            self.rope_parameters = dict(self.rope_scaling)
+
         if not self.compress_ratios:
             n = self.num_hidden_layers
             self.compress_ratios = (
@@ -285,7 +291,7 @@ def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int
 
 @partial(mx.compile, shapeless=True)
 def _simple_compress_kv(kv, gate, ape, head_dim):
-    weights = mx.softmax(gate.astype(mx.float32) + ape, axis=-2)
+    weights = mx.softmax(gate.astype(mx.float32) + ape, axis=-2, precise=True)
     weights = weights.astype(kv.dtype)
     return (kv * weights).sum(axis=-2)
 
@@ -387,7 +393,7 @@ class MoEGate(nn.Module):
             )
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
-        logits = x @ self.weight.T
+        logits = x.astype(mx.float32) @ self.weight.T.astype(mx.float32)
 
         if self.hash:
             if input_ids is None:
@@ -630,7 +636,7 @@ class LocalAttention(nn.Module):
         self.rope = DeepseekV4RoPE(
             config.qk_rope_head_dim,
             config.rope_theta,
-            None,
+            config.rope_scaling,
             config.max_position_embeddings,
         )
 
