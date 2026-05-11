@@ -1510,7 +1510,7 @@ class TestModels(unittest.TestCase):
             head_dim=16,
             qk_rope_head_dim=4,
             sliding_window=16,
-            compress_ratios=[0, 0, 4, 0],
+            compress_ratios=[0, 4, 128, 0],
             index_n_heads=4,
             index_head_dim=8,
             index_topk=4,
@@ -1523,6 +1523,27 @@ class TestModels(unittest.TestCase):
             hc_sinkhorn_iters=2,
         )
         model = deepseek_v4.Model(args)
+
+        # Prompt-cache reuse must be equivalent to pre-filling the same tokens
+        # from scratch, including across CSA and HCA compression boundaries.
+        tokens = mx.array(
+            [[i % args.vocab_size for i in range(144)]],
+            dtype=mx.int32,
+        )
+        for split in (8, 17, 128, 132):
+            full_cache = model.make_cache()
+            full = model(tokens, cache=full_cache)
+
+            split_cache = model.make_cache()
+            prefix = model(tokens[:, :split], cache=split_cache)
+            mx.eval(prefix, [c.state for c in split_cache])
+            rest = model(tokens[:, split:], cache=copy.deepcopy(split_cache))
+            mx.eval(full, rest)
+
+            self.assertTrue(
+                mx.allclose(full[:, split:], rest, rtol=1e-4, atol=1e-4),
+                f"DeepSeek V4 cache reuse diverged at split={split}",
+            )
 
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
