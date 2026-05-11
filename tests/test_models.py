@@ -1545,6 +1545,35 @@ class TestModels(unittest.TestCase):
                 f"DeepSeek V4 cache reuse diverged at split={split}",
             )
 
+        from mlx_lm.generate import BatchGenerator
+
+        # Server batching extracts prompt caches both at segmented prompt
+        # boundaries and when generation finishes.
+        batch_gen = BatchGenerator(
+            model,
+            max_tokens=1,
+            completion_batch_size=2,
+            prefill_batch_size=2,
+            prefill_step_size=16,
+        )
+        batch_gen.insert([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+        responses = batch_gen.next_generated()
+        self.assertEqual(len(responses), 2)
+        self.assertTrue(all(r.prompt_cache is not None for r in responses))
+
+        batch_gen = BatchGenerator(
+            model,
+            max_tokens=1,
+            completion_batch_size=1,
+            prefill_batch_size=1,
+            prefill_step_size=16,
+        )
+        uid = batch_gen.insert_segments([[[1, 2, 3, 4], [5, 6, 7, 8]]])[0]
+        prompt_responses, _ = batch_gen.next()
+        self.assertTrue(prompt_responses[0].end_of_segment)
+        self.assertFalse(prompt_responses[0].end_of_prompt)
+        self.assertIn(uid, batch_gen.extract_cache([uid]))
+
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )

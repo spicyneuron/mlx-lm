@@ -1599,11 +1599,10 @@ class BatchDeepseekV4PoolingCache(BatchPoolingCache):
         base = super().extract(idx)
         cache = DeepseekV4PoolingCache(self.ratio)
         cache.pooled = base.pooled
-        cache._buf = base._buf
         cache.buf_kv = base.buf_kv
         cache.buf_gate = base.buf_gate
         cache.remainder = base.remainder
-        if self.overlap_kv is not None:
+        if self.overlap_kv is not None and self._pool_lengths[idx] > 0:
             cache.overlap_kv = mx.contiguous(self.overlap_kv[idx : idx + 1])
             cache.overlap_gate = mx.contiguous(self.overlap_gate[idx : idx + 1])
         return cache
