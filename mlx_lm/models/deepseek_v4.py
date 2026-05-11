@@ -294,7 +294,7 @@ def _simple_compress_kv(kv, gate, ape, head_dim):
 def _overlap_compress_kv(kv, gate, ape, head_dim, prior_kv, prior_gate):
     D = kv.shape[-1]
 
-    # Overlap gates are stored raw; add ape for both the new chunk and prior Ca.
+    # Overlap gates are stored before positional bias; add APE to both paths.
     gate = gate + ape.astype(gate.dtype)
     prior_gate = prior_gate + ape[:, : D // 2].astype(prior_gate.dtype)
 
@@ -503,9 +503,6 @@ class Compressor(nn.Module):
         if ready_kv.size == 0:
             new_pooled = mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
         else:
-            compress_func = (
-                _overlap_compress_kv if self.overlap else _simple_compress_kv
-            )
             kv = mx.unflatten(ready_kv, 1, (-1, self.compress_ratio))
             gate = mx.unflatten(ready_gate, 1, (-1, self.compress_ratio))
             if self.overlap:
@@ -520,7 +517,7 @@ class Compressor(nn.Module):
                     )
                 else:
                     prior_kv, prior_gate = pool_cache.update_overlap_state(kv, gate)
-                new_pooled = compress_func(
+                new_pooled = _overlap_compress_kv(
                     kv,
                     gate,
                     self.ape,
@@ -529,7 +526,7 @@ class Compressor(nn.Module):
                     prior_gate,
                 )
             else:
-                new_pooled = compress_func(kv, gate, self.ape, self.head_dim)
+                new_pooled = _simple_compress_kv(kv, gate, self.ape, self.head_dim)
             new_pooled = self.norm(new_pooled)
             new_pooled = self.rope(
                 new_pooled[:, None],

@@ -1028,11 +1028,18 @@ class PoolingCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return self.ratio
+        return str(self.ratio)
 
     @meta_state.setter
     def meta_state(self, v):
-        self.ratio = v
+        self.ratio = int(v)
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls.__new__(cls)
+        obj.meta_state = meta_state
+        obj.state = state
+        return obj
 
     def is_trimmable(self):
         return self.pooled is None
@@ -1183,7 +1190,8 @@ class BatchPoolingCache(_BaseCache):
         r_base = mx.array(r_base)
         return r_kv, r_gate, r_base
 
-    def _new_counts(self):
+    def _pending_pool_counts(self):
+        """Per-row pooled tokens produced but not copied into ``self.pooled``."""
         return [
             (self._processed[i] - self.remainder[i]) // self.ratio
             - self._pool_lengths[i]
@@ -1198,7 +1206,7 @@ class BatchPoolingCache(_BaseCache):
                 return mx.zeros((B, 0, D), dtype=px.dtype)
             return self.pooled
 
-        new_counts = self._new_counts()
+        new_counts = self._pending_pool_counts()
         max_new = max(new_counts)
         if max_new == 0:
             if self.pooled is None:
@@ -1468,14 +1476,6 @@ class DeepseekV4PoolingCache(PoolingCache):
         return prior_kv, prior_gate
 
     @property
-    def meta_state(self):
-        return str(self.ratio)
-
-    @meta_state.setter
-    def meta_state(self, v):
-        self.ratio = int(v)
-
-    @property
     def state(self):
         return super().state + (self.overlap_kv, self.overlap_gate)
 
@@ -1503,13 +1503,6 @@ class DeepseekV4PoolingCache(PoolingCache):
     @classmethod
     def merge(cls, caches):
         return BatchDeepseekV4PoolingCache.merge(caches)
-
-    @classmethod
-    def from_state(cls, state, meta_state):
-        obj = cls.__new__(cls)
-        obj.meta_state = meta_state
-        obj.state = state
-        return obj
 
 
 def _zero_overlap(template_kv, template_gate, n):
@@ -1539,7 +1532,7 @@ class BatchDeepseekV4PoolingCache(BatchPoolingCache):
 
         overlap_kv = mx.array(prior_kv)
         overlap_gate = mx.array(prior_gate)
-        for i, count in enumerate(self._new_counts()):
+        for i, count in enumerate(self._pending_pool_counts()):
             if count > 0:
                 overlap_kv[i] = chunk_kv[i, count - 1, :, :half]
                 overlap_gate[i] = chunk_gate[i, count - 1, :, :half]
