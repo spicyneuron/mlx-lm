@@ -29,10 +29,12 @@ from transformers import PreTrainedTokenizer
 from .models import cache
 from .models.cache import (
     ArraysCache,
+    BatchDeepseekV4PoolingCache,
     BatchKVCache,
     BatchPoolingCache,
     BatchRotatingKVCache,
     CacheList,
+    DeepseekV4PoolingCache,
     KVCache,
     PoolingCache,
     QuantizedKVCache,
@@ -849,6 +851,8 @@ def _make_cache(model, left_padding, max_kv_size):
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
+        elif isinstance(c, DeepseekV4PoolingCache):
+            return BatchDeepseekV4PoolingCache(c.ratio, left_padding)
         elif isinstance(c, PoolingCache):
             return BatchPoolingCache(c.ratio, left_padding)
         elif isinstance(c, RotatingKVCache):
