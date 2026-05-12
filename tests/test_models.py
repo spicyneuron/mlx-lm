@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import tempfile
 import unittest
 
 import mlx.core as mx
@@ -9,7 +10,16 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    BatchDeepseekV4PoolingCache,
+    CacheList,
+    DeepseekV4PoolingCache,
+    KVCache,
+    RotatingKVCache,
+    load_prompt_cache,
+    make_prompt_cache,
+    save_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -1495,6 +1505,69 @@ class TestModels(unittest.TestCase):
         expected = expected.astype(block_out.dtype)
         actual = hc_expand(block_out, residual, post, comb)
         self.assertTrue(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5))
+
+        # CSA compression needs the prior Ca slice across cached chunks.
+        ratio = 4
+        head_dim = 8
+        kv = mx.arange(1 * 12 * head_dim * 2, dtype=mx.float32).reshape(
+            1, 12, head_dim * 2
+        )
+        mx.random.seed(0)
+        gate = mx.random.normal(kv.shape) * 0.5
+        ape = mx.random.normal((ratio, head_dim * 2)) * 0.5
+
+        def csa_compress(kv_chunks, gate_chunks, roundtrip_after=None):
+            cache = DeepseekV4PoolingCache(ratio)
+            chunks = []
+            offset = 0
+            for i, (kv_chunk, gate_chunk) in enumerate(zip(kv_chunks, gate_chunks)):
+                ready_kv, ready_gate, _ = cache.accumulate_windows(
+                    kv_chunk, gate_chunk, offset
+                )
+                offset += kv_chunk.shape[1]
+                if ready_kv.shape[1] == 0:
+                    continue
+                ready_kv = mx.unflatten(ready_kv, 1, (-1, ratio))
+                ready_gate = mx.unflatten(ready_gate, 1, (-1, ratio))
+                prior_kv, prior_gate = cache.update_overlap_state(
+                    ready_kv, ready_gate
+                )
+                chunk = deepseek_v4._overlap_compress_kv(
+                    ready_kv,
+                    ready_gate,
+                    ape,
+                    head_dim,
+                    prior_kv,
+                    prior_gate,
+                )
+                cache.update_and_fetch(chunk)
+                chunks.append(chunk)
+                if i == roundtrip_after:
+                    with tempfile.TemporaryDirectory() as d:
+                        path = f"{d}/cache.safetensors"
+                        save_prompt_cache(path, [CacheList(cache)])
+                        cache = load_prompt_cache(path)[0][0]
+                        self.assertIsInstance(cache, DeepseekV4PoolingCache)
+            return mx.concatenate(chunks, axis=1)
+
+        full = csa_compress([kv], [gate])
+        for roundtrip_after in (0, 1):
+            chunked = csa_compress(
+                [kv[:, :5], kv[:, 5:9], kv[:, 9:]],
+                [gate[:, :5], gate[:, 5:9], gate[:, 9:]],
+                roundtrip_after=roundtrip_after,
+            )
+            self.assertTrue(mx.allclose(chunked, full, rtol=1e-6, atol=1e-6))
+
+        single_a = DeepseekV4PoolingCache(ratio)
+        single_b = DeepseekV4PoolingCache(ratio)
+        single_a.overlap_kv = mx.ones((1, ratio, head_dim), dtype=mx.float32)
+        single_a.overlap_gate = mx.zeros((1, ratio, head_dim), dtype=mx.float32)
+        merged = DeepseekV4PoolingCache.merge([single_a, single_b])
+        self.assertIsInstance(merged, BatchDeepseekV4PoolingCache)
+        self.assertEqual(merged.overlap_kv.shape, (2, ratio, head_dim))
+        self.assertTrue(mx.allclose(merged.overlap_kv[0], single_a.overlap_kv[0]))
+        self.assertTrue((merged.overlap_kv[1] == 0).all().item())
 
         # Model test
         args = deepseek_v4.ModelArgs(
