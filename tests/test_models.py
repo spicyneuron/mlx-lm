@@ -1510,7 +1510,7 @@ class TestModels(unittest.TestCase):
             head_dim=16,
             qk_rope_head_dim=4,
             sliding_window=16,
-            compress_ratios=[0, 0, 4, 0],
+            compress_ratios=[0, 4, 128, 0],
             index_n_heads=4,
             index_head_dim=8,
             index_topk=4,
@@ -1523,6 +1523,56 @@ class TestModels(unittest.TestCase):
             hc_sinkhorn_iters=2,
         )
         model = deepseek_v4.Model(args)
+
+        # Prompt-cache reuse must be equivalent to pre-filling the same tokens
+        # from scratch, including across CSA and HCA compression boundaries.
+        tokens = mx.array(
+            [[i % args.vocab_size for i in range(144)]],
+            dtype=mx.int32,
+        )
+        for split in (8, 17, 128, 132):
+            full_cache = model.make_cache()
+            full = model(tokens, cache=full_cache)
+
+            split_cache = model.make_cache()
+            prefix = model(tokens[:, :split], cache=split_cache)
+            mx.eval(prefix, [c.state for c in split_cache])
+            rest = model(tokens[:, split:], cache=copy.deepcopy(split_cache))
+            mx.eval(full, rest)
+
+            self.assertTrue(
+                mx.allclose(full[:, split:], rest, rtol=1e-4, atol=1e-4),
+                f"DeepSeek V4 cache reuse diverged at split={split}",
+            )
+
+        from mlx_lm.generate import BatchGenerator
+
+        # Server batching extracts prompt caches both at segmented prompt
+        # boundaries and when generation finishes.
+        batch_gen = BatchGenerator(
+            model,
+            max_tokens=1,
+            completion_batch_size=2,
+            prefill_batch_size=2,
+            prefill_step_size=16,
+        )
+        batch_gen.insert([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+        responses = batch_gen.next_generated()
+        self.assertEqual(len(responses), 2)
+        self.assertTrue(all(r.prompt_cache is not None for r in responses))
+
+        batch_gen = BatchGenerator(
+            model,
+            max_tokens=1,
+            completion_batch_size=1,
+            prefill_batch_size=1,
+            prefill_step_size=16,
+        )
+        uid = batch_gen.insert_segments([[[1, 2, 3, 4], [5, 6, 7, 8]]])[0]
+        prompt_responses, _ = batch_gen.next()
+        self.assertTrue(prompt_responses[0].end_of_segment)
+        self.assertFalse(prompt_responses[0].end_of_prompt)
+        self.assertIn(uid, batch_gen.extract_cache([uid]))
 
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
