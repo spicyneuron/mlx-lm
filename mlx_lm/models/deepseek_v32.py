@@ -50,6 +50,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    num_nextn_predict_layers: int = 0
 
 
 class Indexer(nn.Module):
@@ -420,6 +421,8 @@ class DeepseekV32Model(nn.Module):
         self.num_layers = self.end_idx
 
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if config.num_nextn_predict_layers > 0:
+            self.mtp = DeepseekV32MTP(config)
         self.pipeline_rank = 0
         self.pipeline_size = 1
 
@@ -475,6 +478,83 @@ class DeepseekV32Model(nn.Module):
         return self.norm(h)
 
 
+class DeepseekV32MTPSharedHead(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def __call__(self, hidden_states: mx.array) -> mx.array:
+        return self.norm(hidden_states)
+
+
+class DeepseekV32MTPLayer(nn.Module):
+    def __init__(self, config: ModelArgs, layer_idx: int):
+        super().__init__()
+        self.enorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        self.mtp_block = DeepseekV32DecoderLayer(config, layer_idx)
+        self.shared_head = DeepseekV32MTPSharedHead(config)
+
+    def __call__(
+        self,
+        inputs_embeds: mx.array,
+        previous_hidden_states: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        offset = cache[0].offset if cache is not None else 0
+        positions = mx.arange(offset, offset + inputs_embeds.shape[1])
+        inputs_embeds = mx.where(
+            positions[None, :, None] == 0,
+            mx.zeros_like(inputs_embeds),
+            inputs_embeds,
+        )
+        inputs_embeds = self.enorm(inputs_embeds)
+        previous_hidden_states = self.hnorm(previous_hidden_states)
+        hidden_states = self.eh_proj(
+            mx.concatenate([inputs_embeds, previous_hidden_states], axis=-1)
+        )
+        return self.mtp_block(hidden_states, mask, cache)
+
+
+class DeepseekV32MTP(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.layers = [
+            DeepseekV32MTPLayer(config, config.num_hidden_layers + idx)
+            for idx in range(config.num_nextn_predict_layers)
+        ]
+
+    def __call__(
+        self,
+        inputs_embeds: mx.array,
+        previous_hidden_states: mx.array,
+        cache: Optional[Any] = None,
+        spec_step_idx: int = 0,
+    ) -> mx.array:
+        layer_idx = spec_step_idx % len(self.layers)
+        layer = self.layers[layer_idx]
+        layer_cache = None if cache is None else cache[layer_idx]
+        if layer_cache is None:
+            mask = create_attention_mask(inputs_embeds, None, return_array=True)
+        else:
+            mask = create_attention_mask(
+                inputs_embeds, layer_cache[0], return_array=True
+            )
+        return layer(inputs_embeds, previous_hidden_states, mask, layer_cache)
+
+    def compute_logits(
+        self,
+        hidden_states: mx.array,
+        lm_head: nn.Module,
+        spec_step_idx: int = 0,
+    ) -> mx.array:
+        layer_idx = spec_step_idx % len(self.layers)
+        hidden_states = self.layers[layer_idx].shared_head(hidden_states)
+        return lm_head(hidden_states)
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -487,18 +567,81 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        return_hidden: bool = False,
     ):
         out = self.model(inputs, cache)
-        return self.lm_head(out)
+        logits = self.lm_head(out)
+        if return_hidden:
+            return logits, out
+        return logits
+
+    def mtp_forward(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        mtp_cache: Optional[Any],
+        spec_step_idx: int = 0,
+        return_hidden: bool = False,
+    ):
+        if not self.has_mtp:
+            raise ValueError("This model does not have MTP layers.")
+        inputs_embeds = self.model.embed_tokens(next_token_ids)
+        mtp_hidden = self.model.mtp(
+            inputs_embeds,
+            hidden_states,
+            cache=mtp_cache,
+            spec_step_idx=spec_step_idx,
+        )
+        logits = self.model.mtp.compute_logits(mtp_hidden, self.lm_head, spec_step_idx)
+        if return_hidden:
+            return logits, mtp_hidden
+        return logits
+
+    def make_mtp_cache(self):
+        if not self.has_mtp:
+            return []
+        return [CacheList(KVCache(), KVCache()) for _ in self.model.mtp.layers]
+
+    @property
+    def has_mtp(self):
+        return hasattr(self.model, "mtp")
+
+    @property
+    def mtp(self):
+        return self.model.mtp
 
     def sanitize(self, weights):
-        # Remove multi-token prediction layers
-        mpt_layer = self.args.num_hidden_layers
+        # Preserve/remap configured multi-token prediction layers and remove any
+        # additional checkpoint-only speculative layers.
+        mtp_layer = self.args.num_hidden_layers
+        num_mtp_layers = self.args.num_nextn_predict_layers
         new_weights = {}
         for k, v in weights.items():
             parts = k.split(".")
-            if len(parts) >= 3 and parts[1] == "layers" and int(parts[2]) >= mpt_layer:
-                continue
+            if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+                try:
+                    layer_idx = int(parts[2])
+                except ValueError:
+                    new_weights[k] = v
+                    continue
+                if layer_idx >= mtp_layer:
+                    mtp_idx = layer_idx - mtp_layer
+                    if mtp_idx >= num_mtp_layers:
+                        continue
+                    name = ".".join(parts[3:])
+                    if name.startswith("embed_tokens.") or name.startswith(
+                        "shared_head.head."
+                    ):
+                        continue
+                    if name.startswith(("enorm.", "hnorm.", "eh_proj.")):
+                        k = f"model.mtp.layers.{mtp_idx}.{name}"
+                    elif name.startswith("shared_head.norm."):
+                        suffix = name[len("shared_head.norm.") :]
+                        k = f"model.mtp.layers.{mtp_idx}.shared_head.norm.{suffix}"
+                    elif name.startswith("shared_head."):
+                        continue
+                    else:
+                        k = f"model.mtp.layers.{mtp_idx}.mtp_block.{name}"
             new_weights[k] = v
         weights = new_weights
 
@@ -531,9 +674,7 @@ class Model(nn.Module):
                 new_weights[k] = v
         weights = new_weights
 
-        # Stack experts
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}"
+        def sanitize_layer(prefix):
             for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
@@ -542,17 +683,16 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
-            prefix = f"model.layers.{l}.self_attn"
-            if f"{prefix}.kv_b_proj.weight" in weights:
-                layer = self.model.layers[l].self_attn.embed_q
-                quantized = f"{prefix}.kv_b_proj.scales" in weights
-                v = weights.pop(f"{prefix}.kv_b_proj.weight")
+            attn_prefix = f"{prefix}.self_attn"
+            if f"{attn_prefix}.kv_b_proj.weight" in weights:
+                quantized = f"{attn_prefix}.kv_b_proj.scales" in weights
+                v = weights.pop(f"{attn_prefix}.kv_b_proj.weight")
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
 
                 if quantized:
                     dims = self.args.kv_lora_rank
-                    scales = weights.pop(f"{prefix}.kv_b_proj.scales")
-                    biases = weights.pop(f"{prefix}.kv_b_proj.biases")
+                    scales = weights.pop(f"{attn_prefix}.kv_b_proj.scales")
+                    biases = weights.pop(f"{attn_prefix}.kv_b_proj.biases")
                     # Try to infer bits and group size
                     bits = (v.shape[-1] * 32) // dims
                     group_size = dims // scales.shape[-1]
@@ -572,12 +712,19 @@ class Model(nn.Module):
                     wv, wv_scales, wv_biases = mx.quantize(
                         wv, bits=bits, group_size=group_size
                     )
-                    weights[f"{prefix}.embed_q.scales"] = wk_scales
-                    weights[f"{prefix}.unembed_out.scales"] = wv_scales
-                    weights[f"{prefix}.embed_q.biases"] = wk_biases
-                    weights[f"{prefix}.unembed_out.biases"] = wv_biases
-                weights[f"{prefix}.embed_q.weight"] = wk
-                weights[f"{prefix}.unembed_out.weight"] = wv
+                    weights[f"{attn_prefix}.embed_q.scales"] = wk_scales
+                    weights[f"{attn_prefix}.unembed_out.scales"] = wv_scales
+                    weights[f"{attn_prefix}.embed_q.biases"] = wk_biases
+                    weights[f"{attn_prefix}.unembed_out.biases"] = wv_biases
+                weights[f"{attn_prefix}.embed_q.weight"] = wk
+                weights[f"{attn_prefix}.unembed_out.weight"] = wv
+
+        # Stack experts and split kv_b_proj for backbone and MTP blocks.
+        for l in range(self.args.num_hidden_layers):
+            sanitize_layer(f"model.layers.{l}")
+        if self.has_mtp:
+            for l in range(len(self.model.mtp.layers)):
+                sanitize_layer(f"model.mtp.layers.{l}.mtp_block")
 
         return weights
 

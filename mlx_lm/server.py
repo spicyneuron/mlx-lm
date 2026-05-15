@@ -293,6 +293,8 @@ class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
         self.cli_args = cli_args
+        if cli_args.mtp and cli_args.draft_model is not None:
+            raise ValueError("--mtp cannot be used together with --draft-model.")
         self.model_key = None
         self.model = None
         self.tokenizer = None
@@ -368,13 +370,13 @@ class ModelProvider:
                 )
 
         # Compute batchability
-        is_batchable = draft_model is None
+        is_batchable = draft_model is None and not self.cli_args.mtp
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
 
         # Update the member variables
-        self.model_key = (model_path, adapter_path, draft_model_path)
+        self.model_key = (model_path, adapter_path, draft_model_path, self.cli_args.mtp)
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
@@ -389,9 +391,9 @@ class ModelProvider:
         adapter_path = self._adapter_map.get(model_path, adapter_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
-        model_key = (model_path, adapter_path, draft_model_path)
+        model_key = (model_path, adapter_path, draft_model_path, self.cli_args.mtp)
         if self.model_key != model_key:
-            self._load(*model_key)
+            self._load(model_path, adapter_path, draft_model_path)
 
         return self.model, self.tokenizer
 
@@ -683,7 +685,11 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and not self.cli_args.mtp
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -969,8 +975,18 @@ class ResponseGenerator:
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
+                if self.cli_args.mtp and hasattr(
+                    self.model_provider.model, "make_mtp_cache"
+                ):
+                    cache += self.model_provider.model.make_mtp_cache()
+                elif self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            xtc_special_tokens = tokenizer.encode("\n")
+            if hasattr(tokenizer, "eos_token_ids"):
+                xtc_special_tokens += list(tokenizer.eos_token_ids)
+            elif tokenizer.eos_token_id is not None:
+                xtc_special_tokens.append(tokenizer.eos_token_id)
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -985,6 +1001,14 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                mtp=self.cli_args.mtp,
+                temp=args.sampling.temperature,
+                top_p=args.sampling.top_p,
+                top_k=args.sampling.top_k,
+                min_p=args.sampling.min_p,
+                xtc_probability=args.sampling.xtc_probability,
+                xtc_threshold=args.sampling.xtc_threshold,
+                xtc_special_tokens=xtc_special_tokens,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1789,6 +1813,11 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use native single-sequence MTP if the model provides MTP layers.",
     )
     parser.add_argument(
         "--trust-remote-code",

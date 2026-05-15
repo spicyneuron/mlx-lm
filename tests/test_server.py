@@ -40,6 +40,7 @@ class DummyModelProvider:
                 "use_default_chat_template": False,
                 "trust_remote_code": False,
                 "draft_model": None,
+                "mtp": False,
                 "num_draft_tokens": 3,
                 "temp": 0.0,
                 "top_p": 1.0,

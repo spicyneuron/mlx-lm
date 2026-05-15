@@ -42,6 +42,7 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
+    num_nextn_predict_layers: int = 0
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
