@@ -220,13 +220,14 @@ def setup_arg_parser():
     parser.add_argument(
         "--num-draft-tokens",
         type=int,
-        help="Number of tokens to draft when using speculative decoding.",
+        help="Number of tokens to draft when using speculative decoding or --draft-mtp.",
         default=3,
     )
     parser.add_argument(
-        "--mtp",
+        "--draft-mtp",
+        dest="mtp",
         action="store_true",
-        help="Use native single-sequence MTP if the model provides MTP layers.",
+        help="Use native MTP layers as a speculative draft model.",
     )
     return parser
 
@@ -2340,7 +2341,7 @@ def main():
     if args.seed is not None:
         mx.random.seed(args.seed)
     if args.mtp and args.draft_model is not None:
-        raise ValueError("--mtp cannot be used together with --draft-model.")
+        raise ValueError("--draft-mtp cannot be used together with --draft-model.")
 
     # Load the prompt cache and metadata if a cache file is provided
     using_cache = args.prompt_cache_file is not None

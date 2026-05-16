@@ -294,7 +294,7 @@ class ModelProvider:
         """Load models on demand and persist them across the whole process."""
         self.cli_args = cli_args
         if cli_args.mtp and cli_args.draft_model is not None:
-            raise ValueError("--mtp cannot be used together with --draft-model.")
+            raise ValueError("--draft-mtp cannot be used together with --draft-model.")
         self.model_key = None
         self.model = None
         self.tokenizer = None
@@ -1811,13 +1811,14 @@ def main():
     parser.add_argument(
         "--num-draft-tokens",
         type=int,
-        help="Number of tokens to draft when using speculative decoding.",
+        help="Number of tokens to draft when using speculative decoding or --draft-mtp.",
         default=3,
     )
     parser.add_argument(
-        "--mtp",
+        "--draft-mtp",
+        dest="mtp",
         action="store_true",
-        help="Use native single-sequence MTP if the model provides MTP layers.",
+        help="Use native MTP layers as a speculative draft model.",
     )
     parser.add_argument(
         "--trust-remote-code",
