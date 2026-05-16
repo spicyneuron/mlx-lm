@@ -27,9 +27,12 @@ def assert_usage_timings(test_case, response_body):
     test_case.assertIn("timings", response_body)
     test_case.assertIn("prompt_per_second", response_body["timings"])
     test_case.assertIn("predicted_per_second", response_body["timings"])
+    cached_tokens = (
+        response_body["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    )
     test_case.assertEqual(
         response_body["timings"]["prompt_n"],
-        response_body["usage"]["prompt_tokens"],
+        response_body["usage"]["prompt_tokens"] - cached_tokens,
     )
     test_case.assertEqual(
         response_body["timings"]["predicted_n"],
@@ -508,6 +511,8 @@ class TestServerWithDraftModel(unittest.TestCase):
 
         self.assertIn("choices", first_response_body)
         self.assertIn("choices", second_response_body)
+        assert_usage_timings(self, first_response_body)
+        assert_usage_timings(self, second_response_body)
         self.assertIn("message", first_response_body["choices"][0])
         self.assertIn("message", second_response_body["choices"][0])
         self.assertIn("content", first_response_body["choices"][0]["message"])

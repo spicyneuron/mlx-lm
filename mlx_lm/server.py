@@ -1527,11 +1527,12 @@ class APIHandler(BaseHTTPRequestHandler):
             end_at = time.perf_counter()
             timings = None
             if include_usage:
+                prompt_n = len(ctx.prompt) - max(ctx.prompt_cache_count, 0)
                 timings = _make_timings(
                     ctx.started_at,
                     first_token_at,
                     end_at,
-                    len(ctx.prompt),
+                    prompt_n,
                     len(tokens),
                 )
 
