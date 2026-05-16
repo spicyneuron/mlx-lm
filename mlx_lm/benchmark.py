@@ -104,6 +104,12 @@ def setup_arg_parser():
         help="Use native MTP layers as a speculative draft model.",
     )
     parser.add_argument(
+        "--draft-mtp-no-bonus",
+        dest="mtp_no_bonus",
+        action="store_true",
+        help="Disable the target-model bonus token in native MTP verification.",
+    )
+    parser.add_argument(
         "--num-draft-tokens",
         type=int,
         default=3,
@@ -117,6 +123,8 @@ def main():
     args = parser.parse_args()
     if args.mtp and args.batch_size != 1:
         parser.error("--draft-mtp only supports --batch-size 1.")
+    if args.mtp_no_bonus and not args.mtp:
+        parser.error("--draft-mtp-no-bonus requires --draft-mtp.")
     if args.prompt is not None and args.batch_size != 1:
         parser.error("--prompt only supports --batch-size 1.")
     mx.random.seed(0)
@@ -173,6 +181,7 @@ def main():
             max_tokens=generation_tokens,
             prefill_step_size=args.prefill_step_size,
             mtp=args.mtp,
+            mtp_no_bonus=args.mtp_no_bonus,
             num_draft_tokens=args.num_draft_tokens,
             mtp_stats_callback=update_mtp_stats if args.mtp else None,
             temp=args.temp,

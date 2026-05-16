@@ -229,6 +229,12 @@ def setup_arg_parser():
         action="store_true",
         help="Use native MTP layers as a speculative draft model.",
     )
+    parser.add_argument(
+        "--draft-mtp-no-bonus",
+        dest="mtp_no_bonus",
+        action="store_true",
+        help="Disable the target-model bonus token in native MTP verification.",
+    )
     return parser
 
 
@@ -687,6 +693,7 @@ def mtp_generate_step(
     xtc_threshold: float = DEFAULT_XTC_THRESHOLD,
     xtc_special_tokens: List[int] = [],
     mtp_stats_callback: Optional[Callable[[dict], None]] = None,
+    mtp_no_bonus: bool = False,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     Single-sequence generation with native MTP drafting.
@@ -874,10 +881,13 @@ def mtp_generate_step(
     draft_time = 0.0
     verify_time = 0.0
     verify_tokens = 0
+    next_from_draft = False
+    next_yielded = False
     logger.info(
-        "MTP enabled: num_draft_tokens=%d, mtp_layers=%d",
+        "MTP enabled: num_draft_tokens=%d, mtp_layers=%d, no_bonus=%s",
         max_draft_tokens,
         len(mtp_cache),
+        mtp_no_bonus,
     )
 
     def _log_mtp_stats(final=False):
@@ -916,6 +926,7 @@ def mtp_generate_step(
                     "full_block_rate": block_rate,
                     "num_draft_tokens": max_draft_tokens,
                     "mtp_layers": len(mtp_cache),
+                    "no_bonus": mtp_no_bonus,
                     "draft_time": draft_time,
                     "verify_time": verify_time,
                     "verify_tokens": verify_tokens,
@@ -929,14 +940,25 @@ def mtp_generate_step(
         while n != max_tokens:
             confirmed = next_y.astype(mx.uint32)
             confirmed_logprobs = next_logprobs
-            if max_tokens - n == 1:
+            confirmed_from_draft = next_from_draft
+            confirmed_yielded = next_yielded
+            next_from_draft = False
+            next_yielded = False
+
+            if max_tokens - n == 1 and not confirmed_yielded:
                 _mtp_step(prev_hidden, confirmed, update_only=True)
                 target_y, target_logprobs, _, target_hidden = _target_step(confirmed)
                 mx.async_eval(target_y, target_logprobs, target_hidden)
-                yield confirmed.item(), confirmed_logprobs, False
+                yield confirmed.item(), confirmed_logprobs, confirmed_from_draft
                 break
 
-            n_draft = min(max_draft_tokens, max_tokens - n - 1)
+            emitted = 0 if confirmed_yielded else 1
+            n_draft = min(max_draft_tokens, max_tokens - n - emitted)
+            if n_draft == 0:
+                if not confirmed_yielded:
+                    yield confirmed.item(), confirmed_logprobs, confirmed_from_draft
+                break
+
             tic = time.perf_counter()
             draft_tokens, draft_sample_logprobs, xtc_draws = _draft_block(
                 prev_hidden, confirmed, n_draft
@@ -951,8 +973,18 @@ def mtp_generate_step(
                 )
             draft_time += time.perf_counter() - tic
 
-            verify_input = mx.concatenate([confirmed, draft_tokens.astype(mx.uint32)])
-            verify_draws = xtc_draws + [None]
+            if mtp_no_bonus:
+                verify_input = (
+                    confirmed
+                    if n_draft == 1
+                    else mx.concatenate(
+                        [confirmed, draft_tokens[:-1].astype(mx.uint32)]
+                    )
+                )
+                verify_draws = xtc_draws
+            else:
+                verify_input = mx.concatenate([confirmed, draft_tokens.astype(mx.uint32)])
+                verify_draws = xtc_draws + [None]
             tic = time.perf_counter()
             target_y, target_logprobs, target_sample_logprobs, target_hidden = (
                 _target_step(verify_input, verify_draws)
@@ -1001,17 +1033,22 @@ def mtp_generate_step(
                 logged_proposed = proposed
 
             if accepted == n_draft:
-                prev_hidden = target_hidden[:, n_draft : n_draft + 1, :]
-                next_y = target_y[n_draft : n_draft + 1].astype(mx.uint32)
-                next_logprobs = target_logprobs[n_draft]
+                if mtp_no_bonus:
+                    prev_hidden = target_hidden[:, n_draft - 1 : n_draft, :]
+                    next_y = draft_tokens[n_draft - 1 : n_draft].astype(mx.uint32)
+                    next_logprobs = target_logprobs[n_draft - 1]
+                    next_from_draft = True
+                    next_yielded = True
+                else:
+                    prev_hidden = target_hidden[:, n_draft : n_draft + 1, :]
+                    next_y = target_y[n_draft : n_draft + 1].astype(mx.uint32)
+                    next_logprobs = target_logprobs[n_draft]
                 mx.async_eval(next_y, next_logprobs, prev_hidden)
             else:
-                trim = n_draft - accepted
+                trim = n_draft - accepted - (1 if mtp_no_bonus else 0)
                 cache.trim_prompt_cache(model_cache, trim)
-                # The MTP cache has already processed the confirmed token plus
-                # the accepted draft prefix; only trim rejected draft positions.
-                mtp_cache[0].trim(max(trim - 1, 0))
-                if prev_tokens is not None:
+                mtp_cache[0].trim(trim if mtp_no_bonus else max(trim - 1, 0))
+                if trim > 0 and prev_tokens is not None:
                     prev_tokens = prev_tokens[:-trim]
                 prev_hidden = target_hidden[:, accepted : accepted + 1, :]
                 if temp == 0:
@@ -1026,8 +1063,9 @@ def mtp_generate_step(
                     next_y = mx.random.categorical(next_logprobs)[None].astype(mx.uint32)
                 mx.async_eval(next_y, next_logprobs, prev_hidden)
 
-            yield confirmed.item(), confirmed_logprobs, False
-            n += 1
+            if not confirmed_yielded:
+                yield confirmed.item(), confirmed_logprobs, confirmed_from_draft
+                n += 1
             for i in range(accepted):
                 yield draft_tokens_list[i], target_logprobs[i], True
                 n += 1
@@ -1083,6 +1121,7 @@ def stream_generate(
     kwargs["max_tokens"] = max_tokens
     mtp = kwargs.pop("mtp", False)
     mtp_stats_callback = kwargs.pop("mtp_stats_callback", None)
+    mtp_no_bonus = kwargs.pop("mtp_no_bonus", False)
     sampling_kwargs = {
         "temp": kwargs.pop("temp", DEFAULT_TEMP),
         "top_p": kwargs.pop("top_p", DEFAULT_TOP_P),
@@ -1116,6 +1155,7 @@ def stream_generate(
                 model,
                 num_draft_tokens=num_draft_tokens,
                 mtp_stats_callback=mtp_stats_callback,
+                mtp_no_bonus=mtp_no_bonus,
                 **kwargs,
                 **sampling_kwargs,
             )
@@ -2398,6 +2438,8 @@ def main():
 
     if args.seed is not None:
         mx.random.seed(args.seed)
+    if args.mtp_no_bonus and not args.mtp:
+        raise ValueError("--draft-mtp-no-bonus requires --draft-mtp.")
     if args.mtp and args.draft_model is not None:
         raise ValueError("--draft-mtp cannot be used together with --draft-model.")
 
@@ -2515,6 +2557,7 @@ def main():
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
         mtp=args.mtp,
+        mtp_no_bonus=args.mtp_no_bonus,
         temp=args.temp,
         top_p=args.top_p,
         min_p=args.min_p,

@@ -295,6 +295,8 @@ class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
         self.cli_args = cli_args
+        if cli_args.mtp_no_bonus and not cli_args.mtp:
+            raise ValueError("--draft-mtp-no-bonus requires --draft-mtp.")
         if cli_args.mtp and cli_args.draft_model is not None:
             raise ValueError("--draft-mtp cannot be used together with --draft-model.")
         self.model_key = None
@@ -1020,6 +1022,7 @@ class ResponseGenerator:
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 mtp=self.cli_args.mtp,
+                mtp_no_bonus=self.cli_args.mtp_no_bonus,
                 temp=args.sampling.temperature,
                 top_p=args.sampling.top_p,
                 top_k=args.sampling.top_k,
@@ -1863,6 +1866,12 @@ def main():
         dest="mtp",
         action="store_true",
         help="Use native MTP layers as a speculative draft model.",
+    )
+    parser.add_argument(
+        "--draft-mtp-no-bonus",
+        dest="mtp_no_bonus",
+        action="store_true",
+        help="Disable the target-model bonus token in native MTP verification.",
     )
     parser.add_argument(
         "--trust-remote-code",

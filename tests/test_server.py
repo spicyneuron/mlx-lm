@@ -60,6 +60,7 @@ class DummyModelProvider:
                 "trust_remote_code": False,
                 "draft_model": None,
                 "mtp": False,
+                "mtp_no_bonus": False,
                 "num_draft_tokens": 3,
                 "temp": 0.0,
                 "top_p": 1.0,
