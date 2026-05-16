@@ -175,16 +175,8 @@ def main():
         stats = getattr(response, "mtp_stats", {})
         accepted = stats.get("accepted", 0)
         proposed = stats.get("proposed", 0)
-        full_accepts = stats.get("full_accepts", 0)
-        verified_steps = stats.get("verified_steps", 0)
         acceptance_rate = accepted / proposed if proposed else 0
-        full_block_rate = full_accepts / verified_steps if verified_steps else 0
-        return [
-            f"mtp_acceptance_rate={100 * acceptance_rate:.1f}%",
-            f"mtp_accepted={accepted}",
-            f"mtp_proposed={proposed}",
-            f"mtp_full_block_rate={100 * full_block_rate:.1f}%",
-        ]
+        return [f"mtp_acceptance={100 * acceptance_rate:.1f}%"]
 
     for i in range(args.num_trials):
         if args.delay > 0:
@@ -209,22 +201,8 @@ def main():
     if args.mtp:
         accepted = sum(getattr(r, "mtp_stats", {}).get("accepted", 0) for r in responses)
         proposed = sum(getattr(r, "mtp_stats", {}).get("proposed", 0) for r in responses)
-        full_accepts = sum(
-            getattr(r, "mtp_stats", {}).get("full_accepts", 0) for r in responses
-        )
-        verified_steps = sum(
-            getattr(r, "mtp_stats", {}).get("verified_steps", 0) for r in responses
-        )
         acceptance_rate = accepted / proposed if proposed else 0
-        full_block_rate = full_accepts / verified_steps if verified_steps else 0
-        results.extend(
-            [
-                f"mtp_acceptance_rate={100 * acceptance_rate:.1f}%",
-                f"mtp_accepted={accepted / args.num_trials:.1f}",
-                f"mtp_proposed={proposed / args.num_trials:.1f}",
-                f"mtp_full_block_rate={100 * full_block_rate:.1f}%",
-            ]
-        )
+        results.append(f"mtp_acceptance={100 * acceptance_rate:.1f}%")
     rprint(f"Averages: " + ", ".join(results))
 
 
