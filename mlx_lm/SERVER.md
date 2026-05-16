@@ -140,6 +140,22 @@ curl localhost:8080/v1/chat/completions \
     - `completion_tokens`: The number of tokens generated.
     - `total_tokens`: The total number of tokens, i.e. the sum of the above two fields.
 
+- `timings`: A dictionary with server-observed generation-service
+  measurements. Excludes network I/O, response serialization, and
+  client-side wait. Includes overhead inside the generation service
+  (queue hops, batch-tick scheduling), so values are approximate:
+    - `prompt_n`: The number of prompt tokens actually processed (excludes
+      cached tokens).
+    - `predicted_n`: The number of tokens generated.
+    - `prompt_per_second`: `prompt_n` divided by the server-observed time
+      until the first generated token is produced.
+    - `predicted_per_second`: `predicted_n` divided by the server-observed
+      time between the first and last generated tokens. Returns `0` when
+      fewer than two tokens are generated.
+
+  For streaming requests, `timings` is included in the final usage chunk
+  when `stream_options.include_usage` is set.
+
 ### List Models
 
 Use the `v1/models` endpoint to list available models:

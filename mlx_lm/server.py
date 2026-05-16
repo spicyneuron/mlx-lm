@@ -215,6 +215,9 @@ class GenerationContext:
 
     prompt: List[int]
     prompt_cache_count: int = -1
+    prompt_start_at: Optional[float] = None
+    prompt_end_at: Optional[float] = None
+    decode_end_at: Optional[float] = None
 
     _should_stop: bool = False
 
@@ -435,6 +438,22 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
         {"id": i, "token": s, "logprob": g}
         for i, s, g in zip(top_indices, txts, top_probs)
     )
+
+
+def _make_timings(ctx, prompt_n: int, predicted_n: int) -> Dict[str, Any]:
+    def rate(n, start, end):
+        if start is None or end is None or end <= start:
+            return 0
+        return n / (end - start)
+
+    return {
+        "prompt_per_second": rate(prompt_n, ctx.prompt_start_at, ctx.prompt_end_at),
+        "predicted_per_second": rate(
+            predicted_n, ctx.prompt_end_at, ctx.decode_end_at
+        ),
+        "prompt_n": prompt_n,
+        "predicted_n": predicted_n,
+    }
 
 
 class ResponseGenerator:
@@ -850,15 +869,20 @@ class ResponseGenerator:
 
                 uids_to_remove = []
                 for _ in self._time_budget:
+                    tic = time.perf_counter()
                     prompt_responses, gen_responses = batch_generator.next()
+                    toc = time.perf_counter()
                     if not prompt_responses and not gen_responses:
                         break
 
                     # Progress report for prompt processing
                     for r in prompt_responses:
                         result = batch_results[r.uid]
+                        ctx = result["ctx"]
+                        if ctx.prompt_start_at is None:
+                            ctx.prompt_start_at = tic
                         result["rqueue"].put(r.progress)
-                        if result["ctx"]._should_stop:
+                        if ctx._should_stop:
                             uids_to_remove.append(r.uid)
 
                     # Save the caches at end of segments
@@ -881,6 +905,9 @@ class ResponseGenerator:
 
                     for r in gen_responses:
                         result = batch_results[r.uid]
+                        ctx = result["ctx"]
+                        if ctx.prompt_end_at is None:
+                            ctx.prompt_end_at = toc
                         result["detokenizer"].add_token(r.token)
                         result["rqueue"].put(
                             Response(
@@ -899,6 +926,7 @@ class ResponseGenerator:
                         )
 
                         if r.finish_reason is not None:
+                            ctx.decode_end_at = toc
                             result["rqueue"].put(None)
                             self.prompt_cache.insert_cache(
                                 current_model_key,
@@ -908,7 +936,7 @@ class ResponseGenerator:
                             )
                             del batch_results[r.uid]
 
-                        if result["ctx"]._should_stop:
+                        if ctx._should_stop:
                             uids_to_remove.append(r.uid)
 
                 uids_to_remove = self._share_object(uids_to_remove)
@@ -973,6 +1001,7 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
+            ctx.prompt_start_at = time.perf_counter()
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -986,6 +1015,8 @@ class ResponseGenerator:
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
+                if ctx.prompt_end_at is None:
+                    ctx.prompt_end_at = time.perf_counter()
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
                 if match_sequence is not None and current_state is None:
@@ -1013,6 +1044,7 @@ class ResponseGenerator:
                 if finish_reason is not None:
                     break
 
+            ctx.decode_end_at = time.perf_counter()
             rqueue.put(None)
 
             # Save the KV cache again
@@ -1268,6 +1300,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
         reasoning_text: Optional[str] = None,
+        timings: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -1345,6 +1378,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 response["usage"]["prompt_tokens_details"] = {
                     "cached_tokens": prompt_cache_count,
                 }
+            if timings is not None:
+                response["timings"] = timings
 
         choice = response["choices"][0]
 
@@ -1450,6 +1485,9 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens = []
         token_logprobs = []
         top_tokens = []
+        include_usage = (not self.stream) or bool(
+            self.stream_options and self.stream_options.get("include_usage")
+        )
 
         try:
             for gen in response:
@@ -1497,6 +1535,11 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
+            timings = None
+            if include_usage:
+                prompt_n = len(ctx.prompt) - max(ctx.prompt_cache_count, 0)
+                timings = _make_timings(ctx, prompt_n, len(tokens))
+
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
                 made_tool_call = True
@@ -1513,14 +1556,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                 self.wfile.flush()
-                if (
-                    self.stream_options is not None
-                    and self.stream_options["include_usage"]
-                ):
+                if include_usage:
                     resp = self.completion_usage_response(
                         len(ctx.prompt),
                         len(tokens),
                         ctx.prompt_cache_count,
+                        timings=timings,
                     )
                     self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                     self.wfile.flush()
@@ -1538,6 +1579,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     tokens=tokens,
                     reasoning_text=reasoning_text,
                     tool_calls=tool_formatter(tool_calls),
+                    timings=timings,
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
@@ -1556,6 +1598,7 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
         prompt_cache_count: Optional[int] = None,
+        timings: Optional[Dict[str, Any]] = None,
     ):
         response = {
             "id": self.request_id,
@@ -1574,6 +1617,8 @@ class APIHandler(BaseHTTPRequestHandler):
             response["usage"]["prompt_tokens_details"] = {
                 "cached_tokens": prompt_cache_count,
             }
+        if timings is not None:
+            response["timings"] = timings
         return response
 
     def handle_chat_completions(self) -> CompletionRequest:
