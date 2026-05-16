@@ -26,8 +26,14 @@ def setup_arg_parser():
         "--prompt-tokens",
         "-p",
         default=512,
-        help="Length of prompt",
+        help="Length of random prompt when --prompt is not provided",
         type=int,
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Text prompt to benchmark instead of a random token prompt.",
     )
     parser.add_argument(
         "--generation-tokens",
@@ -93,6 +99,8 @@ def main():
     args = parser.parse_args()
     if args.mtp and args.batch_size != 1:
         parser.error("--draft-mtp only supports --batch-size 1.")
+    if args.prompt is not None and args.batch_size != 1:
+        parser.error("--prompt only supports --batch-size 1.")
     mx.random.seed(0)
 
     group = mx.distributed.init()
@@ -124,9 +132,14 @@ def main():
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens
     batch_size = args.batch_size
-    vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
-    prompts = mx.random.randint(0, vocab_size, (batch_size, prompt_tokens)).tolist()
-    prompt = prompts[0]
+    if args.prompt is None:
+        vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
+        prompts = mx.random.randint(0, vocab_size, (batch_size, prompt_tokens)).tolist()
+        prompt = prompts[0]
+    else:
+        prompt = tokenizer.encode(args.prompt)
+        prompt_tokens = len(prompt)
+        prompts = [prompt]
 
     def single_bench():
         mtp_stats = {}
