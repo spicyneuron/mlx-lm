@@ -686,6 +686,7 @@ def mtp_generate_step(
     xtc_probability: float = DEFAULT_XTC_PROBABILITY,
     xtc_threshold: float = DEFAULT_XTC_THRESHOLD,
     xtc_special_tokens: List[int] = [],
+    mtp_stats_callback: Optional[Callable[[dict], None]] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     Single-sequence generation with native MTP drafting.
@@ -893,6 +894,20 @@ def mtp_generate_step(
             verified_steps,
             100 * block_rate,
         )
+        if mtp_stats_callback is not None:
+            mtp_stats_callback(
+                {
+                    "final": final,
+                    "accepted": accepted_total,
+                    "proposed": proposed,
+                    "verified_steps": verified_steps,
+                    "full_accepts": full_accepts,
+                    "acceptance_rate": token_rate,
+                    "full_block_rate": block_rate,
+                    "num_draft_tokens": max_draft_tokens,
+                    "mtp_layers": len(mtp_cache),
+                }
+            )
 
     try:
         while n != max_tokens:
@@ -1026,6 +1041,7 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
     mtp = kwargs.pop("mtp", False)
+    mtp_stats_callback = kwargs.pop("mtp_stats_callback", None)
     sampling_kwargs = {
         "temp": kwargs.pop("temp", DEFAULT_TEMP),
         "top_p": kwargs.pop("top_p", DEFAULT_TOP_P),
@@ -1058,6 +1074,7 @@ def stream_generate(
                 prompt,
                 model,
                 num_draft_tokens=num_draft_tokens,
+                mtp_stats_callback=mtp_stats_callback,
                 **kwargs,
                 **sampling_kwargs,
             )
