@@ -871,6 +871,9 @@ def mtp_generate_step(
     verified_steps = 0
     full_accepts = 0
     logged_proposed = 0
+    draft_time = 0.0
+    verify_time = 0.0
+    verify_tokens = 0
     logger.info(
         "MTP enabled: num_draft_tokens=%d, mtp_layers=%d",
         max_draft_tokens,
@@ -883,9 +886,13 @@ def mtp_generate_step(
         label = "final" if final else "progress"
         token_rate = accepted_total / proposed
         block_rate = full_accepts / verified_steps if verified_steps else 0.0
+        draft_ms = 1000 * draft_time / proposed
+        verify_ms = 1000 * verify_time / verify_tokens if verify_tokens else 0.0
+        block_ms = 1000 * (draft_time + verify_time) / verified_steps
         logger.info(
             "MTP %s: accepted %d/%d draft tokens (%.1f%%), "
-            "full draft blocks %d/%d (%.1f%%)",
+            "full draft blocks %d/%d (%.1f%%), "
+            "draft %.2f ms/token, verify %.2f ms/token, cycle %.2f ms/block",
             label,
             accepted_total,
             proposed,
@@ -893,6 +900,9 @@ def mtp_generate_step(
             full_accepts,
             verified_steps,
             100 * block_rate,
+            draft_ms,
+            verify_ms,
+            block_ms,
         )
         if mtp_stats_callback is not None:
             mtp_stats_callback(
@@ -906,6 +916,12 @@ def mtp_generate_step(
                     "full_block_rate": block_rate,
                     "num_draft_tokens": max_draft_tokens,
                     "mtp_layers": len(mtp_cache),
+                    "draft_time": draft_time,
+                    "verify_time": verify_time,
+                    "verify_tokens": verify_tokens,
+                    "draft_ms_per_token": draft_ms,
+                    "verify_ms_per_token": verify_ms,
+                    "cycle_ms_per_block": block_ms,
                 }
             )
 
@@ -921,15 +937,38 @@ def mtp_generate_step(
                 break
 
             n_draft = min(max_draft_tokens, max_tokens - n - 1)
+            tic = time.perf_counter()
             draft_tokens, draft_sample_logprobs, xtc_draws = _draft_block(
                 prev_hidden, confirmed, n_draft
             )
+            if temp == 0:
+                mx.eval(draft_tokens, [c.state for c in mtp_cache])
+            else:
+                mx.eval(
+                    draft_tokens,
+                    draft_sample_logprobs,
+                    [c.state for c in mtp_cache],
+                )
+            draft_time += time.perf_counter() - tic
+
             verify_input = mx.concatenate([confirmed, draft_tokens.astype(mx.uint32)])
             verify_draws = xtc_draws + [None]
+            tic = time.perf_counter()
             target_y, target_logprobs, target_sample_logprobs, target_hidden = (
                 _target_step(verify_input, verify_draws)
             )
-            mx.eval(draft_tokens, target_y)
+            if temp == 0:
+                mx.eval(target_y, target_hidden, [c.state for c in model_cache])
+            else:
+                mx.eval(
+                    target_y,
+                    target_sample_logprobs,
+                    target_hidden,
+                    [c.state for c in model_cache],
+                )
+            verify_time += time.perf_counter() - tic
+            verify_tokens += verify_input.size
+
             draft_tokens_list = draft_tokens.tolist()
             target_tokens = target_y.tolist()
 

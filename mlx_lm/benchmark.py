@@ -211,7 +211,12 @@ def main():
         accepted = stats.get("accepted", 0)
         proposed = stats.get("proposed", 0)
         acceptance_rate = accepted / proposed if proposed else 0
-        return [f"mtp_acceptance={100 * acceptance_rate:.1f}%"]
+        return [
+            f"mtp_acceptance={100 * acceptance_rate:.1f}%",
+            f"mtp_draft_ms/tok={stats.get('draft_ms_per_token', 0):.2f}",
+            f"mtp_verify_ms/tok={stats.get('verify_ms_per_token', 0):.2f}",
+            f"mtp_cycle_ms={stats.get('cycle_ms_per_block', 0):.2f}",
+        ]
 
     for i in range(args.num_trials):
         if args.delay > 0:
@@ -236,8 +241,30 @@ def main():
     if args.mtp:
         accepted = sum(getattr(r, "mtp_stats", {}).get("accepted", 0) for r in responses)
         proposed = sum(getattr(r, "mtp_stats", {}).get("proposed", 0) for r in responses)
+        verify_tokens = sum(
+            getattr(r, "mtp_stats", {}).get("verify_tokens", 0) for r in responses
+        )
+        verified_steps = sum(
+            getattr(r, "mtp_stats", {}).get("verified_steps", 0) for r in responses
+        )
+        draft_time = sum(
+            getattr(r, "mtp_stats", {}).get("draft_time", 0) for r in responses
+        )
+        verify_time = sum(
+            getattr(r, "mtp_stats", {}).get("verify_time", 0) for r in responses
+        )
         acceptance_rate = accepted / proposed if proposed else 0
         results.append(f"mtp_acceptance={100 * acceptance_rate:.1f}%")
+        draft_ms = 1000 * draft_time / proposed if proposed else 0
+        verify_ms = 1000 * verify_time / verify_tokens if verify_tokens else 0
+        cycle_ms = (
+            1000 * (draft_time + verify_time) / verified_steps
+            if verified_steps
+            else 0
+        )
+        results.append(f"mtp_draft_ms/tok={draft_ms:.2f}")
+        results.append(f"mtp_verify_ms/tok={verify_ms:.2f}")
+        results.append(f"mtp_cycle_ms={cycle_ms:.2f}")
     rprint(f"Averages: " + ", ".join(results))
 
 
