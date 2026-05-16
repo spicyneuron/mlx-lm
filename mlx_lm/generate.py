@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import logging
 import sys
 import time
 import warnings
@@ -55,6 +56,8 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+
+logger = logging.getLogger(__name__)
 
 
 def str2bool(string):
@@ -217,13 +220,14 @@ def setup_arg_parser():
     parser.add_argument(
         "--num-draft-tokens",
         type=int,
-        help="Number of tokens to draft when using speculative decoding.",
+        help="Number of tokens to draft when using speculative decoding or --draft-mtp.",
         default=3,
     )
     parser.add_argument(
-        "--mtp",
+        "--draft-mtp",
+        dest="mtp",
         action="store_true",
-        help="Use native single-sequence MTP if the model provides MTP layers.",
+        help="Use native MTP layers as a speculative draft model.",
     )
     return parser
 
@@ -861,81 +865,121 @@ def mtp_generate_step(
 
     n = 0
     max_draft_tokens = max(1, num_draft_tokens)
-    while n != max_tokens:
-        confirmed = next_y.astype(mx.uint32)
-        confirmed_logprobs = next_logprobs
-        if max_tokens - n == 1:
-            _mtp_step(prev_hidden, confirmed, update_only=True)
-            target_y, target_logprobs, _, target_hidden = _target_step(confirmed)
-            mx.async_eval(target_y, target_logprobs, target_hidden)
-            yield confirmed.item(), confirmed_logprobs, False
-            break
+    proposed = 0
+    accepted_total = 0
+    verified_steps = 0
+    full_accepts = 0
+    logged_proposed = 0
+    logger.info(
+        "MTP enabled: num_draft_tokens=%d, mtp_layers=%d",
+        max_draft_tokens,
+        len(mtp_cache),
+    )
 
-        n_draft = min(max_draft_tokens, max_tokens - n - 1)
-        draft_tokens, draft_sample_logprobs, xtc_draws = _draft_block(
-            prev_hidden, confirmed, n_draft
+    def _log_mtp_stats(final=False):
+        if proposed == 0:
+            return
+        label = "final" if final else "progress"
+        token_rate = accepted_total / proposed
+        block_rate = full_accepts / verified_steps if verified_steps else 0.0
+        logger.info(
+            "MTP %s: accepted %d/%d draft tokens (%.1f%%), "
+            "full draft blocks %d/%d (%.1f%%)",
+            label,
+            accepted_total,
+            proposed,
+            100 * token_rate,
+            full_accepts,
+            verified_steps,
+            100 * block_rate,
         )
-        verify_input = mx.concatenate([confirmed, draft_tokens.astype(mx.uint32)])
-        verify_draws = xtc_draws + [None]
-        target_y, target_logprobs, target_sample_logprobs, target_hidden = _target_step(
-            verify_input, verify_draws
-        )
-        mx.eval(draft_tokens, target_y)
-        draft_tokens_list = draft_tokens.tolist()
-        target_tokens = target_y.tolist()
 
-        if temp == 0:
-            accepted = 0
-            while (
-                accepted < n_draft
-                and draft_tokens_list[accepted] == target_tokens[accepted]
-            ):
-                accepted += 1
-        else:
-            accepted = 0
-            while accepted < n_draft:
-                draft_token = draft_tokens_list[accepted]
-                p = mx.exp(target_sample_logprobs[accepted, draft_token])
-                q = mx.exp(draft_sample_logprobs[accepted, draft_token])
-                accept_prob = mx.minimum(mx.array(1.0), p / q)
-                keep = mx.random.uniform(0, 1) < accept_prob
-                mx.eval(keep)
-                if not keep.item():
-                    break
-                accepted += 1
+    try:
+        while n != max_tokens:
+            confirmed = next_y.astype(mx.uint32)
+            confirmed_logprobs = next_logprobs
+            if max_tokens - n == 1:
+                _mtp_step(prev_hidden, confirmed, update_only=True)
+                target_y, target_logprobs, _, target_hidden = _target_step(confirmed)
+                mx.async_eval(target_y, target_logprobs, target_hidden)
+                yield confirmed.item(), confirmed_logprobs, False
+                break
 
-        if accepted == n_draft:
-            prev_hidden = target_hidden[:, n_draft : n_draft + 1, :]
-            next_y = target_y[n_draft : n_draft + 1].astype(mx.uint32)
-            next_logprobs = target_logprobs[n_draft]
-            mx.async_eval(next_y, next_logprobs, prev_hidden)
-        else:
-            trim = n_draft - accepted
-            cache.trim_prompt_cache(model_cache, trim)
-            mtp_cache[0].trim(trim)
-            if prev_tokens is not None:
-                prev_tokens = prev_tokens[:-trim]
-            prev_hidden = target_hidden[:, accepted : accepted + 1, :]
+            n_draft = min(max_draft_tokens, max_tokens - n - 1)
+            draft_tokens, draft_sample_logprobs, xtc_draws = _draft_block(
+                prev_hidden, confirmed, n_draft
+            )
+            verify_input = mx.concatenate([confirmed, draft_tokens.astype(mx.uint32)])
+            verify_draws = xtc_draws + [None]
+            target_y, target_logprobs, target_sample_logprobs, target_hidden = (
+                _target_step(verify_input, verify_draws)
+            )
+            mx.eval(draft_tokens, target_y)
+            draft_tokens_list = draft_tokens.tolist()
+            target_tokens = target_y.tolist()
+
             if temp == 0:
-                next_y = target_y[accepted : accepted + 1].astype(mx.uint32)
-                next_logprobs = target_logprobs[accepted]
+                accepted = 0
+                while (
+                    accepted < n_draft
+                    and draft_tokens_list[accepted] == target_tokens[accepted]
+                ):
+                    accepted += 1
             else:
-                target_probs = mx.exp(target_sample_logprobs[accepted])
-                draft_probs = mx.exp(draft_sample_logprobs[accepted])
-                correction_probs = mx.maximum(target_probs - draft_probs, 0)
-                correction_probs = correction_probs / correction_probs.sum()
-                next_logprobs = mx.log(correction_probs)
-                next_y = mx.random.categorical(next_logprobs)[None].astype(mx.uint32)
-            mx.async_eval(next_y, next_logprobs, prev_hidden)
+                accepted = 0
+                while accepted < n_draft:
+                    draft_token = draft_tokens_list[accepted]
+                    p = mx.exp(target_sample_logprobs[accepted, draft_token])
+                    q = mx.exp(draft_sample_logprobs[accepted, draft_token])
+                    accept_prob = mx.minimum(mx.array(1.0), p / q)
+                    keep = mx.random.uniform(0, 1) < accept_prob
+                    mx.eval(keep)
+                    if not keep.item():
+                        break
+                    accepted += 1
 
-        yield confirmed.item(), confirmed_logprobs, False
-        n += 1
-        for i in range(accepted):
-            yield draft_tokens_list[i], target_logprobs[i], True
+            proposed += n_draft
+            accepted_total += accepted
+            verified_steps += 1
+            full_accepts += accepted == n_draft
+            if proposed - logged_proposed >= 256:
+                _log_mtp_stats()
+                logged_proposed = proposed
+
+            if accepted == n_draft:
+                prev_hidden = target_hidden[:, n_draft : n_draft + 1, :]
+                next_y = target_y[n_draft : n_draft + 1].astype(mx.uint32)
+                next_logprobs = target_logprobs[n_draft]
+                mx.async_eval(next_y, next_logprobs, prev_hidden)
+            else:
+                trim = n_draft - accepted
+                cache.trim_prompt_cache(model_cache, trim)
+                mtp_cache[0].trim(trim)
+                if prev_tokens is not None:
+                    prev_tokens = prev_tokens[:-trim]
+                prev_hidden = target_hidden[:, accepted : accepted + 1, :]
+                if temp == 0:
+                    next_y = target_y[accepted : accepted + 1].astype(mx.uint32)
+                    next_logprobs = target_logprobs[accepted]
+                else:
+                    target_probs = mx.exp(target_sample_logprobs[accepted])
+                    draft_probs = mx.exp(draft_sample_logprobs[accepted])
+                    correction_probs = mx.maximum(target_probs - draft_probs, 0)
+                    correction_probs = correction_probs / correction_probs.sum()
+                    next_logprobs = mx.log(correction_probs)
+                    next_y = mx.random.categorical(next_logprobs)[None].astype(mx.uint32)
+                mx.async_eval(next_y, next_logprobs, prev_hidden)
+
+            yield confirmed.item(), confirmed_logprobs, False
             n += 1
+            for i in range(accepted):
+                yield draft_tokens_list[i], target_logprobs[i], True
+                n += 1
 
-        if n % 256 == 0:
-            mx.clear_cache()
+            if n % 256 == 0:
+                mx.clear_cache()
+    finally:
+        _log_mtp_stats(final=True)
 
 
 def stream_generate(
@@ -2291,10 +2335,13 @@ def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
 
+    if args.mtp and not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
+
     if args.seed is not None:
         mx.random.seed(args.seed)
     if args.mtp and args.draft_model is not None:
-        raise ValueError("--mtp cannot be used together with --draft-model.")
+        raise ValueError("--draft-mtp cannot be used together with --draft-model.")
 
     # Load the prompt cache and metadata if a cache file is provided
     using_cache = args.prompt_cache_file is not None
