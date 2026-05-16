@@ -969,7 +969,9 @@ def mtp_generate_step(
             else:
                 trim = n_draft - accepted
                 cache.trim_prompt_cache(model_cache, trim)
-                mtp_cache[0].trim(trim)
+                # The MTP cache has already processed the confirmed token plus
+                # the accepted draft prefix; only trim rejected draft positions.
+                mtp_cache[0].trim(max(trim - 1, 0))
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[:-trim]
                 prev_hidden = target_hidden[:, accepted : accepted + 1, :]
