@@ -6,7 +6,13 @@ import time
 import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
-from mlx_lm.generate import DEFAULT_MODEL
+from mlx_lm.generate import (
+    DEFAULT_MIN_P,
+    DEFAULT_MODEL,
+    DEFAULT_TEMP,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
+)
 from mlx_lm.utils import pipeline_load, sharded_load
 
 
@@ -41,6 +47,18 @@ def setup_arg_parser():
         default=1024,
         help="Length of completion",
         type=int,
+    )
+    parser.add_argument(
+        "--temp", type=float, default=DEFAULT_TEMP, help="Sampling temperature"
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=DEFAULT_TOP_P, help="Sampling top-p"
+    )
+    parser.add_argument(
+        "--min-p", type=float, default=DEFAULT_MIN_P, help="Sampling min-p"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=DEFAULT_TOP_K, help="Sampling top-k"
     )
     parser.add_argument(
         "--batch-size",
@@ -157,6 +175,10 @@ def main():
             mtp=args.mtp,
             num_draft_tokens=args.num_draft_tokens,
             mtp_stats_callback=update_mtp_stats if args.mtp else None,
+            temp=args.temp,
+            top_p=args.top_p,
+            min_p=args.min_p,
+            top_k=args.top_k,
         ):
             pass
         if args.mtp:
