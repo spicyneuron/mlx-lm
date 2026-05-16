@@ -10,7 +10,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -214,6 +214,7 @@ class GenerationContext:
     sequences: Dict[Tuple[int], str]
 
     prompt: List[int]
+    started_at: float = field(default_factory=time.perf_counter)
     prompt_cache_count: int = -1
 
     _should_stop: bool = False
@@ -435,6 +436,22 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
         {"id": i, "token": s, "logprob": g}
         for i, s, g in zip(top_indices, txts, top_probs)
     )
+
+
+def _make_timings(started_at, first_token_at, end_at, prompt_n, predicted_n):
+    first_token_at = first_token_at or end_at
+    prompt_time = first_token_at - started_at
+    predicted_time = end_at - first_token_at
+    prompt_per_second = prompt_n / prompt_time if prompt_time > 0 else 0
+    rate_n = max(predicted_n - 1, 0)
+    predicted_per_second = rate_n / predicted_time if predicted_time > 0 else 0
+
+    return {
+        "prompt_per_second": prompt_per_second,
+        "predicted_per_second": predicted_per_second,
+        "prompt_n": prompt_n,
+        "predicted_n": predicted_n,
+    }
 
 
 class ResponseGenerator:
@@ -942,16 +959,6 @@ class ResponseGenerator:
             )
             sm_state = sm.make_state()
 
-            # Start the generation context
-            ctx = GenerationContext(
-                has_thinking=tokenizer.has_thinking,
-                has_tool_calling=tokenizer.has_tool_calling,
-                tool_parser=tokenizer.tool_parser,
-                sequences=sequences,
-                prompt=prompt,
-            )
-            rqueue.put(ctx)
-
             # Seed if requested
             if args.seed is not None:
                 mx.random.seed(args.seed)
@@ -965,12 +972,23 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
+            prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            # Start the generation context
+            ctx = GenerationContext(
+                has_thinking=tokenizer.has_thinking,
+                has_tool_calling=tokenizer.has_tool_calling,
+                tool_parser=tokenizer.tool_parser,
+                sequences=sequences,
+                prompt=prompt,
+                prompt_cache_count=prompt_cache_count,
+            )
+            rqueue.put(ctx)
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1268,6 +1286,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
         reasoning_text: Optional[str] = None,
+        timings: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -1345,6 +1364,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 response["usage"]["prompt_tokens_details"] = {
                     "cached_tokens": prompt_cache_count,
                 }
+            if timings is not None:
+                response["timings"] = timings
 
         choice = response["choices"][0]
 
@@ -1450,9 +1471,15 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens = []
         token_logprobs = []
         top_tokens = []
+        first_token_at = None
+        include_usage = (not self.stream) or bool(
+            self.stream_options and self.stream_options.get("include_usage")
+        )
 
         try:
             for gen in response:
+                if first_token_at is None:
+                    first_token_at = time.perf_counter()
                 logging.debug(gen.text)
 
                 # Collect the text according to our current state and state
@@ -1497,6 +1524,17 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
+            end_at = time.perf_counter()
+            timings = None
+            if include_usage:
+                timings = _make_timings(
+                    ctx.started_at,
+                    first_token_at,
+                    end_at,
+                    len(ctx.prompt),
+                    len(tokens),
+                )
+
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
                 made_tool_call = True
@@ -1513,14 +1551,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                 self.wfile.flush()
-                if (
-                    self.stream_options is not None
-                    and self.stream_options["include_usage"]
-                ):
+                if include_usage:
                     resp = self.completion_usage_response(
                         len(ctx.prompt),
                         len(tokens),
                         ctx.prompt_cache_count,
+                        timings=timings,
                     )
                     self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                     self.wfile.flush()
@@ -1538,6 +1574,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     tokens=tokens,
                     reasoning_text=reasoning_text,
                     tool_calls=tool_formatter(tool_calls),
+                    timings=timings,
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
@@ -1556,6 +1593,7 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
         prompt_cache_count: Optional[int] = None,
+        timings: Optional[Dict[str, Any]] = None,
     ):
         response = {
             "id": self.request_id,
@@ -1574,6 +1612,8 @@ class APIHandler(BaseHTTPRequestHandler):
             response["usage"]["prompt_tokens_details"] = {
                 "cached_tokens": prompt_cache_count,
             }
+        if timings is not None:
+            response["timings"] = timings
         return response
 
     def handle_chat_completions(self) -> CompletionRequest:
