@@ -232,6 +232,7 @@ class Response:
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
+    created_at: float = field(default_factory=time.perf_counter)
 
 
 def _process_control_tokens(ctx, token_stream):
@@ -445,8 +446,7 @@ def _make_timings(started_at, first_token_at, end_at, prompt_n, predicted_n):
     prompt_time = first_token_at - started_at
     predicted_time = end_at - first_token_at
     prompt_per_second = prompt_n / prompt_time if prompt_time > 0 else 0
-    rate_n = max(predicted_n - 1, 0)
-    predicted_per_second = rate_n / predicted_time if predicted_time > 0 else 0
+    predicted_per_second = predicted_n / predicted_time if predicted_time > 0 else 0
 
     return {
         "prompt_per_second": prompt_per_second,
@@ -1497,6 +1497,7 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs = []
         top_tokens = []
         first_token_at = None
+        last_token_at = None
         include_usage = (not self.stream) or bool(
             self.stream_options and self.stream_options.get("include_usage")
         )
@@ -1504,7 +1505,8 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             for gen in response:
                 if first_token_at is None:
-                    first_token_at = time.perf_counter()
+                    first_token_at = gen.created_at
+                last_token_at = gen.created_at
                 logging.debug(gen.text)
 
                 # Collect the text according to our current state and state
@@ -1549,7 +1551,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
-            end_at = time.perf_counter()
+            end_at = last_token_at or time.perf_counter()
             timings = None
             if include_usage:
                 prompt_n = len(ctx.prompt) - max(ctx.prompt_cache_count, 0)
