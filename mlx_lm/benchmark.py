@@ -6,7 +6,13 @@ import time
 import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
-from mlx_lm.generate import DEFAULT_MODEL
+from mlx_lm.generate import (
+    DEFAULT_MIN_P,
+    DEFAULT_MODEL,
+    DEFAULT_TEMP,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
+)
 from mlx_lm.utils import pipeline_load, sharded_load
 
 
@@ -26,8 +32,14 @@ def setup_arg_parser():
         "--prompt-tokens",
         "-p",
         default=512,
-        help="Length of prompt",
+        help="Length of random prompt when --prompt is not provided",
         type=int,
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Text prompt to benchmark instead of a random token prompt.",
     )
     parser.add_argument(
         "--generation-tokens",
@@ -35,6 +47,18 @@ def setup_arg_parser():
         default=1024,
         help="Length of completion",
         type=int,
+    )
+    parser.add_argument(
+        "--temp", type=float, default=DEFAULT_TEMP, help="Sampling temperature"
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=DEFAULT_TOP_P, help="Sampling top-p"
+    )
+    parser.add_argument(
+        "--min-p", type=float, default=DEFAULT_MIN_P, help="Sampling min-p"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=DEFAULT_TOP_K, help="Sampling top-k"
     )
     parser.add_argument(
         "--batch-size",
@@ -93,6 +117,8 @@ def main():
     args = parser.parse_args()
     if args.mtp and args.batch_size != 1:
         parser.error("--draft-mtp only supports --batch-size 1.")
+    if args.prompt is not None and args.batch_size != 1:
+        parser.error("--prompt only supports --batch-size 1.")
     mx.random.seed(0)
 
     group = mx.distributed.init()
@@ -124,9 +150,14 @@ def main():
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens
     batch_size = args.batch_size
-    vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
-    prompts = mx.random.randint(0, vocab_size, (batch_size, prompt_tokens)).tolist()
-    prompt = prompts[0]
+    if args.prompt is None:
+        vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
+        prompts = mx.random.randint(0, vocab_size, (batch_size, prompt_tokens)).tolist()
+        prompt = prompts[0]
+    else:
+        prompt = tokenizer.encode(args.prompt)
+        prompt_tokens = len(prompt)
+        prompts = [prompt]
 
     def single_bench():
         mtp_stats = {}
@@ -144,6 +175,10 @@ def main():
             mtp=args.mtp,
             num_draft_tokens=args.num_draft_tokens,
             mtp_stats_callback=update_mtp_stats if args.mtp else None,
+            temp=args.temp,
+            top_p=args.top_p,
+            min_p=args.min_p,
+            top_k=args.top_k,
         ):
             pass
         if args.mtp:
@@ -175,16 +210,8 @@ def main():
         stats = getattr(response, "mtp_stats", {})
         accepted = stats.get("accepted", 0)
         proposed = stats.get("proposed", 0)
-        full_accepts = stats.get("full_accepts", 0)
-        verified_steps = stats.get("verified_steps", 0)
         acceptance_rate = accepted / proposed if proposed else 0
-        full_block_rate = full_accepts / verified_steps if verified_steps else 0
-        return [
-            f"mtp_acceptance_rate={100 * acceptance_rate:.1f}%",
-            f"mtp_accepted={accepted}",
-            f"mtp_proposed={proposed}",
-            f"mtp_full_block_rate={100 * full_block_rate:.1f}%",
-        ]
+        return [f"mtp_acceptance={100 * acceptance_rate:.1f}%"]
 
     for i in range(args.num_trials):
         if args.delay > 0:
@@ -209,22 +236,8 @@ def main():
     if args.mtp:
         accepted = sum(getattr(r, "mtp_stats", {}).get("accepted", 0) for r in responses)
         proposed = sum(getattr(r, "mtp_stats", {}).get("proposed", 0) for r in responses)
-        full_accepts = sum(
-            getattr(r, "mtp_stats", {}).get("full_accepts", 0) for r in responses
-        )
-        verified_steps = sum(
-            getattr(r, "mtp_stats", {}).get("verified_steps", 0) for r in responses
-        )
         acceptance_rate = accepted / proposed if proposed else 0
-        full_block_rate = full_accepts / verified_steps if verified_steps else 0
-        results.extend(
-            [
-                f"mtp_acceptance_rate={100 * acceptance_rate:.1f}%",
-                f"mtp_accepted={accepted / args.num_trials:.1f}",
-                f"mtp_proposed={proposed / args.num_trials:.1f}",
-                f"mtp_full_block_rate={100 * full_block_rate:.1f}%",
-            ]
-        )
+        results.append(f"mtp_acceptance={100 * acceptance_rate:.1f}%")
     rprint(f"Averages: " + ", ".join(results))
 
 
