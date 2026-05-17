@@ -441,18 +441,20 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
 
 
 def _make_timings(ctx, prompt_n: int, predicted_n: int, cache_n: int) -> Dict[str, Any]:
-    def rate(n, start, end):
+    def elapsed(start, end):
         if start is None or end is None or end <= start:
             return 0
-        return n / (end - start)
+        return end - start
 
+    prompt_s = elapsed(ctx.prompt_start_at, ctx.prompt_end_at)
+    predicted_s = elapsed(ctx.prompt_end_at, ctx.decode_end_at)
     return {
-        "prompt_per_second": rate(prompt_n, ctx.prompt_start_at, ctx.prompt_end_at),
-        "predicted_per_second": rate(
-            predicted_n, ctx.prompt_end_at, ctx.decode_end_at
-        ),
         "prompt_n": prompt_n,
+        "prompt_ms": prompt_s * 1000,
+        "prompt_per_second": (prompt_n / prompt_s) if prompt_s else 0,
         "predicted_n": predicted_n,
+        "predicted_ms": predicted_s * 1000,
+        "predicted_per_second": (predicted_n / predicted_s) if predicted_s else 0,
         "cache_n": cache_n,
     }
 

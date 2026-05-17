@@ -37,11 +37,11 @@ def assert_usage_timings(test_case, response_body):
         response_body["usage"]["completion_tokens"],
     )
     test_case.assertEqual(timings["cache_n"], cached_tokens)
-    if timings["prompt_n"] > 0:
+    test_case.assertGreaterEqual(timings["prompt_ms"], 0)
+    test_case.assertGreaterEqual(timings["predicted_ms"], 0)
+    if timings["prompt_ms"] > 0:
         test_case.assertGreater(timings["prompt_per_second"], 0)
-    # predicted_per_second needs at least two tokens; with one, the
-    # first-token and last-token timestamps collapse.
-    if timings["predicted_n"] > 1:
+    if timings["predicted_ms"] > 0:
         test_case.assertGreater(timings["predicted_per_second"], 0)
 
 
