@@ -440,7 +440,7 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
     )
 
 
-def _make_timings(ctx, prompt_n: int, predicted_n: int) -> Dict[str, Any]:
+def _make_timings(ctx, prompt_n: int, predicted_n: int, cache_n: int) -> Dict[str, Any]:
     def rate(n, start, end):
         if start is None or end is None or end <= start:
             return 0
@@ -453,6 +453,7 @@ def _make_timings(ctx, prompt_n: int, predicted_n: int) -> Dict[str, Any]:
         ),
         "prompt_n": prompt_n,
         "predicted_n": predicted_n,
+        "cache_n": cache_n,
     }
 
 
@@ -1538,7 +1539,7 @@ class APIHandler(BaseHTTPRequestHandler):
             timings = None
             if include_usage:
                 prompt_n = len(ctx.prompt) - max(ctx.prompt_cache_count, 0)
-                timings = _make_timings(ctx, prompt_n, len(tokens))
+                timings = _make_timings(ctx, prompt_n, len(tokens), max(ctx.prompt_cache_count, 0))
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
