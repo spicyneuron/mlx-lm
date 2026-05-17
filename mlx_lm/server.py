@@ -1540,8 +1540,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
             timings = None
             if include_usage:
-                prompt_n = len(ctx.prompt) - max(ctx.prompt_cache_count, 0)
-                timings = _make_timings(ctx, prompt_n, len(tokens), max(ctx.prompt_cache_count, 0))
+                cache_n = max(ctx.prompt_cache_count, 0)
+                prompt_n = len(ctx.prompt) - cache_n
+                timings = _make_timings(ctx, prompt_n, len(tokens), cache_n)
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
