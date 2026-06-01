@@ -422,6 +422,12 @@ def main():
         help="Limit the number of examples per task.",
         type=int,
     )
+    parser.add_argument(
+        "--log-samples",
+        action="store_true",
+        help="Save per-sample prompts, responses, and metrics to a JSON file.",
+        default=False,
+    )
     parser.add_argument("--seed", type=int, default=123, help="Random seed.")
     parser.add_argument(
         "--fewshot-as-multiturn",
@@ -502,6 +508,7 @@ def main():
         torch_random_seed=args.seed,
         fewshot_random_seed=args.seed,
         confirm_run_unsafe_code=args.confirm_run_unsafe_code,
+        log_samples=args.log_samples,
     )
 
     file_keys = ["eval", args.model.replace("/", "_"), version("lm_eval")]
@@ -512,6 +519,9 @@ def main():
     if world.rank() == 0:
         output_path = output_dir / filename
         output_path.write_text(json.dumps(results["results"], indent=4))
+        if args.log_samples:
+            samples_path = output_dir / f"{filename}_samples"
+            samples_path.write_text(json.dumps(results["samples"], indent=4))
         print("Results:")
         for result in results["results"].values():
             print(json.dumps(result, indent=4))
