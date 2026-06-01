@@ -192,30 +192,34 @@ class MLXLM(LM):
         long_completions = 0
         scores, is_greedy = [], []
         for q, rs in tqdm(zip(questions, responses), total=len(questions)):
+            n_spaces = len(q) - len(q.rstrip())
+            if n_spaces > 0:
+                rs = [q[-n_spaces:] + r for r in rs]
+                q = q[:-n_spaces]
+
             prefix = self._tokenize([q])[0]
             full_sequences = self._tokenize([q + r for r in rs])
-            max_completed_l = max(len(s) for s in full_sequences)
+            continuations = [s[len(prefix) :] for s in full_sequences]
+            max_completed_l = len(prefix) + max(len(c) for c in continuations)
 
             # compute truncation length
             max_tokens = self._max_tokens or DEFAULT_MAX_TOKENS
             truncation = max(0, max_completed_l - max_tokens - 1)
-            orig_prefix_l = len(prefix)
             prefix_l = max(len(prefix) - truncation, 0)
             prefix = prefix[len(prefix) - prefix_l :]
 
             # If the entire prompt got truncated ignore the question
             if prefix_l == 0:
                 long_completions += 1
-                all_scores.extend([-float("inf")] * len(rs))
-                all_is_greedy.extend([False] * len(rs))
+                scores.extend([-float("inf")] * len(rs))
+                is_greedy.extend([False] * len(rs))
                 continue
 
             # model scoring, returns num_requests x (logp, is_greedy, length).
             logprobs, cache = self._process_prompt(prefix)
             max_idx = mx.argmax(logprobs).item()
 
-            for s in full_sequences:
-                inputs = s[len(prefix) :]
+            for inputs in continuations:
                 # The logprobs from the last token of the prompt are
                 # for the first input token
                 scores.append(logprobs[0, inputs[0]].item())

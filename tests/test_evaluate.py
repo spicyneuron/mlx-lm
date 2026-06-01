@@ -54,6 +54,41 @@ class TestMLXLM(unittest.TestCase):
         self.assertEqual(len(call_args_list[1][0][0]), 2)  # Second batch: 2 items
         self.assertEqual(len(call_args_list[2][0][0]), 1)  # Third batch: 1 item
 
+    def test_loglikelihood_moves_context_trailing_space_to_continuation(self):
+        encodings = {
+            "hello": [1],
+            "hello world": [1, 2],
+            "hello there": [1, 3],
+        }
+        self.mock_tokenizer.encode.side_effect = lambda text, **_: encodings[text]
+        self.mlx_lm._process_prompt = MagicMock(
+            return_value=(mx.array([[0.0, 0.1, 0.9, 0.2]]), None)
+        )
+        self.mlx_lm._score_fn = MagicMock()
+        group = MagicMock()
+        group.rank.return_value = 0
+        group.size.return_value = 1
+        requests = [
+            MagicMock(args=("hello ", "world")),
+            MagicMock(args=("hello ", "there")),
+        ]
+
+        with (
+            patch("mlx_lm.evaluate.mx.distributed.init", return_value=group),
+            patch("mlx_lm.evaluate.mx.distributed.all_max", return_value=mx.array(2)),
+            patch(
+                "mlx_lm.evaluate.mx.distributed.all_gather",
+                side_effect=lambda x, stream=None: x,
+            ),
+        ):
+            result = self.mlx_lm.loglikelihood(requests)
+
+        self.assertAlmostEqual(result[0][0], 0.9)
+        self.assertTrue(result[0][1])
+        self.assertAlmostEqual(result[1][0], 0.2)
+        self.assertFalse(result[1][1])
+        self.mlx_lm._score_fn.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
