@@ -1701,6 +1701,13 @@ class TestModels(unittest.TestCase):
         self.assertEqual(seen["kv_len"], 4)
         self.assertEqual(seen["mask"].shape[-1], 4)
 
+        # Shared experts use the same clipped SwiGLU as routed experts.
+        args_moe = tiny_args(0)
+        self.assertEqual(
+            deepseek_v4.DeepseekV4MoE(args_moe, 0).shared_experts.swiglu_limit,
+            args_moe.swiglu_limit,
+        )
+
         # Model test
         args = deepseek_v4.ModelArgs(
             model_type="deepseek_v4",
