@@ -127,7 +127,9 @@ def _expert_select(
     logits = logits.astype(mx.float32)
     scores = _score_func(logits, scoring_func)
     biased = scores + e_score_correction_bias
-    inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k].astype(
+        mx.int32
+    )
     weights = mx.take_along_axis(scores, inds, axis=-1)
     if scoring_func != "softmax" and norm_topk_prob:
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
