@@ -1625,6 +1625,7 @@ class BatchDeepseekV4PoolingCache(BatchPoolingCache):
         base = super().extract(idx)
         cache = DeepseekV4PoolingCache(self.ratio)
         cache.pooled = base.pooled
+        cache._buf = base._buf
         cache.buf_kv = base.buf_kv
         cache.buf_gate = base.buf_gate
         cache.remainder = base.remainder

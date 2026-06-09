@@ -1570,6 +1570,14 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(merged.overlap_kv[0], single_a.overlap_kv[0]))
         self.assertTrue((merged.overlap_kv[1] == 0).all().item())
 
+        single_a.update_and_fetch(mx.ones((1, 2, 1)))
+        single_b.update_and_fetch(mx.ones((1, 1, 1)) * 2)
+        extracted = DeepseekV4PoolingCache.merge([single_a, single_b]).extract(0)
+        extracted.update_and_fetch(mx.ones((1, 1, 1)) * 3)
+        self.assertTrue(
+            mx.array_equal(extracted.pooled, mx.array([[[1.0], [1.0], [3.0]]]))
+        )
+
         # Stateless pooled masks match the cache-backed causal condition:
         # query t can see compressed entry i iff i < (t + 1) // ratio.
         for ratio, seq_len in ((128, 256), (4, 12)):
