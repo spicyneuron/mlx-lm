@@ -185,6 +185,12 @@ def main() -> int:
     p.add_argument(
         "--quiet", action="store_true", help="Suppress tail-of-stdout per run"
     )
+    p.add_argument(
+        "--skip-baseline",
+        action="store_true",
+        help="Run only the candidate (no A/B comparison). Useful for iterating on "
+        "the candidate when the baseline hasn't moved since the last run.",
+    )
     args = p.parse_args()
 
     if shutil.which("uvx") is None:
@@ -197,9 +203,15 @@ def main() -> int:
 
     extra_args = list(args.extra)
 
+    refs = []
+    if not args.skip_baseline:
+        refs.append(("baseline", args.baseline))
+    refs.append(("candidate", args.candidate))
+
     print("=" * 72)
     print(f"Model:      {args.model}")
-    print(f"Baseline:   {args.baseline}")
+    if not args.skip_baseline:
+        print(f"Baseline:   {args.baseline}")
     print(f"Candidate:  {args.candidate}")
     print(f"Prompt:     ~{len(prompt)} chars, target {args.prompt_tokens} tokens")
     print(f"Max-tokens: {args.max_tokens}")
@@ -208,8 +220,8 @@ def main() -> int:
         print(f"Extra:      {' '.join(extra_args)}")
     print("=" * 72)
 
-    all_runs = {"baseline": [], "candidate": []}
-    for label, ref in [("baseline", args.baseline), ("candidate", args.candidate)]:
+    all_runs = {label: [] for label, _ in refs}
+    for label, ref in refs:
         print(f"\n[{label}] {ref}")
         for i in range(args.runs):
             tag = "warmup" if i == 0 else f"run {i}"
@@ -231,18 +243,18 @@ def main() -> int:
             if i > 0:
                 all_runs[label].append(r)
 
-    base = summarize(all_runs["baseline"], "baseline")
-    cand = summarize(all_runs["candidate"], "candidate")
+    summaries = {label: summarize(all_runs[label], label) for label, _ in refs}
+    cand = summaries["candidate"]
 
     print("\n" + "=" * 72)
     print("Summary (mean over measured runs)")
     print("-" * 72)
-    print(fmt_row("baseline", base))
-    print(fmt_row("candidate", cand))
+    for label, _ in refs:
+        print(fmt_row(label, summaries[label]))
     print("-" * 72)
-    if base["prompt_tokens"] < 2048:
+    if cand["prompt_tokens"] < 2048:
         print(
-            f"NOTE: prompt was {base['prompt_tokens']} tokens. The DSA indexer "
+            f"NOTE: prompt was {cand['prompt_tokens']} tokens. The DSA indexer "
             "only triggers above index_topk (~2048). For decode-path signal, "
             "increase --prompt-tokens or pass --prompt-file."
         )
@@ -252,33 +264,35 @@ def main() -> int:
             return float("nan")
         return (b - a) / a * 100.0
 
-    d_prefill = delta(base["prompt_tps"]["mean"], cand["prompt_tps"]["mean"])
-    d_decode = delta(base["gen_tps"]["mean"], cand["gen_tps"]["mean"])
-    d_peak = delta(base["peak_gb"]["mean"], cand["peak_gb"]["mean"])
-    print(
-        f"delta      prefill {d_prefill:+6.2f}%      "
-        f"decode {d_decode:+6.2f}%        peak {d_peak:+6.2f}%"
-    )
+    deltas = None
+    if not args.skip_baseline:
+        base = summaries["baseline"]
+        deltas = {
+            "prefill_tps": delta(base["prompt_tps"]["mean"], cand["prompt_tps"]["mean"]),
+            "decode_tps": delta(base["gen_tps"]["mean"], cand["gen_tps"]["mean"]),
+            "peak_gb": delta(base["peak_gb"]["mean"], cand["peak_gb"]["mean"]),
+        }
+        print(
+            f"delta      prefill {deltas['prefill_tps']:+6.2f}%      "
+            f"decode {deltas['decode_tps']:+6.2f}%        "
+            f"peak {deltas['peak_gb']:+6.2f}%"
+        )
     print("=" * 72)
 
     if args.json_out:
-        args.json_out.write_text(
-            json.dumps(
-                {
-                    "model": args.model,
-                    "prompt_tokens": base["prompt_tokens"],
-                    "max_tokens": args.max_tokens,
-                    "baseline": {"summary": base, "runs": all_runs["baseline"]},
-                    "candidate": {"summary": cand, "runs": all_runs["candidate"]},
-                    "delta_pct": {
-                        "prefill_tps": d_prefill,
-                        "decode_tps": d_decode,
-                        "peak_gb": d_peak,
-                    },
-                },
-                indent=2,
-            )
-        )
+        payload = {
+            "model": args.model,
+            "prompt_tokens": cand["prompt_tokens"],
+            "max_tokens": args.max_tokens,
+            "candidate": {"summary": cand, "runs": all_runs["candidate"]},
+        }
+        if not args.skip_baseline:
+            payload["baseline"] = {
+                "summary": summaries["baseline"],
+                "runs": all_runs["baseline"],
+            }
+            payload["delta_pct"] = deltas
+        args.json_out.write_text(json.dumps(payload, indent=2))
         print(f"Wrote {args.json_out}")
 
     return 0
