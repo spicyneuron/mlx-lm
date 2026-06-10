@@ -127,7 +127,9 @@ def _expert_select(
     logits = logits.astype(mx.float32)
     scores = _score_func(logits, scoring_func)
     biased = scores + e_score_correction_bias
-    inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.argpartition(-biased, kth=top_k - 1, axis=-1)[..., :top_k].astype(
+        mx.int32
+    )
     weights = mx.take_along_axis(scores, inds, axis=-1)
     if scoring_func != "softmax" and norm_topk_prob:
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
@@ -479,6 +481,7 @@ class DeepseekV4MoE(nn.Module):
         self.shared_experts = DeepseekV4MLP(
             config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            swiglu_limit=config.swiglu_limit,
         )
         self.sharding_group = None
 

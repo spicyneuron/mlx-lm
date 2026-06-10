@@ -1591,6 +1591,17 @@ class TestModels(unittest.TestCase):
             pool_cache.update_and_fetch(mx.zeros((1, pooled_len, 1)))
             self.assertTrue(mx.array_equal(pool_cache.make_mask(seq_len), expected))
 
+        logits = mx.array([[[0.1, 0.3, 0.2]]])
+        correction = mx.zeros((3,), dtype=mx.float32)
+        inds, _ = deepseek_v4._expert_select(logits, correction, 2, 1.0, True, "sigmoid")
+        self.assertEqual(inds.dtype, mx.int32)
+
+        tid2eid = mx.array([[[0, 1]]], dtype=mx.int32).reshape(1, 2)
+        inds, _ = deepseek_v4._hash_expert_select(
+            mx.array([[0]], dtype=mx.int32), logits, tid2eid, 1.0, True, "sigmoid"
+        )
+        self.assertEqual(inds.dtype, mx.int32)
+
         def tiny_args(ratio, index_topk=4):
             return deepseek_v4.ModelArgs(
                 model_type="deepseek_v4",
@@ -1696,6 +1707,13 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(seen["kv_len"], 4)
         self.assertEqual(seen["mask"].shape[-1], 4)
+
+        # Shared experts use the same clipped SwiGLU as routed experts.
+        args_moe = tiny_args(0)
+        self.assertEqual(
+            deepseek_v4.DeepseekV4MoE(args_moe, 0).shared_experts.swiglu_limit,
+            args_moe.swiglu_limit,
+        )
 
         # Model test
         args = deepseek_v4.ModelArgs(
