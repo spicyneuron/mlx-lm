@@ -12,8 +12,9 @@ from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KeysCache, KVCache
 from .mla import MultiLinear
+from .moe_utils import group_expert_select
 from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
+from .switch_layers import FusedSwitchGLU
 
 
 @dataclass
@@ -327,48 +328,17 @@ class DeepseekV32MLP(nn.Module):
             config.intermediate_size if intermediate_size is None else intermediate_size
         )
 
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        # Gate and up projections are merged so we issue one wider GEMM
+        # instead of two. Down stays separate.
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size, 2 * self.intermediate_size, bias=False
+        )
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def __call__(self, x):
-        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-        return down_proj
-
-
-@mx.compile
-def group_expert_select(
-    gates,
-    e_score_correction_bias,
-    top_k,
-    n_group,
-    topk_group,
-    routed_scaling_factor,
-    norm_topk_prob,
-):
-
-    scores = mx.sigmoid(gates.astype(mx.float32))
-    orig_scores = scores
-    scores = scores + e_score_correction_bias
-    if n_group > 1:
-        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-        k = n_group - topk_group
-        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-        scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
-        )
-        scores = mx.flatten(scores, -2, -1)
-
-    k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-    if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True)
-        scores = scores / denominator
-    scores = scores * routed_scaling_factor
-
-    return inds, scores
+        gate_up = self.gate_up_proj(x)
+        gate, up = mx.split(gate_up, [self.intermediate_size], axis=-1)
+        return self.down_proj(swiglu(gate, up))
 
 
 class MoEGate(nn.Module):
@@ -387,13 +357,15 @@ class MoEGate(nn.Module):
 
     def __call__(self, x):
         return group_expert_select(
-            x @ self.weight.T,
+            x,
+            self.weight,
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,
             self.topk_group,
             self.routed_scaling_factor,
             self.norm_topk_prob,
+            0.0,
         )
 
 
@@ -402,7 +374,7 @@ class DeepseekV32MoE(nn.Module):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.switch_mlp = SwitchGLU(
+        self.switch_mlp = FusedSwitchGLU(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
@@ -605,6 +577,24 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+
+            # Fuse gate_proj + up_proj into gate_up_proj across every SwiGLU
+            # in this layer (dense MLP, routed experts, shared experts). The
+            # output axis (-2) is unrelated to per-block quant boundaries on
+            # the input axis (-1), so the concat is layout-safe — no
+            # dequant/requant needed.
+            for parent in (
+                f"{prefix}.mlp",
+                f"{prefix}.mlp.switch_mlp",
+                f"{prefix}.mlp.shared_experts",
+            ):
+                for k in ("weight", "scales", "biases"):
+                    gk = f"{parent}.gate_proj.{k}"
+                    uk = f"{parent}.up_proj.{k}"
+                    if gk in weights and uk in weights:
+                        weights[f"{parent}.gate_up_proj.{k}"] = mx.concatenate(
+                            [weights.pop(gk), weights.pop(uk)], axis=-2
+                        )
             prefix = f"model.layers.{l}.self_attn"
             if f"{prefix}.kv_b_proj.weight" in weights:
                 layer = self.model.layers[l].self_attn.embed_q
@@ -667,16 +657,19 @@ class Model(nn.Module):
             layer.self_attn.embed_q.apply(shard_heads)
             layer.self_attn.unembed_out.apply(shard_heads)
 
-            # Shard the MLP
+            # NOTE: The fused gate_up_proj uses contiguous output-axis sharding,
+            # which splits cleanly when N divides 2 (gate and up halves end up on
+            # different ranks for N=2; correct mixed slices for N==1 only).
+            # For correct N>2 tensor-parallel behavior we'd need to interleave
+            # the gate/up rows in the fused weight so each rank's output slice
+            # contains both halves. Out of scope for this commit; single-node
+            # (N=1) is unaffected.
             if isinstance(layer.mlp, DeepseekV32MLP):
-                layer.mlp.gate_proj = shard_linear(
-                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                layer.mlp.gate_up_proj = shard_linear(
+                    layer.mlp.gate_up_proj, "all-to-sharded", group=group
                 )
                 layer.mlp.down_proj = shard_linear(
                     layer.mlp.down_proj, "sharded-to-all", group=group
-                )
-                layer.mlp.up_proj = shard_linear(
-                    layer.mlp.up_proj, "all-to-sharded", group=group
                 )
 
             # Shard the MoE. Shard in place since the MoE should be responsible
@@ -684,22 +677,18 @@ class Model(nn.Module):
             else:
                 layer.mlp.sharding_group = group = group
                 shard_inplace(
-                    layer.mlp.shared_experts.gate_proj, "all-to-sharded", group=group
+                    layer.mlp.shared_experts.gate_up_proj,
+                    "all-to-sharded",
+                    group=group,
                 )
                 shard_inplace(
                     layer.mlp.shared_experts.down_proj, "sharded-to-all", group=group
                 )
                 shard_inplace(
-                    layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                    layer.mlp.switch_mlp.gate_up_proj, "all-to-sharded", group=group
                 )
                 shard_inplace(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
 
     @property

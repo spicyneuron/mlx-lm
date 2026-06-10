@@ -11,6 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .mla import MultiLinear
+from .moe_utils import group_expert_select
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -194,40 +195,6 @@ class Glm4MoeLiteMLP(nn.Module):
         return down_proj
 
 
-@mx.compile
-def group_expert_select(
-    gates,
-    e_score_correction_bias,
-    top_k,
-    n_group,
-    topk_group,
-    routed_scaling_factor,
-    norm_topk_prob,
-):
-    scores = mx.sigmoid(gates.astype(mx.float32))
-    orig_scores = scores
-    scores = scores + e_score_correction_bias
-    if n_group > 1:
-        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-        k = n_group - topk_group
-        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-        scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
-        )
-        scores = mx.flatten(scores, -2, -1)
-
-    k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-    if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True)
-        scores = scores / (denominator + 1e-20)
-    scores = scores * routed_scaling_factor
-
-    return inds, scores
-
-
 class MoEGate(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -243,14 +210,17 @@ class MoEGate(nn.Module):
         assert config.topk_method == "noaux_tc", "Unsupported topk method."
 
     def __call__(self, x):
+        # Lite variant preserves its previous +1e-20 denominator guard.
         return group_expert_select(
-            x @ self.weight.T,
+            x,
+            self.weight,
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,
             self.topk_group,
             self.routed_scaling_factor,
             self.norm_topk_prob,
+            1e-20,
         )
 
 

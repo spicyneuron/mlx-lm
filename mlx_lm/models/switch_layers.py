@@ -199,6 +199,57 @@ class SwitchGLU(nn.Module):
         return x.squeeze(-2)
 
 
+class FusedSwitchGLU(nn.Module):
+    """SwiGLU MoE block with `gate_proj` and `up_proj` merged into a single
+    2x-wide `gate_up_proj` SwitchLinear.
+
+    Same compute and same per-token bytes-read as SwitchGLU (the activated
+    experts' gate and up weights are still fully read), but cuts the per-layer
+    SwitchLinear dispatch count from 3 to 2. The win is command-queue overhead
+    on Apple Silicon, which is non-trivial for MoE forwards where each linear
+    is itself small.
+
+    Checkpoints stored with separate `gate_proj` / `up_proj` are stitched at
+    load time by concatenating along the output axis in `sanitize`. No
+    re-quantization required — per-block quant blocks span the input axis, so
+    the output-axis concat doesn't cross any block boundaries.
+    """
+
+    def __init__(
+        self,
+        input_dims: int,
+        hidden_dims: int,
+        num_experts: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.hidden_dims = hidden_dims
+        self.gate_up_proj = SwitchLinear(
+            input_dims, 2 * hidden_dims, num_experts, bias=bias
+        )
+        self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
+
+    def __call__(self, x, indices) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+
+        gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+        gate, up = mx.split(gate_up, [self.hidden_dims], axis=-1)
+        x = self.down_proj(swiglu(gate, up), idx, sorted_indices=do_sort)
+
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+
+        return x.squeeze(-2)
+
+
 class SwitchMLP(nn.Module):
     def __init__(
         self,
