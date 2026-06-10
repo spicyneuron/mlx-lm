@@ -15,6 +15,7 @@ from mlx_lm.models.cache import (
     CacheList,
     DeepseekV4PoolingCache,
     KVCache,
+    PoolingCache,
     RotatingKVCache,
     load_prompt_cache,
     make_prompt_cache,
@@ -1576,6 +1577,125 @@ class TestModels(unittest.TestCase):
         self.assertTrue(
             mx.array_equal(extracted.pooled, mx.array([[[1.0], [1.0], [3.0]]]))
         )
+        # Stateless pooled masks match the cache-backed causal condition:
+        # query t can see compressed entry i iff i < (t + 1) // ratio.
+        for ratio, seq_len in ((128, 256), (4, 12)):
+            pooled_len = seq_len // ratio
+            expected = mx.arange(pooled_len)[None] < (
+                mx.arange(1, seq_len + 1)[:, None] // ratio
+            )
+            actual = deepseek_v4._pooled_mask(seq_len, pooled_len, ratio)
+            self.assertTrue(mx.array_equal(actual, expected))
+
+            pool_cache = PoolingCache(ratio)
+            pool_cache.update_and_fetch(mx.zeros((1, pooled_len, 1)))
+            self.assertTrue(mx.array_equal(pool_cache.make_mask(seq_len), expected))
+
+        def tiny_args(ratio, index_topk=4):
+            return deepseek_v4.ModelArgs(
+                model_type="deepseek_v4",
+                vocab_size=32,
+                hidden_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                q_lora_rank=8,
+                o_lora_rank=8,
+                o_groups=1,
+                head_dim=8,
+                qk_rope_head_dim=4,
+                sliding_window=8,
+                compress_ratios=[ratio],
+                index_n_heads=2,
+                index_head_dim=4,
+                index_topk=index_topk,
+                moe_intermediate_size=8,
+                n_routed_experts=2,
+                n_shared_experts=1,
+                num_experts_per_tok=1,
+                num_hash_layers=0,
+                hc_mult=2,
+                hc_sinkhorn_iters=2,
+            )
+
+        def capture_sdpa(attn, x, mask, cache=None):
+            seen = {}
+            orig = deepseek_v4.scaled_dot_product_attention
+
+            def fake_sdpa(q, k, v, cache, scale, mask, sinks=None):
+                seen["mask"] = mask
+                seen["kv_len"] = k.shape[2]
+                return mx.zeros_like(q)
+
+            try:
+                deepseek_v4.scaled_dot_product_attention = fake_sdpa
+                attn(x, mask=mask, cache=cache)
+            finally:
+                deepseek_v4.scaled_dot_product_attention = orig
+            return seen
+
+        # HCA stateless attention must not expose compressed future windows.
+        args_hca = tiny_args(128)
+        attn_hca = deepseek_v4.CompressedAttention(args_hca, 0)
+        x_hca = mx.zeros((1, 256, args_hca.hidden_size))
+        mask_hca = create_causal_mask(256, window_size=args_hca.sliding_window)
+        seen = capture_sdpa(attn_hca, x_hca, mask_hca)
+        self.assertEqual(seen["mask"].shape, (1, 1, 256, 258))
+        self.assertFalse(seen["mask"][0, 0, 0, -2].item())
+        self.assertTrue(seen["mask"][0, 0, 127, -2].item())
+        self.assertFalse(seen["mask"][0, 0, 127, -1].item())
+        self.assertTrue(seen["mask"][0, 0, 255, -1].item())
+
+        # CSA full-compressed fallback uses the same pooled causal mask.
+        args_csa_full = tiny_args(4, index_topk=4)
+        attn_csa_full = deepseek_v4.SparseCompressedAttention(args_csa_full, 0)
+        x_csa = mx.zeros((1, 12, args_csa_full.hidden_size))
+        mask_csa = create_causal_mask(12, window_size=args_csa_full.sliding_window)
+        seen = capture_sdpa(attn_csa_full, x_csa, mask_csa)
+        self.assertEqual(seen["mask"].shape, (1, 1, 12, 15))
+        self.assertFalse(seen["mask"][0, 0, 0, -3].item())
+        self.assertTrue(seen["mask"][0, 0, 3, -3].item())
+        self.assertFalse(seen["mask"][0, 0, 3, -2].item())
+
+        # CSA sparse path carries per-query validity after top-k, including
+        # early queries with fewer valid compressed entries than index_topk.
+        args_csa_sparse = tiny_args(4, index_topk=2)
+        attn_csa_sparse = deepseek_v4.SparseCompressedAttention(args_csa_sparse, 0)
+        seen = {}
+        orig_sparse = deepseek_v4._sparse_pooled_attention
+
+        def fake_sparse(q, local_kv, pooled, topk, local_mask, pooled_mask, scale, sinks):
+            seen["pooled_mask"] = pooled_mask
+            return mx.zeros_like(q)
+
+        try:
+            deepseek_v4._sparse_pooled_attention = fake_sparse
+            attn_csa_sparse(x_csa, mask=mask_csa)
+        finally:
+            deepseek_v4._sparse_pooled_attention = orig_sparse
+
+        self.assertIsNotNone(seen["pooled_mask"])
+        self.assertEqual(seen["pooled_mask"].shape, (1, 1, 12, 2))
+        self.assertEqual(seen["pooled_mask"][0, 0, 0].sum().item(), 0)
+        self.assertEqual(seen["pooled_mask"][0, 0, 3].sum().item(), 1)
+
+        # Local masks are aligned to the actual rotating-cache KV length.
+        args_local = tiny_args(0)
+        attn_local = deepseek_v4.LocalAttention(args_local, 0)
+        local_cache = RotatingKVCache(max_size=4)
+        local_cache.update_and_fetch(
+            mx.zeros((1, 1, 8, args_local.head_dim)),
+            mx.zeros((1, 1, 8, 0)),
+        )
+        stale_mask = mx.ones((1, 6), dtype=mx.bool_)
+        seen = capture_sdpa(
+            attn_local,
+            mx.zeros((1, 1, args_local.hidden_size)),
+            stale_mask,
+            local_cache,
+        )
+        self.assertEqual(seen["kv_len"], 4)
+        self.assertEqual(seen["mask"].shape[-1], 4)
 
         # Model test
         args = deepseek_v4.ModelArgs(
