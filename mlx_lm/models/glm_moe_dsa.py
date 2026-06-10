@@ -42,6 +42,8 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
+    quantization: Dict = None
+    fuse_indexer_projections: bool = True
     # See deepseek_v32.ModelArgs for semantics.
     indexer_types: Optional[list] = None
     index_topk_freq: int = 1

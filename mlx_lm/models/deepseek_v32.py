@@ -50,7 +50,9 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
+    quantization: Dict = None
     attention_bias: bool = False
+    fuse_indexer_projections: bool = True
     # Per-layer indexer mode ("full" or "shared"). "shared" layers reuse the
     # previous "full" layer's top-k indices, skipping the indexer entirely.
     # When unset, derived from index_topk_freq / index_skip_topk_offset, matching
@@ -112,12 +114,16 @@ class Indexer(nn.Module):
         qr: mx.array,
         mask: Optional[mx.array],
         cache: Optional[Any] = None,
+        q: Optional[mx.array] = None,
+        k: Optional[mx.array] = None,
     ):
         # Computes top_k indices for attention
         b, s, _ = x.shape
-        q = self.wq_b(qr)
+        if q is None:
+            q = self.wq_b(qr)
+        if k is None:
+            k = self.wk(x)
         q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
-        k = self.wk(x)
         k = self.k_norm(k)
         k = mx.reshape(k, (b, 1, s, self.head_dim))
 
@@ -169,6 +175,13 @@ class DeepseekV32Attention(nn.Module):
             and layer_idx + 1 < len(types)
             and types[layer_idx + 1] == "shared"
         )
+        self.q_proj_dims = self.num_heads * self.q_head_dim
+        self.kv_proj_dims = self.kv_lora_rank + self.qk_rope_head_dim
+        self.index_q_dims = (
+            0 if self.skip_topk else config.index_n_heads * config.index_head_dim
+        )
+        self.index_k_dims = 0 if self.skip_topk else config.index_head_dim
+        self.fused_indexer_projections = False
 
         self.scale = self.q_head_dim**-0.5
 
@@ -177,12 +190,12 @@ class DeepseekV32Attention(nn.Module):
         )
         self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
         self.q_b_proj = nn.Linear(
-            self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
+            self.q_lora_rank, self.q_proj_dims, bias=False
         )
 
         self.kv_a_proj_with_mqa = nn.Linear(
             self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.kv_proj_dims,
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
@@ -216,6 +229,38 @@ class DeepseekV32Attention(nn.Module):
             scaling_config=self.config.rope_scaling,
         )
 
+    def fuse_indexer_projections(self):
+        if self.indexer is None or self.fused_indexer_projections:
+            return
+        self.q_b_proj = nn.Linear(
+            self.q_lora_rank, self.q_proj_dims + self.index_q_dims, bias=False
+        )
+        self.kv_a_proj_with_mqa = nn.Linear(
+            self.hidden_size,
+            self.kv_proj_dims + self.index_k_dims,
+            bias=self.config.attention_bias,
+        )
+        del self.indexer.wq_b
+        del self.indexer.wk
+        self.fused_indexer_projections = True
+
+    def unfuse_indexer_projections(self):
+        if self.indexer is None or not self.fused_indexer_projections:
+            return
+        self.indexer.wq_b = _slice_linear_output(
+            self.q_b_proj, self.q_proj_dims, self.q_proj_dims + self.index_q_dims
+        )
+        self.q_b_proj = _slice_linear_output(self.q_b_proj, 0, self.q_proj_dims)
+        self.indexer.wk = _slice_linear_output(
+            self.kv_a_proj_with_mqa,
+            self.kv_proj_dims,
+            self.kv_proj_dims + self.index_k_dims,
+        )
+        self.kv_a_proj_with_mqa = _slice_linear_output(
+            self.kv_a_proj_with_mqa, 0, self.kv_proj_dims
+        )
+        self.fused_indexer_projections = False
+
     def __call__(
         self,
         x: mx.array,
@@ -227,10 +272,20 @@ class DeepseekV32Attention(nn.Module):
 
         qr = self.q_a_layernorm(self.q_a_proj(x))
         q = self.q_b_proj(qr)
+        if not self.fused_indexer_projections:
+            index_q = None
+        else:
+            q, index_q = mx.split(q, [self.q_proj_dims], axis=-1)
 
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
         compressed_kv = self.kv_a_proj_with_mqa(x)
+        if not self.fused_indexer_projections:
+            index_k = None
+        else:
+            compressed_kv, index_k = mx.split(
+                compressed_kv, [self.kv_proj_dims], axis=-1
+            )
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
         kv_latent = self.kv_a_layernorm(compressed_kv)
@@ -255,7 +310,9 @@ class DeepseekV32Attention(nn.Module):
             # layer marked "shared") is caught in ModelArgs.__post_init__.
             topk_indices = prev_topk_indices
         else:
-            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+            topk_indices = self.indexer(
+                x, qr, mask, cache=cache[1], q=index_q, k=index_k
+            )
         if topk_indices is not None:
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
@@ -512,6 +569,88 @@ class DeepseekV32Model(nn.Module):
         return self.norm(h)
 
 
+def _concat_output(a, b):
+    axis = -2 if a.ndim > 1 else 0
+    return mx.concatenate([a, b], axis=axis)
+
+
+def _same_output_layout(weights, dst, src):
+    if f"{dst}.weight" not in weights or f"{src}.weight" not in weights:
+        return False
+    quant_keys = ("scales", "biases")
+    for k in quant_keys:
+        if (f"{dst}.{k}" in weights) != (f"{src}.{k}" in weights):
+            return False
+    for k in ("weight", *quant_keys):
+        dk = f"{dst}.{k}"
+        sk = f"{src}.{k}"
+        if dk not in weights and sk not in weights:
+            continue
+        if weights[dk].shape[1:] != weights[sk].shape[1:]:
+            return False
+    return True
+
+
+def _same_quant_config(quantization, dst, src):
+    if not quantization:
+        return True
+    base = {
+        k: quantization[k]
+        for k in ("group_size", "bits", "mode")
+        if k in quantization
+    }
+
+    def effective(name):
+        return {**base, **quantization.get(name, {})}
+
+    return effective(dst) == effective(src)
+
+
+def _fuse_output_projection(weights, dst, src):
+    for k in ("weight", "scales", "biases"):
+        dk = f"{dst}.{k}"
+        sk = f"{src}.{k}"
+        if dk in weights and sk in weights:
+            weights[dk] = _concat_output(weights[dk], weights.pop(sk))
+
+    db = f"{dst}.bias"
+    sb = f"{src}.bias"
+    if sb in weights:
+        weights[db] = (
+            _concat_output(weights[db], weights.pop(sb))
+            if db in weights
+            else weights.pop(sb)
+        )
+    elif db in weights:
+        src_rows = weights[f"{dst}.weight"].shape[-2] - weights[db].shape[0]
+        weights[db] = mx.concatenate(
+            [weights[db], mx.zeros((src_rows,), dtype=weights[db].dtype)]
+        )
+
+
+def _slice_linear_output(module, start, end):
+    out_dims = end - start
+    if isinstance(module, nn.Linear):
+        new = nn.Linear(module.weight.shape[1], out_dims, bias="bias" in module)
+    else:
+        input_dims = module.weight.shape[1] * 32 // module.bits
+        new = nn.QuantizedLinear(
+            input_dims,
+            out_dims,
+            bias="bias" in module,
+            group_size=module.group_size,
+            bits=module.bits,
+            mode=module.mode,
+        )
+        new.scales = module.scales[start:end]
+        if module.get("biases") is not None:
+            new.biases = module.biases[start:end]
+    new.weight = module.weight[start:end]
+    if "bias" in module:
+        new.bias = module.bias[start:end]
+    return new
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -602,6 +741,28 @@ class Model(nn.Module):
                             mx.stack([g, u], axis=-2), -3, -2
                         )
             prefix = f"model.layers.{l}.self_attn"
+            # Fuse indexer projections into same-input, same-layout attention
+            # projections. This is only safe when quantization metadata matches
+            # exactly (same bit-width / group layout) or both sides are raw. If
+            # not, keep the original standalone indexer projections.
+            attn = self.model.layers[l].self_attn
+            q_dst = f"{prefix}.q_b_proj"
+            q_src = f"{prefix}.indexer.wq_b"
+            kv_dst = f"{prefix}.kv_a_proj_with_mqa"
+            kv_src = f"{prefix}.indexer.wk"
+            can_fuse_indexer = (
+                self.args.fuse_indexer_projections
+                and attn.indexer is not None
+                and _same_quant_config(self.args.quantization, q_dst, q_src)
+                and _same_quant_config(self.args.quantization, kv_dst, kv_src)
+                and _same_output_layout(weights, q_dst, q_src)
+                and _same_output_layout(weights, kv_dst, kv_src)
+            )
+            if can_fuse_indexer:
+                attn.fuse_indexer_projections()
+                _fuse_output_projection(weights, q_dst, q_src)
+                _fuse_output_projection(weights, kv_dst, kv_src)
+
             if f"{prefix}.kv_b_proj.weight" in weights:
                 layer = self.model.layers[l].self_attn.embed_q
                 quantized = f"{prefix}.kv_b_proj.scales" in weights
@@ -645,6 +806,11 @@ class Model(nn.Module):
         N = group.size()
         rank = group.rank()
         for layer in self.model.layers:
+            # Fused indexer rows are appended to q_b / kv_a for single-device
+            # inference. Tensor parallel expects q_b's output rows to be only
+            # attention heads and keeps the indexer replicated, so restore the
+            # original layout before sharding.
+            layer.self_attn.unfuse_indexer_projections()
             layer.self_attn.q_b_proj = shard_linear(
                 layer.self_attn.q_b_proj, "all-to-sharded", group=group
             )
