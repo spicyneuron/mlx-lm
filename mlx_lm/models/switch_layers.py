@@ -209,10 +209,13 @@ class FusedSwitchGLU(nn.Module):
     on Apple Silicon, which is non-trivial for MoE forwards where each linear
     is itself small.
 
-    Checkpoints stored with separate `gate_proj` / `up_proj` are stitched at
-    load time by concatenating along the output axis in `sanitize`. No
-    re-quantization required — per-block quant blocks span the input axis, so
-    the output-axis concat doesn't cross any block boundaries.
+    Weight layout: output rows are interleaved as
+    ``[gate_0, up_0, gate_1, up_1, ...]`` instead of ``[gate_0..H-1, up_0..H-1]``.
+    This keeps gate/up paired under contiguous output-axis tensor-parallel
+    sharding (one matched pair per row index), so a rank's local slice always
+    contains balanced halves. The forward deinterleaves with ``unflatten``
+    before SwiGLU. Per-block quantization lives on the input axis, so the
+    output-axis permutation is layout-safe — no re-quantization required.
     """
 
     def __init__(
@@ -223,7 +226,6 @@ class FusedSwitchGLU(nn.Module):
         bias: bool = False,
     ):
         super().__init__()
-        self.hidden_dims = hidden_dims
         self.gate_up_proj = SwitchLinear(
             input_dims, 2 * hidden_dims, num_experts, bias=bias
         )
@@ -240,9 +242,16 @@ class FusedSwitchGLU(nn.Module):
         if self.training:
             idx = mx.stop_gradient(idx)
 
-        gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
-        gate, up = mx.split(gate_up, [self.hidden_dims], axis=-1)
-        x = self.down_proj(swiglu(gate, up), idx, sorted_indices=do_sort)
+        gate_up = mx.unflatten(
+            self.gate_up_proj(x, idx, sorted_indices=do_sort),
+            axis=-1,
+            shape=(-1, 2),
+        )
+        x = self.down_proj(
+            swiglu(gate_up[..., 0], gate_up[..., 1]),
+            idx,
+            sorted_indices=do_sort,
+        )
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)

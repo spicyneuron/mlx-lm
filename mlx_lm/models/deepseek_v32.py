@@ -336,9 +336,11 @@ class DeepseekV32MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def __call__(self, x):
-        gate_up = self.gate_up_proj(x)
-        gate, up = mx.split(gate_up, [self.intermediate_size], axis=-1)
-        return self.down_proj(swiglu(gate, up))
+        # Interleaved output layout: rows [gate_0, up_0, gate_1, up_1, ...].
+        # Unflatten + index extracts each half as a stride-2 view; SwiGLU is
+        # elementwise so the strides cost nothing.
+        gate_up = mx.unflatten(self.gate_up_proj(x), axis=-1, shape=(-1, 2))
+        return self.down_proj(swiglu(gate_up[..., 0], gate_up[..., 1]))
 
 
 class MoEGate(nn.Module):
@@ -579,10 +581,12 @@ class Model(nn.Module):
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
 
             # Fuse gate_proj + up_proj into gate_up_proj across every SwiGLU
-            # in this layer (dense MLP, routed experts, shared experts). The
-            # output axis (-2) is unrelated to per-block quant boundaries on
-            # the input axis (-1), so the concat is layout-safe — no
-            # dequant/requant needed.
+            # in this layer (dense MLP, routed experts, shared experts) with
+            # an *interleaved* output-axis layout — pair (gate_i, up_i) at
+            # rows (2i, 2i+1). This keeps gate/up paired under contiguous
+            # output-axis tensor-parallel sharding. Per-block quant blocks
+            # span the input axis (-1), so the output-axis permutation is
+            # layout-safe — no dequant/requant needed.
             for parent in (
                 f"{prefix}.mlp",
                 f"{prefix}.mlp.switch_mlp",
@@ -592,8 +596,10 @@ class Model(nn.Module):
                     gk = f"{parent}.gate_proj.{k}"
                     uk = f"{parent}.up_proj.{k}"
                     if gk in weights and uk in weights:
-                        weights[f"{parent}.gate_up_proj.{k}"] = mx.concatenate(
-                            [weights.pop(gk), weights.pop(uk)], axis=-2
+                        g = weights.pop(gk)
+                        u = weights.pop(uk)
+                        weights[f"{parent}.gate_up_proj.{k}"] = mx.flatten(
+                            mx.stack([g, u], axis=-2), -3, -2
                         )
             prefix = f"model.layers.{l}.self_attn"
             if f"{prefix}.kv_b_proj.weight" in weights:
@@ -657,13 +663,10 @@ class Model(nn.Module):
             layer.self_attn.embed_q.apply(shard_heads)
             layer.self_attn.unembed_out.apply(shard_heads)
 
-            # NOTE: The fused gate_up_proj uses contiguous output-axis sharding,
-            # which splits cleanly when N divides 2 (gate and up halves end up on
-            # different ranks for N=2; correct mixed slices for N==1 only).
-            # For correct N>2 tensor-parallel behavior we'd need to interleave
-            # the gate/up rows in the fused weight so each rank's output slice
-            # contains both halves. Out of scope for this commit; single-node
-            # (N=1) is unaffected.
+            # gate_up_proj's interleaved row layout keeps (gate_i, up_i) pairs
+            # adjacent, so contiguous output-axis sharding gives each rank a
+            # balanced slice of both halves. Requires 2*intermediate_size to be
+            # divisible by N (always true for the common power-of-two configs).
             if isinstance(layer.mlp, DeepseekV32MLP):
                 layer.mlp.gate_up_proj = shard_linear(
                     layer.mlp.gate_up_proj, "all-to-sharded", group=group
