@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import tempfile
 import unittest
 
 import mlx.core as mx
@@ -9,7 +10,16 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    BatchDeepseekV4PoolingCache,
+    CacheList,
+    DeepseekV4PoolingCache,
+    KVCache,
+    RotatingKVCache,
+    load_prompt_cache,
+    make_prompt_cache,
+    save_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -1496,6 +1506,77 @@ class TestModels(unittest.TestCase):
         actual = hc_expand(block_out, residual, post, comb)
         self.assertTrue(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5))
 
+        # CSA compression needs the prior Ca slice across cached chunks.
+        ratio = 4
+        head_dim = 8
+        kv = mx.arange(1 * 12 * head_dim * 2, dtype=mx.float32).reshape(
+            1, 12, head_dim * 2
+        )
+        mx.random.seed(0)
+        gate = mx.random.normal(kv.shape) * 0.5
+        ape = mx.random.normal((ratio, head_dim * 2)) * 0.5
+
+        def csa_compress(kv_chunks, gate_chunks, roundtrip_after=None):
+            cache = DeepseekV4PoolingCache(ratio)
+            chunks = []
+            offset = 0
+            for i, (kv_chunk, gate_chunk) in enumerate(zip(kv_chunks, gate_chunks)):
+                ready_kv, ready_gate, _ = cache.accumulate_windows(
+                    kv_chunk, gate_chunk, offset
+                )
+                offset += kv_chunk.shape[1]
+                if ready_kv.shape[1] == 0:
+                    continue
+                ready_kv = mx.unflatten(ready_kv, 1, (-1, ratio))
+                ready_gate = mx.unflatten(ready_gate, 1, (-1, ratio))
+                prior_kv, prior_gate = cache.update_overlap_state(
+                    ready_kv, ready_gate
+                )
+                chunk = deepseek_v4._overlap_compress_kv(
+                    ready_kv,
+                    ready_gate,
+                    ape,
+                    head_dim,
+                    prior_kv,
+                    prior_gate,
+                )
+                cache.update_and_fetch(chunk)
+                chunks.append(chunk)
+                if i == roundtrip_after:
+                    with tempfile.TemporaryDirectory() as d:
+                        path = f"{d}/cache.safetensors"
+                        save_prompt_cache(path, [CacheList(cache)])
+                        cache = load_prompt_cache(path)[0][0]
+                        self.assertIsInstance(cache, DeepseekV4PoolingCache)
+            return mx.concatenate(chunks, axis=1)
+
+        full = csa_compress([kv], [gate])
+        for roundtrip_after in (0, 1):
+            chunked = csa_compress(
+                [kv[:, :5], kv[:, 5:9], kv[:, 9:]],
+                [gate[:, :5], gate[:, 5:9], gate[:, 9:]],
+                roundtrip_after=roundtrip_after,
+            )
+            self.assertTrue(mx.allclose(chunked, full, rtol=1e-6, atol=1e-6))
+
+        single_a = DeepseekV4PoolingCache(ratio)
+        single_b = DeepseekV4PoolingCache(ratio)
+        single_a.overlap_kv = mx.ones((1, ratio, head_dim), dtype=mx.float32)
+        single_a.overlap_gate = mx.zeros((1, ratio, head_dim), dtype=mx.float32)
+        merged = DeepseekV4PoolingCache.merge([single_a, single_b])
+        self.assertIsInstance(merged, BatchDeepseekV4PoolingCache)
+        self.assertEqual(merged.overlap_kv.shape, (2, ratio, head_dim))
+        self.assertTrue(mx.allclose(merged.overlap_kv[0], single_a.overlap_kv[0]))
+        self.assertTrue((merged.overlap_kv[1] == 0).all().item())
+
+        single_a.update_and_fetch(mx.ones((1, 2, 1)))
+        single_b.update_and_fetch(mx.ones((1, 1, 1)) * 2)
+        extracted = DeepseekV4PoolingCache.merge([single_a, single_b]).extract(0)
+        extracted.update_and_fetch(mx.ones((1, 1, 1)) * 3)
+        self.assertTrue(
+            mx.array_equal(extracted.pooled, mx.array([[[1.0], [1.0], [3.0]]]))
+        )
+
         # Model test
         args = deepseek_v4.ModelArgs(
             model_type="deepseek_v4",
@@ -1510,7 +1591,7 @@ class TestModels(unittest.TestCase):
             head_dim=16,
             qk_rope_head_dim=4,
             sliding_window=16,
-            compress_ratios=[0, 0, 4, 0],
+            compress_ratios=[0, 4, 128, 0],
             index_n_heads=4,
             index_head_dim=8,
             index_topk=4,
@@ -1523,6 +1604,56 @@ class TestModels(unittest.TestCase):
             hc_sinkhorn_iters=2,
         )
         model = deepseek_v4.Model(args)
+
+        # Prompt-cache reuse must be equivalent to pre-filling the same tokens
+        # from scratch, including across CSA and HCA compression boundaries.
+        tokens = mx.array(
+            [[i % args.vocab_size for i in range(144)]],
+            dtype=mx.int32,
+        )
+        for split in (8, 17, 128, 132):
+            full_cache = model.make_cache()
+            full = model(tokens, cache=full_cache)
+
+            split_cache = model.make_cache()
+            prefix = model(tokens[:, :split], cache=split_cache)
+            mx.eval(prefix, [c.state for c in split_cache])
+            rest = model(tokens[:, split:], cache=copy.deepcopy(split_cache))
+            mx.eval(full, rest)
+
+            self.assertTrue(
+                mx.allclose(full[:, split:], rest, rtol=1e-4, atol=1e-4),
+                f"DeepSeek V4 cache reuse diverged at split={split}",
+            )
+
+        from mlx_lm.generate import BatchGenerator
+
+        # Server batching extracts prompt caches both at segmented prompt
+        # boundaries and when generation finishes.
+        batch_gen = BatchGenerator(
+            model,
+            max_tokens=1,
+            completion_batch_size=2,
+            prefill_batch_size=2,
+            prefill_step_size=16,
+        )
+        batch_gen.insert([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+        responses = batch_gen.next_generated()
+        self.assertEqual(len(responses), 2)
+        self.assertTrue(all(r.prompt_cache is not None for r in responses))
+
+        batch_gen = BatchGenerator(
+            model,
+            max_tokens=1,
+            completion_batch_size=1,
+            prefill_batch_size=1,
+            prefill_step_size=16,
+        )
+        uid = batch_gen.insert_segments([[[1, 2, 3, 4], [5, 6, 7, 8]]])[0]
+        prompt_responses, _ = batch_gen.next()
+        self.assertTrue(prompt_responses[0].end_of_segment)
+        self.assertFalse(prompt_responses[0].end_of_prompt)
+        self.assertIn(uid, batch_gen.extract_cache([uid]))
 
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
