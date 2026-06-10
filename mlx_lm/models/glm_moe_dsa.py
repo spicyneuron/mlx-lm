@@ -42,10 +42,25 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
+    # See deepseek_v32.ModelArgs for semantics.
+    indexer_types: Optional[list] = None
+    index_topk_freq: int = 1
+    index_skip_topk_offset: int = 2
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
         self.rope_theta = self.rope_parameters["rope_theta"]
+        if self.indexer_types is None:
+            freq = max(self.index_topk_freq, 1)
+            offset = self.index_skip_topk_offset
+            self.indexer_types = [
+                "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
+                for i in range(self.num_hidden_layers)
+            ]
+        if self.indexer_types and self.indexer_types[0] != "full":
+            raise ValueError(
+                "indexer_types[0] must be 'full' so the chain has a top-k to share."
+            )
 
 
 class Model(DSV32Model):

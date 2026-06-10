@@ -10,7 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache
+from .cache import CacheList, KeysCache, KVCache
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -50,6 +50,35 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    # Per-layer indexer mode ("full" or "shared"). "shared" layers reuse the
+    # previous "full" layer's top-k indices, skipping the indexer entirely.
+    # When unset, derived from index_topk_freq / index_skip_topk_offset, matching
+    # the HF reference (configuration_glm_moe_dsa.py).
+    indexer_types: Optional[list] = None
+    index_topk_freq: int = 1
+    index_skip_topk_offset: int = 2
+
+    def __post_init__(self):
+        if self.indexer_types is None:
+            freq = max(self.index_topk_freq, 1)
+            offset = self.index_skip_topk_offset
+            self.indexer_types = [
+                "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
+                for i in range(self.num_hidden_layers)
+            ]
+        if self.indexer_types and self.indexer_types[0] != "full":
+            raise ValueError(
+                "indexer_types[0] must be 'full' so the chain has a top-k to share."
+            )
+
+
+@mx.compile
+def _indexer_reduce(scores, weights):
+    # Fuses ReLU + per-head weighting + cross-head reduction. This intermediate
+    # (B, H, L, S) tensor is the largest non-matmul tensor in the decode path at
+    # long context; keeping the ReLU/multiply/sum chain in one compiled region
+    # lets MLX tile the reduction without re-materializing it to memory.
+    return (mx.maximum(scores, 0) * weights).sum(axis=1, keepdims=True)
 
 
 class Indexer(nn.Module):
@@ -97,15 +126,13 @@ class Indexer(nn.Module):
         k = self.rope(k, offset=offset)
 
         if cache is not None:
-            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
+            k = cache.update_and_fetch(k)
         if k.shape[2] <= self.index_topk:
             return None
         scores = q @ k.swapaxes(-1, -2)
-        scores = mx.maximum(scores, 0)
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
-        scores = scores * weights
-        scores = scores.sum(axis=1, keepdims=True)
+        scores = _indexer_reduce(scores, weights)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
@@ -114,9 +141,10 @@ class Indexer(nn.Module):
 
 
 class DeepseekV32Attention(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, layer_idx: int = 0):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
@@ -127,6 +155,19 @@ class DeepseekV32Attention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        # "full" layers run the indexer; "shared" layers reuse the previous
+        # full layer's top-k indices (matches HF GLM-DSA reference).
+        types = config.indexer_types
+        self.skip_topk = (
+            types is not None
+            and layer_idx < len(types)
+            and types[layer_idx] == "shared"
+        )
+        self.next_skip_topk = (
+            types is not None
+            and layer_idx + 1 < len(types)
+            and types[layer_idx + 1] == "shared"
+        )
 
         self.scale = self.q_head_dim**-0.5
 
@@ -165,7 +206,7 @@ class DeepseekV32Attention(nn.Module):
                     s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
                     self.scale = self.scale * s * s
 
-        self.indexer = Indexer(config)
+        self.indexer = None if self.skip_topk else Indexer(config)
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
@@ -179,7 +220,8 @@ class DeepseekV32Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
+        prev_topk_indices: Optional[mx.array] = None,
+    ):
         B, L, D = x.shape
 
         qr = self.q_a_layernorm(self.q_a_proj(x))
@@ -203,7 +245,16 @@ class DeepseekV32Attention(nn.Module):
         else:
             cache = [None] * 2
 
-        topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        if self.skip_topk:
+            # Reuse the previous full-indexer layer's selection. Will be None
+            # at pipeline-rank boundaries (the chain doesn't cross ranks); in
+            # that case we fall through to dense attention, which is correct
+            # and matches the existing "sequence shorter than index_topk"
+            # semantics in the full indexer below. Config-level misuse (first
+            # layer marked "shared") is caught in ModelArgs.__post_init__.
+            topk_indices = prev_topk_indices
+        else:
+            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
@@ -229,10 +280,15 @@ class DeepseekV32Attention(nn.Module):
                 if mask is not None:
                     sparse_mask = sparse_mask & mask
                 mask = sparse_mask
-        # Ensure the indexer cache is evaluated even if the topk_indices are unused
-        # to keep the graph from getting too large
-        if cache is not None and cache[0] is not None:
-            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
+        # Ensure the indexer cache is evaluated even when its top-k is unused
+        # this step, to keep the graph from growing across decoding steps.
+        # Shared layers never populate cache[1], so .keys stays None there.
+        if (
+            cache[0] is not None
+            and cache[1] is not None
+            and cache[1].keys is not None
+        ):
+            cache[0].keys = mx.depends(cache[0].keys, cache[1].keys)
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
@@ -256,7 +312,8 @@ class DeepseekV32Attention(nn.Module):
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        next_topk = topk_indices if self.next_skip_topk else None
+        return self.o_proj(output), next_topk
 
 
 class DeepseekV32MLP(nn.Module):
@@ -379,7 +436,7 @@ class DeepseekV32MoE(nn.Module):
 class DeepseekV32DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
-        self.self_attn = DeepseekV32Attention(config)
+        self.self_attn = DeepseekV32Attention(config, layer_idx)
         self.mlp = (
             DeepseekV32MoE(config)
             if (
@@ -399,11 +456,14 @@ class DeepseekV32DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        prev_topk_indices: Optional[mx.array] = None,
+    ):
+        r, next_topk = self.self_attn(
+            self.input_layernorm(x), mask, cache, prev_topk_indices
+        )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        return h + r, next_topk
 
 
 class DeepseekV32Model(nn.Module):
@@ -459,8 +519,11 @@ class DeepseekV32Model(nn.Module):
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
+        prev_topk = None
         for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i])
+            h, prev_topk = self.layers[self.start_idx + i](
+                h, mask, cache[i], prev_topk
+            )
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -651,4 +714,10 @@ class Model(nn.Module):
         return predicate
 
     def make_cache(self):
-        return [CacheList(KVCache(), KVCache()) for _ in self.layers]
+        # Each layer holds a CacheList of (MLA-latent KVCache, indexer KeysCache).
+        # Shared (non-full) layers reuse the prior full layer's top-k indices
+        # and never call update_and_fetch on their own KeysCache, so it stays
+        # at offset=0 with keys=None — effectively free. We still allocate it
+        # to preserve CacheList invariants (state/trim/merge all iterate every
+        # slot and would break on None).
+        return [CacheList(KVCache(), KeysCache()) for _ in self.layers]

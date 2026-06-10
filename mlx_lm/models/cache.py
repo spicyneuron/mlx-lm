@@ -407,6 +407,87 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class KeysCache(_BaseCache):
+    """Append-only cache for a single keys stream (no values).
+
+    Used by sparse-attention indexers (e.g. DeepSeek V3.2 / GLM-DSA) where the
+    indexer scores against a key-only history. Mirrors KVCache's growth and
+    serialization semantics so it composes inside CacheList alongside a regular
+    KVCache.
+    """
+
+    step = 256
+
+    def __init__(self):
+        self.keys = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys):
+        prev = self.offset
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            B, n_heads, _, head_dim = keys.shape
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            new_k = mx.zeros((B, n_heads, n_steps * self.step, head_dim), keys.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+            else:
+                self.keys = new_k
+
+        self.offset += keys.shape[2]
+        self.keys[..., prev : self.offset, :] = keys
+        return self.keys[..., : self.offset, :]
+
+    def size(self):
+        return self.offset
+
+    @property
+    def state(self):
+        if self.keys is None or self.offset == self.keys.shape[2]:
+            return (self.keys,)
+        return (self.keys[..., : self.offset, :],)
+
+    @state.setter
+    def state(self, v):
+        (self.keys,) = v
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        return 0 if self.keys is None else self.keys.nbytes
+
+    # Batch-serving paths (merge/filter/extend) require a batched key-only
+    # cache, which doesn't exist yet. The sparse-attention indexer that uses
+    # this class isn't wired up for batch serving either, so just raise
+    # clearly if a caller stumbles into this path.
+    @classmethod
+    def merge(cls, caches):
+        raise NotImplementedError(
+            "KeysCache does not support batch merging; "
+            "batch serving for sparse-attention indexers is not implemented."
+        )
+
+    def filter(self, batch_indices):
+        raise NotImplementedError(
+            "KeysCache does not support batch filtering."
+        )
+
+    def extend(self, other):
+        raise NotImplementedError("KeysCache does not support batch extension.")
+
+
 class RotatingKVCache(_BaseCache):
     step = 256
 
