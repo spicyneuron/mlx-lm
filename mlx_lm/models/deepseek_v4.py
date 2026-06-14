@@ -356,7 +356,10 @@ def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
     return weights_a, weights_b
 
 
-def _sparse_pooled_attention(
+_SPARSE_ATTN_QUERY_CHUNK = 128
+
+
+def _sparse_pooled_attention_inner(
     q: mx.array,
     local_kv: mx.array,
     pooled: mx.array,
@@ -399,6 +402,54 @@ def _sparse_pooled_attention(
     pw_bl = pooled_weights.transpose(0, 2, 1, 3)
     out = out + (pw_bl @ pooled_sq).transpose(0, 2, 1, 3)
     return out.astype(q.dtype)
+
+
+def _slice_query_mask(mask: Optional[mx.array], start: int, end: int):
+    if mask is None:
+        return None
+    return mask[..., start:end, :]
+
+
+def _sparse_pooled_attention(
+    q: mx.array,
+    local_kv: mx.array,
+    pooled: mx.array,
+    topk: mx.array,
+    local_mask: Optional[mx.array],
+    pooled_mask: Optional[mx.array],
+    scale: float,
+    sinks: Optional[mx.array],
+) -> mx.array:
+    L = q.shape[2]
+    chunk_size = _SPARSE_ATTN_QUERY_CHUNK
+    if L <= chunk_size:
+        return _sparse_pooled_attention_inner(
+            q,
+            local_kv,
+            pooled,
+            topk,
+            local_mask,
+            pooled_mask,
+            scale,
+            sinks,
+        )
+
+    chunks = []
+    for start in range(0, L, chunk_size):
+        end = min(start + chunk_size, L)
+        chunks.append(
+            _sparse_pooled_attention_inner(
+                q[:, :, start:end],
+                local_kv,
+                pooled,
+                topk[:, start:end],
+                _slice_query_mask(local_mask, start, end),
+                _slice_query_mask(pooled_mask, start, end),
+                scale,
+                sinks,
+            )
+        )
+    return mx.concatenate(chunks, axis=2)
 
 
 class MoEGate(nn.Module):
