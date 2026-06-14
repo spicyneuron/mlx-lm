@@ -1,0 +1,30 @@
+{
+  "created_at": "20260614-171026",
+  "host": "m3",
+  "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+  "python": "3.13.11 (main, Dec 17 2025, 20:55:16) [Clang 21.1.4 ]",
+  "model": "284-deepseek-4",
+  "cases": [
+    {
+      "name": "decode_128",
+      "prompt_tokens": 128,
+      "max_tokens": 128
+    },
+    {
+      "name": "csa_2k_decode",
+      "prompt_tokens": 2304,
+      "max_tokens": 128
+    },
+    {
+      "name": "long_8k_decode",
+      "prompt_tokens": 8192,
+      "max_tokens": 128
+    }
+  ],
+  "base": "mlx-lm@git+https://github.com/spicyneuron/mlx-lm@_ds4",
+  "ours": "mlx-lm@git+https://github.com/spicyneuron/mlx-lm@_ds4_perf",
+  "outputs": {
+    "base": "/Volumes/Models/mlx/ds4-ben-runs/skip-indexer-score/base.json",
+    "ours": "/Volumes/Models/mlx/ds4-ben-runs/skip-indexer-score/ours.json"
+  }
+}

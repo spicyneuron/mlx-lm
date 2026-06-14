@@ -1,0 +1,138 @@
+{
+  "label": "mlx-lm@git+https://github.com/spicyneuron/mlx-lm@_ds4",
+  "model": "284-deepseek-4",
+  "load_s": 5.195693709072657,
+  "python": "3.13.11 (main, Dec 17 2025, 20:55:16) [Clang 21.1.4 ]",
+  "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+  "mlx_default_device": "Device(gpu, 0)",
+  "records": [
+    {
+      "case": "decode_128",
+      "prompt_tokens": 128,
+      "generation_tokens": 128,
+      "prompt_tps": 293.56597443160695,
+      "generation_tps": 32.251515792833494,
+      "total_s": 4.468967750086449,
+      "peak_memory_gb": 155.579072564,
+      "finish_reason": "length",
+      "repeat": 0
+    },
+    {
+      "case": "decode_128",
+      "prompt_tokens": 128,
+      "generation_tokens": 128,
+      "prompt_tps": 288.868003457844,
+      "generation_tps": 32.068365409363636,
+      "total_s": 4.498937499942258,
+      "peak_memory_gb": 155.579077072,
+      "finish_reason": "length",
+      "repeat": 1
+    },
+    {
+      "case": "decode_128",
+      "prompt_tokens": 128,
+      "generation_tokens": 128,
+      "prompt_tps": 293.12518392354383,
+      "generation_tps": 32.013401610739095,
+      "total_s": 4.499139666091651,
+      "peak_memory_gb": 155.579077072,
+      "finish_reason": "length",
+      "repeat": 2
+    },
+    {
+      "case": "csa_2k_decode",
+      "prompt_tokens": 2304,
+      "generation_tokens": 128,
+      "prompt_tps": 453.3331645853845,
+      "generation_tps": 29.54371464061549,
+      "total_s": 9.471076457994059,
+      "peak_memory_gb": 157.95561386,
+      "finish_reason": "length",
+      "repeat": 0
+    },
+    {
+      "case": "csa_2k_decode",
+      "prompt_tokens": 2304,
+      "generation_tokens": 128,
+      "prompt_tps": 452.86988974395285,
+      "generation_tps": 29.479759683288503,
+      "total_s": 9.485996374976821,
+      "peak_memory_gb": 157.95561386,
+      "finish_reason": "length",
+      "repeat": 1
+    },
+    {
+      "case": "csa_2k_decode",
+      "prompt_tokens": 2304,
+      "generation_tokens": 128,
+      "prompt_tps": 452.97144926347994,
+      "generation_tps": 29.526578793768877,
+      "total_s": 9.478841666947119,
+      "peak_memory_gb": 157.95561386,
+      "finish_reason": "length",
+      "repeat": 2
+    },
+    {
+      "case": "long_8k_decode",
+      "prompt_tokens": 8192,
+      "generation_tokens": 128,
+      "prompt_tps": 434.5719068920108,
+      "generation_tps": 28.33473053549986,
+      "total_s": 23.42719991703052,
+      "peak_memory_gb": 159.166075728,
+      "finish_reason": "length",
+      "repeat": 0
+    },
+    {
+      "case": "long_8k_decode",
+      "prompt_tokens": 8192,
+      "generation_tokens": 128,
+      "prompt_tps": 434.604612393695,
+      "generation_tps": 28.312453102676464,
+      "total_s": 23.429179874947295,
+      "peak_memory_gb": 159.166075728,
+      "finish_reason": "length",
+      "repeat": 1
+    },
+    {
+      "case": "long_8k_decode",
+      "prompt_tokens": 8192,
+      "generation_tokens": 128,
+      "prompt_tps": 434.52256975921193,
+      "generation_tps": 28.306389465271895,
+      "total_s": 23.433682875009254,
+      "peak_memory_gb": 159.166075728,
+      "finish_reason": "length",
+      "repeat": 2
+    }
+  ],
+  "summary": {
+    "decode_128": {
+      "prompt_tokens": 128,
+      "generation_tokens": 128,
+      "prompt_tps_median": 293.12518392354383,
+      "generation_tps_median": 32.068365409363636,
+      "total_s_median": 4.498937499942258,
+      "peak_memory_gb_max": 155.579077072,
+      "repeats": 3
+    },
+    "csa_2k_decode": {
+      "prompt_tokens": 2304,
+      "generation_tokens": 128,
+      "prompt_tps_median": 452.97144926347994,
+      "generation_tps_median": 29.526578793768877,
+      "total_s_median": 9.478841666947119,
+      "peak_memory_gb_max": 157.95561386,
+      "repeats": 3
+    },
+    "long_8k_decode": {
+      "prompt_tokens": 8192,
+      "generation_tokens": 128,
+      "prompt_tps_median": 434.5719068920108,
+      "generation_tps_median": 28.312453102676464,
+      "total_s_median": 23.429179874947295,
+      "peak_memory_gb_max": 159.166075728,
+      "repeats": 3
+    }
+  }
+}
