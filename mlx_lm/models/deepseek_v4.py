@@ -456,18 +456,15 @@ class DeepseekV4MLP(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
-        self.gate_up_proj = nn.Linear(
-            hidden_size, 2 * intermediate_size, bias=False
-        )
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.intermediate_size = intermediate_size
         self.swiglu_limit = swiglu_limit
 
     def __call__(self, x: mx.array) -> mx.array:
-        gate, up = mx.split(
-            self.gate_up_proj(x), [self.intermediate_size], axis=-1
+        return self.down_proj(
+            _limited_swiglu(self.gate_proj(x), self.up_proj(x), self.swiglu_limit)
         )
-        return self.down_proj(_limited_swiglu(gate, up, self.swiglu_limit))
 
 
 class DeepseekV4MoE(nn.Module):
@@ -1226,17 +1223,6 @@ class Model(nn.Module):
                         [weights.pop(gate_key), weights.pop(up_key)], axis=1
                     )
 
-        # Fuse shared expert gate/up projections by concatenating output rows.
-        for layer_idx in range(n_layers):
-            prefix = f"model.layers.{layer_idx}.ffn.shared_experts"
-            for suffix in ("weight", "scales", "biases"):
-                gate_key = f"{prefix}.gate_proj.{suffix}"
-                up_key = f"{prefix}.up_proj.{suffix}"
-                if gate_key in weights and up_key in weights:
-                    weights[f"{prefix}.gate_up_proj.{suffix}"] = mx.concatenate(
-                        [weights.pop(gate_key), weights.pop(up_key)], axis=0
-                    )
-
         # Reshape wo_a from nn.Linear (2D) to MultiLinear (3D) for all layers
         for layer_idx in range(n_layers):
             prefix = f"model.layers.{layer_idx}.attn.wo_a"
@@ -1291,12 +1277,14 @@ class Model(nn.Module):
 
             layer.ffn.sharding_group = group
             shard_inplace(
-                layer.ffn.shared_experts.gate_up_proj, "all-to-sharded", group=group
+                layer.ffn.shared_experts.gate_proj, "all-to-sharded", group=group
             )
             shard_inplace(
                 layer.ffn.shared_experts.down_proj, "sharded-to-all", group=group
             )
-            layer.ffn.shared_experts.intermediate_size //= N
+            shard_inplace(
+                layer.ffn.shared_experts.up_proj, "all-to-sharded", group=group
+            )
             shard_inplace(layer.ffn.switch_mlp.gate_proj, "all-to-sharded", group=group)
             shard_inplace(layer.ffn.switch_mlp.down_proj, "sharded-to-all", group=group)
             layer.ffn.switch_mlp.hidden_dims //= N
