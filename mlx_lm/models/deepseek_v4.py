@@ -627,6 +627,15 @@ class Indexer(nn.Module):
         k = min(self.index_topk, pooled.shape[1])
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
 
+    def update_cache(
+        self,
+        x: mx.array,
+        pool_cache: Optional[PoolingCache],
+        offset: Union[int, mx.array],
+    ):
+        if pool_cache is not None:
+            self.compressor(x, pool_cache, offset)
+
 
 class LocalAttention(nn.Module):
     """DeepSeek V4 attention with no KV compression."""
@@ -901,11 +910,11 @@ class SparseCompressedAttention(nn.Module):
                 else None
             )
         )
-        topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
         sinks = self.attn_sink.astype(q.dtype)
 
         # Local attention
         if pooled.shape[1] == 0:
+            self.indexer.update_cache(x, idx_cache, offset)
             out = scaled_dot_product_attention(
                 q,
                 kv,
@@ -918,6 +927,7 @@ class SparseCompressedAttention(nn.Module):
 
         # Compressed attention
         elif pooled.shape[1] <= self.indexer.index_topk:
+            self.indexer.update_cache(x, idx_cache, offset)
             full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
             mask = _extend_mask(mask, pmask, full_kv.shape[2])
             out = scaled_dot_product_attention(
@@ -932,6 +942,7 @@ class SparseCompressedAttention(nn.Module):
 
         # Sparse compressed attention
         else:
+            topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
             sparse_mask = None
             if pmask is not None:
                 sparse_mask = mx.take_along_axis(
