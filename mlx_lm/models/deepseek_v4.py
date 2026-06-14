@@ -508,7 +508,8 @@ class Compressor(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.overlap = compress_ratio == 4
         self.out_dim = head_dim * (2 if self.overlap else 1)
-        self.wkv_gate = nn.Linear(config.hidden_size, 2 * self.out_dim, bias=False)
+        self.wkv = nn.Linear(config.hidden_size, self.out_dim, bias=False)
+        self.wgate = nn.Linear(config.hidden_size, self.out_dim, bias=False)
         self.ape = mx.zeros((compress_ratio, self.out_dim), dtype=mx.float32)
         self.norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
         self.rope = DeepseekV4RoPE(
@@ -526,7 +527,8 @@ class Compressor(nn.Module):
         offset: Union[int, mx.array],
     ) -> mx.array:
         B, _, _ = x.shape
-        kv, gate = mx.split(self.wkv_gate(x), 2, axis=-1)
+        kv = self.wkv(x)
+        gate = self.wgate(x)
         if pool_cache is None:
             usable = (kv.shape[1] // self.compress_ratio) * self.compress_ratio
             ready_kv, ready_gate = kv[:, :usable], gate[:, :usable]
@@ -641,13 +643,12 @@ class LocalAttention(nn.Module):
         self.o_lora_rank = config.o_lora_rank
         self.scale = self.head_dim**-0.5
 
-        self.wq_a_wkv = nn.Linear(
-            config.hidden_size, config.q_lora_rank + self.head_dim, bias=False
-        )
+        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
+        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.wo_a = MultiLinear(
             self.n_heads * self.head_dim // config.o_groups,
@@ -680,16 +681,13 @@ class LocalAttention(nn.Module):
         offset = cache.offset if cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_residual, kv = mx.split(
-            self.wq_a_wkv(x), [self.config.q_lora_rank], axis=-1
-        )
-        q = self.wq_b(self.q_norm(q_residual))
+        q = self.wq_b(self.q_norm(self.wq_a(x)))
         q = q.reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
         q = self.rope(q, offset)
 
-        kv = self.kv_norm(kv).reshape(B, 1, L, self.head_dim)
+        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         if cache is not None:
             kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
@@ -733,13 +731,12 @@ class CompressedAttention(nn.Module):
         self.o_lora_rank = config.o_lora_rank
         self.scale = self.head_dim**-0.5
 
-        self.wq_a_wkv = nn.Linear(
-            config.hidden_size, config.q_lora_rank + self.head_dim, bias=False
-        )
+        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
+        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.wo_a = MultiLinear(
             self.n_heads * self.head_dim // config.o_groups,
@@ -776,16 +773,13 @@ class CompressedAttention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_residual, kv = mx.split(
-            self.wq_a_wkv(x), [self.config.q_lora_rank], axis=-1
-        )
-        q = self.wq_b(self.q_norm(q_residual))
+        q = self.wq_b(self.q_norm(self.wq_a(x)))
         q = q.reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
         q = self.rope(q, offset)
 
-        kv = self.kv_norm(kv).reshape(B, 1, L, self.head_dim)
+        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
@@ -842,13 +836,12 @@ class SparseCompressedAttention(nn.Module):
         self.o_lora_rank = config.o_lora_rank
         self.scale = self.head_dim**-0.5
 
-        self.wq_a_wkv = nn.Linear(
-            config.hidden_size, config.q_lora_rank + self.head_dim, bias=False
-        )
+        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
+        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.wo_a = MultiLinear(
             self.n_heads * self.head_dim // config.o_groups,
@@ -886,16 +879,13 @@ class SparseCompressedAttention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_residual, kv = mx.split(
-            self.wq_a_wkv(x), [self.config.q_lora_rank], axis=-1
-        )
-        q_residual = self.q_norm(q_residual)
+        q_residual = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
         q = q.transpose(0, 2, 1, 3)
         q = self.rope(q, offset)
 
-        kv = self.kv_norm(kv).reshape(B, 1, L, self.head_dim)
+        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
@@ -1230,31 +1220,6 @@ class Model(nn.Module):
                 if key in weights and weights[key].ndim == 2:
                     weights[key] = weights[key].reshape(
                         self.args.o_groups, self.args.o_lora_rank, -1
-                    )
-
-        # Fuse compressor wkv/wgate projections by concatenating their output rows.
-        for layer_idx in range(n_layers):
-            for prefix in (
-                f"model.layers.{layer_idx}.attn.compressor",
-                f"model.layers.{layer_idx}.attn.indexer.compressor",
-            ):
-                for suffix in ("weight", "scales", "biases"):
-                    wkv_key = f"{prefix}.wkv.{suffix}"
-                    wgate_key = f"{prefix}.wgate.{suffix}"
-                    if wkv_key in weights and wgate_key in weights:
-                        weights[f"{prefix}.wkv_gate.{suffix}"] = mx.concatenate(
-                            [weights.pop(wkv_key), weights.pop(wgate_key)], axis=0
-                        )
-
-        # Fuse attention input projections by concatenating their output rows.
-        for layer_idx in range(n_layers):
-            prefix = f"model.layers.{layer_idx}.attn"
-            for suffix in ("weight", "scales", "biases"):
-                wq_key = f"{prefix}.wq_a.{suffix}"
-                wkv_key = f"{prefix}.wkv.{suffix}"
-                if wq_key in weights and wkv_key in weights:
-                    weights[f"{prefix}.wq_a_wkv.{suffix}"] = mx.concatenate(
-                        [weights.pop(wq_key), weights.pop(wkv_key)], axis=0
                     )
 
         return weights
