@@ -858,6 +858,32 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(config["quantization"]["bits"], 4)
 
+    def test_fused_switch_glu_matches_switch_glu(self):
+        from mlx_lm.models.switch_layers import FusedSwitchGLU, SwitchGLU
+
+        mx.random.seed(0)
+        input_dims = 5
+        hidden_dims = 7
+        num_experts = 3
+        reference = SwitchGLU(input_dims, hidden_dims, num_experts, bias=True)
+        fused = FusedSwitchGLU(input_dims, hidden_dims, num_experts, bias=True)
+
+        fused.gate_proj.weight = mx.concatenate(
+            [reference.gate_proj.weight, reference.up_proj.weight], axis=1
+        )
+        fused.gate_proj.bias = mx.concatenate(
+            [reference.gate_proj.bias, reference.up_proj.bias], axis=1
+        )
+        fused.down_proj.weight = reference.down_proj.weight
+        fused.down_proj.bias = reference.down_proj.bias
+
+        for length in (8, 64):
+            x = mx.random.normal((1, length, input_dims))
+            indices = (mx.arange(length) % num_experts).reshape(1, length, 1)
+            expected = reference(x, indices)
+            actual = fused(x, indices)
+            self.assertTrue(mx.allclose(actual, expected, rtol=1e-6, atol=1e-6))
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 
@@ -1714,6 +1740,43 @@ class TestModels(unittest.TestCase):
             deepseek_v4.DeepseekV4MoE(args_moe, 0).shared_experts.swiglu_limit,
             args_moe.swiglu_limit,
         )
+
+        # Routed expert gate/up weights are packed for FusedSwitchGLU.
+        args_pack = tiny_args(0)
+        model_pack = deepseek_v4.Model(args_pack)
+        prefix = "layers.0.ffn.experts"
+        weights = {}
+        gates = []
+        ups = []
+        downs = []
+        for e in range(args_pack.n_routed_experts):
+            gate = mx.arange(
+                args_pack.moe_intermediate_size * args_pack.hidden_size,
+                dtype=mx.float32,
+            ).reshape(args_pack.moe_intermediate_size, args_pack.hidden_size)
+            up = gate + 1000 + e
+            down = mx.arange(
+                args_pack.hidden_size * args_pack.moe_intermediate_size,
+                dtype=mx.float32,
+            ).reshape(args_pack.hidden_size, args_pack.moe_intermediate_size)
+            down = down + 2000 + e
+            weights[f"{prefix}.{e}.w1.weight"] = gate + e
+            weights[f"{prefix}.{e}.w2.weight"] = down
+            weights[f"{prefix}.{e}.w3.weight"] = up
+            gates.append(gate + e)
+            downs.append(down)
+            ups.append(up)
+        packed = model_pack.sanitize(weights)
+        packed_prefix = "model.layers.0.ffn.switch_mlp"
+        gate_key = f"{packed_prefix}.gate_proj.weight"
+        up_key = f"{packed_prefix}.up_proj.weight"
+        down_key = f"{packed_prefix}.down_proj.weight"
+        self.assertIn(gate_key, packed)
+        self.assertNotIn(up_key, packed)
+        self.assertIn(down_key, packed)
+        expected_gate = mx.concatenate([mx.stack(gates), mx.stack(ups)], axis=1)
+        self.assertTrue(mx.array_equal(packed[gate_key], expected_gate))
+        self.assertTrue(mx.array_equal(packed[down_key], mx.stack(downs)))
 
         # Model test
         args = deepseek_v4.ModelArgs(

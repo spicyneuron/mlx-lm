@@ -15,7 +15,7 @@ from .cache import CacheList, DeepseekV4PoolingCache, PoolingCache, RotatingKVCa
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
-from .switch_layers import SwitchGLU
+from .switch_layers import FusedSwitchGLU
 
 
 @dataclass
@@ -472,7 +472,7 @@ class DeepseekV4MoE(nn.Module):
         super().__init__()
         self.config = config
         self.gate = MoEGate(config, layer_idx)
-        self.switch_mlp = SwitchGLU(
+        self.switch_mlp = FusedSwitchGLU(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
@@ -1202,6 +1202,17 @@ class Model(nn.Module):
                             f"model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
                         ] = mx.stack(stacked)
 
+        # Fuse routed expert gate/up projections by concatenating output rows.
+        for layer_idx in range(n_layers):
+            prefix = f"model.layers.{layer_idx}.ffn.switch_mlp"
+            for suffix in ("weight", "scales"):
+                gate_key = f"{prefix}.gate_proj.{suffix}"
+                up_key = f"{prefix}.up_proj.{suffix}"
+                if gate_key in weights and up_key in weights:
+                    weights[gate_key] = mx.concatenate(
+                        [weights.pop(gate_key), weights.pop(up_key)], axis=1
+                    )
+
         # Reshape wo_a from nn.Linear (2D) to MultiLinear (3D) for all layers
         for layer_idx in range(n_layers):
             prefix = f"model.layers.{layer_idx}.attn.wo_a"
@@ -1239,6 +1250,11 @@ class Model(nn.Module):
             shard_inplace(
                 layer.ffn.shared_experts.up_proj, "all-to-sharded", group=group
             )
-            shard_inplace(layer.ffn.switch_mlp.gate_proj, "all-to-sharded", group=group)
+            shard_inplace(
+                layer.ffn.switch_mlp.gate_proj,
+                "all-to-sharded",
+                segments=2,
+                group=group,
+            )
             shard_inplace(layer.ffn.switch_mlp.down_proj, "sharded-to-all", group=group)
-            shard_inplace(layer.ffn.switch_mlp.up_proj, "all-to-sharded", group=group)
+            layer.ffn.switch_mlp.hidden_dims //= N
