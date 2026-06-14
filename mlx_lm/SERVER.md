@@ -140,6 +140,23 @@ curl localhost:8080/v1/chat/completions \
     - `completion_tokens`: The number of tokens generated.
     - `total_tokens`: The total number of tokens, i.e. the sum of the above two fields.
 
+- `timings`: Server-side timing measurements, following the shape used by
+  llama.cpp and several open-source clients. Times are measured around
+  the generation service only (no network or serialization) and include
+  some internal scheduling overhead, so treat them as approximate.
+    - `prompt_n`: Prompt tokens processed (excludes cached tokens).
+    - `prompt_ms`: Time to first generated token, in milliseconds.
+    - `prompt_per_second`: `prompt_n / (prompt_ms / 1000)`, or `0` if
+      `prompt_ms` is `0`.
+    - `predicted_n`: Tokens generated.
+    - `predicted_ms`: Time from first to last generated token, in
+      milliseconds. `0` when fewer than two tokens are generated.
+    - `predicted_per_second`: `predicted_n / (predicted_ms / 1000)`, or
+      `0` if `predicted_ms` is `0`.
+
+  For streaming requests, `timings` rides on the final usage chunk and
+  requires `stream_options.include_usage`.
+
 ### List Models
 
 Use the `v1/models` endpoint to list available models:

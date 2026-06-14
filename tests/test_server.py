@@ -21,6 +21,30 @@ from mlx_lm.server import (
 from mlx_lm.utils import load
 
 
+def assert_usage_timings(test_case, response_body):
+    test_case.assertIn("usage", response_body)
+    test_case.assertIn("timings", response_body)
+    timings = response_body["timings"]
+    cached_tokens = (
+        response_body["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    )
+    test_case.assertEqual(
+        timings["prompt_n"],
+        response_body["usage"]["prompt_tokens"] - cached_tokens,
+    )
+    test_case.assertEqual(
+        timings["predicted_n"],
+        response_body["usage"]["completion_tokens"],
+    )
+    test_case.assertEqual(timings["cache_n"], cached_tokens)
+    test_case.assertGreaterEqual(timings["prompt_ms"], 0)
+    test_case.assertGreaterEqual(timings["predicted_ms"], 0)
+    if timings["prompt_ms"] > 0:
+        test_case.assertGreater(timings["prompt_per_second"], 0)
+    if timings["predicted_ms"] > 0:
+        test_case.assertGreater(timings["predicted_per_second"], 0)
+
+
 class DummyModelProvider:
     def __init__(self, with_draft=False):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
@@ -201,6 +225,7 @@ class TestServer(unittest.TestCase):
 
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+        assert_usage_timings(self, response_body)
         first_text = response_body["choices"][0]["text"]
         self.assertEqual(
             first_text,
@@ -221,9 +246,10 @@ class TestServer(unittest.TestCase):
             ],
         }
         response = requests.post(url, json=chat_post_data)
-        response_body = response.text
+        response_body = json.loads(response.text)
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+        assert_usage_timings(self, response_body)
 
     def test_handle_chat_completions_with_content_fragments(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
@@ -247,6 +273,38 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
+    def test_streaming_include_usage_timings(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        chat_post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello!"},
+            ],
+        }
+
+        response = requests.post(url, json=chat_post_data, stream=True)
+        self.assertEqual(response.status_code, 200)
+
+        usage_count = 0
+        for chunk in response.iter_lines():
+            if not chunk:
+                continue
+            data = chunk.decode("utf-8")
+            if not data.startswith("data: ") or data == "data: [DONE]":
+                continue
+            chunk_data = json.loads(data[6:])
+            if chunk_data.get("usage"):
+                self.assertEqual(chunk_data["choices"], [])
+                assert_usage_timings(self, chunk_data)
+                usage_count += 1
+
+        self.assertEqual(usage_count, 1)
 
     def test_handle_chat_completions_with_null_tool_content(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
@@ -361,7 +419,7 @@ class TestServerWithDraftModel(unittest.TestCase):
         response_body = json.loads(response.text)
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
-        self.assertIn("usage", response_body)
+        assert_usage_timings(self, response_body)
 
         # Check that tokens were generated
         self.assertTrue(response_body["usage"]["completion_tokens"] > 0)
@@ -385,7 +443,7 @@ class TestServerWithDraftModel(unittest.TestCase):
         response_body = json.loads(response.text)
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
-        self.assertIn("usage", response_body)
+        assert_usage_timings(self, response_body)
 
         # Check that tokens were generated
         self.assertTrue(response_body["usage"]["completion_tokens"] > 0)
@@ -458,6 +516,8 @@ class TestServerWithDraftModel(unittest.TestCase):
 
         self.assertIn("choices", first_response_body)
         self.assertIn("choices", second_response_body)
+        assert_usage_timings(self, first_response_body)
+        assert_usage_timings(self, second_response_body)
         self.assertIn("message", first_response_body["choices"][0])
         self.assertIn("message", second_response_body["choices"][0])
         self.assertIn("content", first_response_body["choices"][0]["message"])
