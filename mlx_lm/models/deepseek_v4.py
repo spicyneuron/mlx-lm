@@ -508,8 +508,7 @@ class Compressor(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.overlap = compress_ratio == 4
         self.out_dim = head_dim * (2 if self.overlap else 1)
-        self.wkv = nn.Linear(config.hidden_size, self.out_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, self.out_dim, bias=False)
+        self.wkv_gate = nn.Linear(config.hidden_size, 2 * self.out_dim, bias=False)
         self.ape = mx.zeros((compress_ratio, self.out_dim), dtype=mx.float32)
         self.norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
         self.rope = DeepseekV4RoPE(
@@ -527,8 +526,7 @@ class Compressor(nn.Module):
         offset: Union[int, mx.array],
     ) -> mx.array:
         B, _, _ = x.shape
-        kv = self.wkv(x)
-        gate = self.wgate(x)
+        kv, gate = mx.split(self.wkv_gate(x), 2, axis=-1)
         if pool_cache is None:
             usable = (kv.shape[1] // self.compress_ratio) * self.compress_ratio
             ready_kv, ready_gate = kv[:, :usable], gate[:, :usable]
@@ -1210,6 +1208,20 @@ class Model(nn.Module):
                     weights[key] = weights[key].reshape(
                         self.args.o_groups, self.args.o_lora_rank, -1
                     )
+
+        # Fuse compressor wkv/wgate projections by concatenating their output rows.
+        for layer_idx in range(n_layers):
+            for prefix in (
+                f"model.layers.{layer_idx}.attn.compressor",
+                f"model.layers.{layer_idx}.attn.indexer.compressor",
+            ):
+                for suffix in ("weight", "scales", "biases"):
+                    wkv_key = f"{prefix}.wkv.{suffix}"
+                    wgate_key = f"{prefix}.wgate.{suffix}"
+                    if wkv_key in weights and wgate_key in weights:
+                        weights[f"{prefix}.wkv_gate.{suffix}"] = mx.concatenate(
+                            [weights.pop(wkv_key), weights.pop(wgate_key)], axis=0
+                        )
 
         return weights
 
