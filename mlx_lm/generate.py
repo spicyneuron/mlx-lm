@@ -223,7 +223,7 @@ def setup_arg_parser():
 
 
 # A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
+generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
 @contextlib.contextmanager
@@ -1497,6 +1497,7 @@ class BatchGenerator:
     def __init__(
         self,
         model: nn.Module,
+        *,
         max_tokens: int = 128,
         stop_tokens: Optional[Sequence[Sequence[int]]] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
@@ -1507,6 +1508,7 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
+        stream=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1517,6 +1519,8 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+
+        self._stream = stream or generation_stream
 
         self._default_state_machine = SequenceStateMachine(
             {"normal": [(seq, None) for seq in stop_tokens]} if stop_tokens else {},
@@ -1544,9 +1548,13 @@ class BatchGenerator:
         else:
             self._old_wired_limit = None
 
+    @property
+    def stream(self):
+        return self._stream
+
     def close(self):
         if self._old_wired_limit is not None:
-            mx.synchronize(generation_stream)
+            mx.synchronize(self._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
@@ -1843,7 +1851,7 @@ class BatchGenerator:
         Returns:
             Tuple of prompt processing responses and generation responses.
         """
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             return self._next()
 
     def next_generated(self):
@@ -1853,7 +1861,7 @@ class BatchGenerator:
         Returns:
             List of GenerationBatch.Response objects
         """
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             while True:
                 prompt_responses, generation_responses = self._next()
                 if not generation_responses and prompt_responses:
@@ -1869,11 +1877,19 @@ class BatchResponse:
     Args:
         texts: (List[str]): The generated text for each prompt.
         stats (BatchStats): Statistics about the generation.
+        caches: Optional prompt caches for each sequence.
+        token_ids (Optional[List[List[int]]]): The generated token IDs for each
+            prompt. Only present when ``return_token_ids=True``.
+        logprobs (Optional[List[List[float]]]): The per-token log-probabilities
+            of the sampled tokens for each prompt. Only present when
+            ``return_logprobs=True``.
     """
 
     texts: List[str]
     stats: BatchStats
     caches: Optional[List[List[Any]]]
+    token_ids: Optional[List[List[int]]] = None
+    logprobs: Optional[List[List[float]]] = None
 
 
 def batch_generate(
@@ -1884,6 +1900,8 @@ def batch_generate(
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     return_prompt_caches: bool = False,
+    return_token_ids: bool = False,
+    return_logprobs: bool = False,
     **kwargs,
 ) -> BatchResponse:
     """
@@ -1902,6 +1920,12 @@ def batch_generate(
           can be per prompt if a list is provided.
        return_prompt_caches (bool): Return the prompt caches in the batch
           responses. Default: ``False``.
+       return_token_ids (bool): Return the generated token IDs in the batch
+          responses. Default: ``False``.
+       return_logprobs (bool): Return the per-token log-probability of the
+          sampled token for each generated token. Useful for reinforcement
+          learning (e.g. RLOO, PPO) where behavior log-probabilities are needed
+          for importance weighting. Default: ``False``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
     """
@@ -1921,6 +1945,7 @@ def batch_generate(
 
     uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
     results = {uid: [] for uid in uids}
+    logprob_results = {uid: [] for uid in uids} if return_logprobs else None
     prompt_caches = {}
     with gen.stats() as stats:
         while responses := gen.next_generated():
@@ -1936,6 +1961,8 @@ def batch_generate(
                         )
                 if r.finish_reason != "stop":
                     results[r.uid].append(r.token)
+                    if return_logprobs:
+                        logprob_results[r.uid].append(r.logprobs[r.token].item())
     gen.close()
     if verbose:
         print(f"[batch_generate] Finished processing {fin}/{num_samples}")
@@ -1943,6 +1970,8 @@ def batch_generate(
     # Return results in correct order
     texts = [tokenizer.decode(results[uid]) for uid in uids]
     caches = [prompt_caches[uid] for uid in uids] if return_prompt_caches else None
+    token_ids = [results[uid] for uid in uids] if return_token_ids else None
+    logprobs = [logprob_results[uid] for uid in uids] if return_logprobs else None
     if verbose:
         print(
             f"[batch_generate] Prompt: {stats.prompt_tokens} tokens, {stats.prompt_tps:.3f} tokens-per-sec"
@@ -1952,7 +1981,7 @@ def batch_generate(
             f"{stats.generation_tps:.3f} tokens-per-sec"
         )
         print(f"[batch_generate] Peak memory: {stats.peak_memory:.3f} GB")
-    return BatchResponse(texts, stats, caches)
+    return BatchResponse(texts, stats, caches, token_ids, logprobs)
 
 
 def main():
@@ -1983,7 +2012,7 @@ def main():
     tokenizer_config = (
         {} if not using_cache else json.loads(metadata["tokenizer_config"])
     )
-    tokenizer_config["trust_remote_code"] = True if args.trust_remote_code else None
+    tokenizer_config["trust_remote_code"] = args.trust_remote_code
 
     model_path = args.model
     if using_cache:
@@ -2002,6 +2031,7 @@ def main():
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
+        trust_remote_code=args.trust_remote_code,
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
