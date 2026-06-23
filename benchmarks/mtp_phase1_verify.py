@@ -38,31 +38,40 @@ FORCE_ABSORB = 1 << 30  # every L takes the absorbed path
 FORCE_UNABSORB = 0  # every L takes the un-absorbed path
 
 
-def preflight() -> None:
-    """Fail loudly if the *loaded* attention code lacks the Phase 1 toggle.
+# Markers that must appear in the loaded attention source. Each is a distinct
+# code edit; scripts sync to the server separately from model code (git
+# checkout), so a stale checkout can have an earlier marker but not a later one.
+REQUIRED_MARKERS = (
+    "ABSORB_MAX_L",  # the L<=cutoff absorbed-path toggle
+    "absorbed_attention",  # the explicit-softmax verify fix (post-toggle)
+)
 
-    Scripts get synced to the server separately from the model code (git
-    checkout). If the server's checkout predates the ABSORB_MAX_L edit, the
-    toggle below is a no-op: every L>1 takes the un-absorbed path, parity is
-    trivially bit-identical (max_abs=0.0) and perf is 1.0x. Catch that here
-    instead of after a long sweep.
+
+def preflight() -> None:
+    """Fail loudly if the *loaded* attention code is missing any required edit.
+
+    Catches the deploy split where the script is newer than the model code on
+    this host. Checking only an early marker is not enough -- the old absorbed
+    path still contained ABSORB_MAX_L, so the explicit-softmax fix could be
+    silently absent (giving identical wrong results and identical perf).
     """
     from mlx_lm.models.glm_moe_dsa import GlmMoeDsaAttention
     from mlx_lm.models.deepseek_v32 import DeepseekV32Attention
 
-    missing = [
-        cls.__name__
-        for cls in (GlmMoeDsaAttention, DeepseekV32Attention)
-        if "ABSORB_MAX_L" not in inspect.getsource(cls.__call__)
-    ]
-    if missing:
-        src = inspect.getsourcefile(GlmMoeDsaAttention)
+    problems = []
+    for cls in (GlmMoeDsaAttention, DeepseekV32Attention):
+        src = inspect.getsource(cls.__call__)
+        for marker in REQUIRED_MARKERS:
+            if marker not in src:
+                problems.append(f"{cls.__name__} missing '{marker}'")
+    if problems:
+        path = inspect.getsourcefile(GlmMoeDsaAttention)
         sys.exit(
-            "ERROR: loaded attention code is NOT patched for Phase 1 "
-            f"({', '.join(missing)} has no ABSORB_MAX_L).\n"
-            f"       Running from: {src}\n"
-            "       The model code on this host is stale -- `git checkout` the\n"
-            "       commit with the ABSORB_MAX_L edit, don't just sync the script."
+            "ERROR: loaded attention code is stale / not fully patched:\n"
+            + "\n".join(f"         - {p}" for p in problems)
+            + f"\n       Running from: {path}\n"
+            "       `git checkout` the commit with the latest model edits on\n"
+            "       this host -- syncing the script alone is not enough."
         )
 
 
