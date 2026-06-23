@@ -65,25 +65,35 @@ def main():
         model.mtp_forward(h, ids[1:C][None], mtp_cache)
         mx.eval([c.state for c in model_cache + mtp_cache])
 
-        # gather walk: one token at a time -> gather verify argmax + draft argmax
+        # gather walk: one token at a time -> gather verify argmax + draft argmax.
+        # The draft for token t+1 is mtp_forward(h_t, token_{t+1}) -- the hidden
+        # that produced the *previous* token, paired with the current token (this
+        # is how generate._draft_block feeds the head). So pair prev_h with the
+        # current token; draft[k] aligns with gather_pred[k] for k>=1.
         gather_pred, draft_pred = [], []
+        prev_h = None
         for i in range(W):
             tok = walk[i : i + 1]
             logits, h = model(tok[None], cache=model_cache, return_hidden=True)
             gather_pred.append(mx.argmax(logits[0, -1]))
-            d_logits, _ = model.mtp_forward(h, tok[None], mtp_cache, return_hidden=True)
-            draft_pred.append(mx.argmax(d_logits[0, -1]))
-        gather_pred = mx.stack(gather_pred)
-        draft_pred = mx.stack(draft_pred)
+            if prev_h is not None:
+                d_logits, _ = model.mtp_forward(
+                    prev_h, tok[None], mtp_cache, return_hidden=True
+                )
+                draft_pred.append(mx.argmax(d_logits[0, -1]))
+            prev_h = h
+        gather_pred = mx.stack(gather_pred)  # [W], predicts tokens C..C+W-1
+        draft_pred = mx.stack(draft_pred)  # [W-1], aligned to gather_pred[1:]
 
         # reuse the cache: trim the W walk steps back off, then batched mask verify
         trim_prompt_cache(model_cache, W)
         mask_logits = model(walk[None], cache=model_cache)
-        mask_pred = mx.argmax(mask_logits[0], axis=-1)
+        mask_pred = mx.argmax(mask_logits[0], axis=-1)  # [W]
         mx.eval(gather_pred, draft_pred, mask_pred)
 
-        acc_g = (draft_pred == gather_pred).mean().item()
-        acc_m = (draft_pred == mask_pred).mean().item()
+        g, m = gather_pred[1:], mask_pred[1:]  # align with draft_pred
+        acc_g = (draft_pred == g).mean().item()
+        acc_m = (draft_pred == m).mean().item()
         vgvm = (gather_pred == mask_pred).mean().item()
         print(f"{C:>7} {acc_g:>11.1%} {acc_m:>9.1%} {acc_g - acc_m:>+8.1%} {vgvm:>7.1%}")
 
