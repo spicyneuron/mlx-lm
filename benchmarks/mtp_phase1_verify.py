@@ -181,6 +181,12 @@ def main():
     p.add_argument("--skip-perf", action="store_true")
     args = p.parse_args()
 
+    # Show where mlx_lm actually loaded from. A path under .cache/uv means a
+    # stale cached wheel (use `uv run --with-editable .` instead of `--with .`);
+    # a path in your checkout means live source.
+    import mlx_lm
+
+    print(f"mlx_lm: {inspect.getsourcefile(mlx_lm.models.glm_moe_dsa)}")
     preflight()  # refuse to run if the loaded attention isn't patched
 
     contexts = [int(c) for c in args.contexts.split(",") if c]
