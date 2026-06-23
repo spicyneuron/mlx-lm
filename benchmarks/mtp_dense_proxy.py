@@ -52,7 +52,7 @@ def measure(model, tokenizer, prompt, n_draft, prefill_step_size):
         pass
     acc = stats.get("accepted", 0)
     prop = stats.get("proposed", 0)
-    return acc / prop if prop else 0.0
+    return (acc / prop if prop else 0.0), prop
 
 
 def main():
@@ -63,14 +63,17 @@ def main():
     p.add_argument("--prefill-step-size", type=int, default=2048)
     args = p.parse_args()
 
+    # Mirror mlx_lm.benchmark EXACTLY so [sparse] reproduces its number:
+    #   seed(0) BEFORE load (model init consumes RNG, so the prompt is built from
+    #   the post-load RNG state), then disable EOS so all 256 tokens generate.
+    mx.random.seed(0)
     model, tokenizer = load(args.model)
+    tokenizer._eos_token_ids = {}
     idxs = mtp_indexers(model)
     if not idxs:
         raise SystemExit("MTP block has no indexer to toggle")
     real_topk = idxs[0].index_topk
 
-    # same synthetic prompt as mlx_lm.benchmark
-    mx.random.seed(0)
     vocab = model.model.embed_tokens.weight.shape[0]
     prompt = mx.random.randint(0, vocab, (1, args.prompt_tokens)).tolist()[0]
     print(f"loaded {args.model}  prompt_tokens={args.prompt_tokens} "
@@ -78,15 +81,15 @@ def main():
 
     for ix in idxs:
         ix.index_topk = real_topk
-    sparse = measure(model, tokenizer, prompt, args.num_draft_tokens, args.prefill_step_size)
-    print(f"[sparse] MTP acceptance: {sparse:6.1%}")
+    sparse, ps = measure(model, tokenizer, prompt, args.num_draft_tokens, args.prefill_step_size)
+    print(f"[sparse] MTP acceptance: {sparse:6.1%}  (proposed={ps})")
 
     for ix in idxs:
         ix.index_topk = 1 << 30  # force dense: indexer returns None
-    dense = measure(model, tokenizer, prompt, args.num_draft_tokens, args.prefill_step_size)
+    dense, pd = measure(model, tokenizer, prompt, args.num_draft_tokens, args.prefill_step_size)
     for ix in idxs:
         ix.index_topk = real_topk
-    print(f"[dense]  MTP acceptance: {dense:6.1%}")
+    print(f"[dense]  MTP acceptance: {dense:6.1%}  (proposed={pd})")
 
     print(f"\ndelta = {dense - sparse:+.1%}")
     print(
