@@ -32,8 +32,13 @@ def first_full_indexer(model):
     raise SystemExit("no full-indexer layer found")
 
 
-def capture(model, target, run):
-    """Run `run()` with Indexer.__call__ patched to record target's outputs."""
+def capture(target, setup, measured):
+    """Run setup() un-recorded (prefill), then measured() with target recorded.
+
+    Prefill at context > index_topk also invokes the indexer, so recording must
+    start only after prefill -- otherwise the prefill's topk is captured too.
+    """
+    setup()
     orig = Indexer.__call__
     records = []
 
@@ -45,7 +50,7 @@ def capture(model, target, run):
 
     Indexer.__call__ = patched
     try:
-        run()
+        measured()
     finally:
         Indexer.__call__ = orig
     mx.eval(records)
@@ -69,21 +74,24 @@ def main():
     ids = mx.random.randint(0, vocab, (1, args.context + args.width))
     ctx, step = ids[:, : args.context], ids[:, args.context :]
 
-    def batched():
-        cache = make_prompt_cache(model)
+    def prefill(cache):
         model(ctx, cache=cache)
         mx.eval([c.state for c in cache])
-        mx.eval(model(step, cache=cache))
 
-    def sequential():
-        cache = make_prompt_cache(model)
-        model(ctx, cache=cache)
-        mx.eval([c.state for c in cache])
+    cache_b = make_prompt_cache(model)
+    rb = capture(
+        target,
+        lambda: prefill(cache_b),
+        lambda: mx.eval(model(step, cache=cache_b)),
+    )
+
+    cache_s = make_prompt_cache(model)
+
+    def seq_steps():
         for i in range(step.shape[1]):
-            mx.eval(model(step[:, i : i + 1], cache=cache))
+            mx.eval(model(step[:, i : i + 1], cache=cache_s))
 
-    rb = capture(model, target, batched)
-    rs = capture(model, target, sequential)
+    rs = capture(target, lambda: prefill(cache_s), seq_steps)
 
     # batched: one record [1,1,L,topk]; sequential: L records [1,1,1,topk]
     assert len(rb) == 1, f"expected 1 batched indexer call, got {len(rb)}"
