@@ -19,6 +19,90 @@ from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
 class TestModels(unittest.TestCase):
+    def _deepseek_v32_mtp_args(self):
+        from mlx_lm.models import deepseek_v32
+
+        return deepseek_v32.ModelArgs(
+            vocab_size=32,
+            hidden_size=16,
+            index_head_dim=4,
+            index_n_heads=2,
+            index_topk=128,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            kv_lora_rank=4,
+            q_lora_rank=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            qk_nope_head_dim=4,
+            max_position_embeddings=32,
+            num_nextn_predict_layers=1,
+        )
+
+    def test_deepseek_v32_mtp_api(self):
+        from mlx_lm.models import deepseek_v32
+
+        args = self._deepseek_v32_mtp_args()
+        model = deepseek_v32.Model(args)
+        prompt = mx.array([[1, 2, 3]])
+        model_cache = model.make_cache()
+        logits, hidden = model(prompt, cache=model_cache, return_hidden=True)
+        self.assertEqual(logits.shape, (1, 3, args.vocab_size))
+        self.assertEqual(hidden.shape, (1, 3, args.hidden_size))
+
+        mtp_cache = model.make_mtp_cache()
+        mtp_logits = model.mtp_forward(hidden[:, -1:, :], mx.array([[4]]), mtp_cache)
+        self.assertEqual(mtp_logits.shape, (1, 1, args.vocab_size))
+        self.assertEqual(len(mtp_cache), args.num_nextn_predict_layers)
+        self.assertTrue(all(c.is_trimmable() for c in mtp_cache))
+
+    def test_deepseek_v32_mtp_sanitize(self):
+        from mlx_lm.models import deepseek_v32
+
+        args = self._deepseek_v32_mtp_args()
+        model = deepseek_v32.Model(args)
+        layer = args.num_hidden_layers
+        weights = model.sanitize(
+            {
+                f"model.layers.{layer}.enorm.weight": mx.ones((args.hidden_size,)),
+                f"model.layers.{layer}.hnorm.weight": mx.ones((args.hidden_size,)),
+                f"model.layers.{layer}.eh_proj.weight": mx.ones(
+                    (args.hidden_size, args.hidden_size * 2)
+                ),
+                f"model.layers.{layer}.shared_head.norm.weight": mx.ones(
+                    (args.hidden_size,)
+                ),
+                f"model.layers.{layer}.shared_head.head.weight": mx.ones(
+                    (args.vocab_size, args.hidden_size)
+                ),
+                f"model.layers.{layer}.embed_tokens.weight": mx.ones(
+                    (args.vocab_size, args.hidden_size)
+                ),
+                f"model.layers.{layer}.self_attn.q_a_proj.weight": mx.ones(
+                    (args.q_lora_rank, args.hidden_size)
+                ),
+                f"model.layers.{layer}.self_attn.kv_b_proj.weight": mx.ones(
+                    (
+                        args.num_attention_heads
+                        * (args.qk_nope_head_dim + args.v_head_dim),
+                        args.kv_lora_rank,
+                    )
+                ),
+            }
+        )
+        prefix = "model.mtp.layers.0"
+        self.assertIn(f"{prefix}.enorm.weight", weights)
+        self.assertIn(f"{prefix}.hnorm.weight", weights)
+        self.assertIn(f"{prefix}.eh_proj.weight", weights)
+        self.assertIn(f"{prefix}.shared_head.norm.weight", weights)
+        self.assertIn(f"{prefix}.mtp_block.self_attn.q_a_proj.weight", weights)
+        self.assertIn(f"{prefix}.mtp_block.self_attn.embed_q.weight", weights)
+        self.assertFalse(any("shared_head.head" in k for k in weights))
+        self.assertFalse(any("mtp.layers.0.embed_tokens" in k for k in weights))
+
     def test_kv_cache(self):
         cache = KVCache()
 

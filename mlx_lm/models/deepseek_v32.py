@@ -15,6 +15,13 @@ from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
+# Query lengths at or below this use the MLA-absorbed (latent-space) attention
+# path instead of up-projecting the full KV per step. Absorption is exact for
+# any L; it only stops being the cheaper choice once L approaches the kv_lora /
+# qk_nope ratio (~170 for these configs), i.e. real prefill. Short MTP verify
+# chains (L = draft_depth + 1) sit far below the crossover and win ~60x here.
+ABSORB_MAX_L = 64
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -243,17 +250,24 @@ class DeepseekV32Attention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorb = L <= ABSORB_MAX_L
+        if absorb:
+            # MLA-absorbed: attend in the kv_lora latent space. For L == 1 the
+            # topk gather above already compacted kv_latent; for 1 < L <= cutoff
+            # (MTP verify) kv_latent stays full but the per-query topk set is
+            # masked into pe_scores. Either way we never up-project the full KV.
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
+            # Un-absorbed: amortizes the full-KV up-projection over a long query
+            # (prefill). Cheaper than absorbed only when L is large.
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
 
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
-        if L == 1:
+        if absorb:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -421,6 +435,8 @@ class DeepseekV32Model(nn.Module):
         self.num_layers = self.end_idx
 
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if config.num_nextn_predict_layers > 0:
+            self.mtp = DeepseekV32MTP(config)
         self.pipeline_rank = 0
         self.pipeline_size = 1
 
@@ -568,9 +584,48 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        return_hidden: bool = False,
     ):
         out = self.model(inputs, cache)
-        return self.lm_head(out)
+        logits = self.lm_head(out)
+        if return_hidden:
+            return logits, out
+        return logits
+
+    def mtp_forward(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        mtp_cache: Optional[Any],
+        spec_step_idx: int = 0,
+        return_hidden: bool = False,
+    ):
+        if not self.has_mtp:
+            raise ValueError("This model does not have MTP layers.")
+        inputs_embeds = self.model.embed_tokens(next_token_ids)
+        mtp_hidden = self.model.mtp(
+            inputs_embeds,
+            hidden_states,
+            cache=mtp_cache,
+            spec_step_idx=spec_step_idx,
+        )
+        logits = self.model.mtp.compute_logits(mtp_hidden, self.lm_head, spec_step_idx)
+        if return_hidden:
+            return logits, mtp_hidden
+        return logits
+
+    def make_mtp_cache(self):
+        if not self.has_mtp:
+            return []
+        return [CacheList(KVCache(), KVCache()) for _ in self.model.mtp.layers]
+
+    @property
+    def has_mtp(self):
+        return hasattr(self.model, "mtp")
+
+    @property
+    def mtp(self):
+        return self.model.mtp
 
     @property
     def has_mtp(self):

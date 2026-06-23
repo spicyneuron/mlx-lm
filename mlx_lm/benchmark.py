@@ -6,7 +6,13 @@ import time
 import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
-from mlx_lm.generate import DEFAULT_MODEL
+from mlx_lm.generate import (
+    DEFAULT_MIN_P,
+    DEFAULT_MODEL,
+    DEFAULT_TEMP,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
+)
 from mlx_lm.utils import pipeline_load, sharded_load
 
 
@@ -26,8 +32,14 @@ def setup_arg_parser():
         "--prompt-tokens",
         "-p",
         default=512,
-        help="Length of prompt",
+        help="Length of random prompt when --prompt is not provided",
         type=int,
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Text prompt to benchmark instead of a random token prompt.",
     )
     parser.add_argument(
         "--generation-tokens",
@@ -35,6 +47,18 @@ def setup_arg_parser():
         default=1024,
         help="Length of completion",
         type=int,
+    )
+    parser.add_argument(
+        "--temp", type=float, default=DEFAULT_TEMP, help="Sampling temperature"
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=DEFAULT_TOP_P, help="Sampling top-p"
+    )
+    parser.add_argument(
+        "--min-p", type=float, default=DEFAULT_MIN_P, help="Sampling min-p"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=DEFAULT_TOP_K, help="Sampling top-k"
     )
     parser.add_argument(
         "--batch-size",
@@ -74,6 +98,24 @@ def setup_arg_parser():
         help="Delay between each test in seconds (default: 0)",
     )
     parser.add_argument(
+        "--draft-mtp",
+        dest="mtp",
+        action="store_true",
+        help="Use native MTP layers as a speculative draft model.",
+    )
+    parser.add_argument(
+        "--draft-mtp-no-bonus",
+        dest="mtp_no_bonus",
+        action="store_true",
+        help="Disable the target-model bonus token in native MTP verification.",
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=3,
+        help="Number of tokens to draft when using --draft-mtp.",
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Enable trusting remote code for tokenizer/model loading.",
@@ -84,6 +126,12 @@ def setup_arg_parser():
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
+    if args.mtp and args.batch_size != 1:
+        parser.error("--draft-mtp only supports --batch-size 1.")
+    if args.mtp_no_bonus and not args.mtp:
+        parser.error("--draft-mtp-no-bonus requires --draft-mtp.")
+    if args.prompt is not None and args.batch_size != 1:
+        parser.error("--prompt only supports --batch-size 1.")
     mx.random.seed(0)
 
     group = mx.distributed.init()
@@ -120,19 +168,40 @@ def main():
     prompt_tokens = args.prompt_tokens
     generation_tokens = args.generation_tokens
     batch_size = args.batch_size
-    vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
-    prompts = mx.random.randint(0, vocab_size, (batch_size, prompt_tokens)).tolist()
-    prompt = prompts[0]
+    if args.prompt is None:
+        vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
+        prompts = mx.random.randint(0, vocab_size, (batch_size, prompt_tokens)).tolist()
+        prompt = prompts[0]
+    else:
+        prompt = tokenizer.encode(args.prompt)
+        prompt_tokens = len(prompt)
+        prompts = [prompt]
 
     def single_bench():
+        mtp_stats = {}
+
+        def update_mtp_stats(stats):
+            mtp_stats.clear()
+            mtp_stats.update(stats)
+
         for response in stream_generate(
             model,
             tokenizer,
             prompt,
             max_tokens=generation_tokens,
             prefill_step_size=args.prefill_step_size,
+            mtp=args.mtp,
+            mtp_no_bonus=args.mtp_no_bonus,
+            num_draft_tokens=args.num_draft_tokens,
+            mtp_stats_callback=update_mtp_stats if args.mtp else None,
+            temp=args.temp,
+            top_p=args.top_p,
+            min_p=args.min_p,
+            top_k=args.top_k,
         ):
             pass
+        if args.mtp:
+            response.mtp_stats = mtp_stats
         return response
 
     def batch_bench():
@@ -155,6 +224,19 @@ def main():
     report_keys = ["prompt_tps", "generation_tps", "peak_memory"]
     rprint(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
     responses = []
+
+    def mtp_results(response):
+        stats = getattr(response, "mtp_stats", {})
+        accepted = stats.get("accepted", 0)
+        proposed = stats.get("proposed", 0)
+        acceptance_rate = accepted / proposed if proposed else 0
+        return [
+            f"mtp_acceptance={100 * acceptance_rate:.1f}%",
+            f"mtp_draft_ms/tok={stats.get('draft_ms_per_token', 0):.2f}",
+            f"mtp_verify_ms/tok={stats.get('verify_ms_per_token', 0):.2f}",
+            f"mtp_cycle_ms={stats.get('cycle_ms_per_block', 0):.2f}",
+        ]
+
     for i in range(args.num_trials):
         if args.delay > 0:
             time.sleep(args.delay)
@@ -165,6 +247,8 @@ def main():
         results = [(k, getattr(response, k)) for k in report_keys]
         results = [f"{k}={v:.3f}" for k, v in results]
         results.append(f"total_time={toc - tic:.3f}")
+        if args.mtp:
+            results.extend(mtp_results(response))
         rprint(f"Trial {i+1}:  " + ", ".join(results))
 
     def avg(k):
@@ -173,6 +257,33 @@ def main():
 
     results = [(k, avg(k)) for k in report_keys]
     results = [f"{k}={v:.3f}" for k, v in results]
+    if args.mtp:
+        accepted = sum(getattr(r, "mtp_stats", {}).get("accepted", 0) for r in responses)
+        proposed = sum(getattr(r, "mtp_stats", {}).get("proposed", 0) for r in responses)
+        verify_tokens = sum(
+            getattr(r, "mtp_stats", {}).get("verify_tokens", 0) for r in responses
+        )
+        verified_steps = sum(
+            getattr(r, "mtp_stats", {}).get("verified_steps", 0) for r in responses
+        )
+        draft_time = sum(
+            getattr(r, "mtp_stats", {}).get("draft_time", 0) for r in responses
+        )
+        verify_time = sum(
+            getattr(r, "mtp_stats", {}).get("verify_time", 0) for r in responses
+        )
+        acceptance_rate = accepted / proposed if proposed else 0
+        results.append(f"mtp_acceptance={100 * acceptance_rate:.1f}%")
+        draft_ms = 1000 * draft_time / proposed if proposed else 0
+        verify_ms = 1000 * verify_time / verify_tokens if verify_tokens else 0
+        cycle_ms = (
+            1000 * (draft_time + verify_time) / verified_steps
+            if verified_steps
+            else 0
+        )
+        results.append(f"mtp_draft_ms/tok={draft_ms:.2f}")
+        results.append(f"mtp_verify_ms/tok={verify_ms:.2f}")
+        results.append(f"mtp_cycle_ms={cycle_ms:.2f}")
     rprint(f"Averages: " + ", ".join(results))
 
 

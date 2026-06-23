@@ -10,7 +10,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -214,6 +214,7 @@ class GenerationContext:
     sequences: Dict[Tuple[int], str]
 
     prompt: List[int]
+    started_at: float = field(default_factory=time.perf_counter)
     prompt_cache_count: int = -1
 
     _should_stop: bool = False
@@ -231,6 +232,7 @@ class Response:
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
+    created_at: float = field(default_factory=time.perf_counter)
 
 
 def _process_control_tokens(ctx, token_stream):
@@ -293,6 +295,10 @@ class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
         self.cli_args = cli_args
+        if cli_args.mtp_no_bonus and not cli_args.mtp:
+            raise ValueError("--draft-mtp-no-bonus requires --draft-mtp.")
+        if cli_args.mtp and cli_args.draft_model is not None:
+            raise ValueError("--draft-mtp cannot be used together with --draft-model.")
         self.model_key = None
         self.model = None
         self.tokenizer = None
@@ -368,13 +374,13 @@ class ModelProvider:
                 )
 
         # Compute batchability
-        is_batchable = draft_model is None
+        is_batchable = draft_model is None and not self.cli_args.mtp
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
 
         # Update the member variables
-        self.model_key = (model_path, adapter_path, draft_model_path)
+        self.model_key = (model_path, adapter_path, draft_model_path, self.cli_args.mtp)
         self.model = model
         self.tokenizer = tokenizer
         self.draft_model = draft_model
@@ -389,9 +395,9 @@ class ModelProvider:
         adapter_path = self._adapter_map.get(model_path, adapter_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
-        model_key = (model_path, adapter_path, draft_model_path)
+        model_key = (model_path, adapter_path, draft_model_path, self.cli_args.mtp)
         if self.model_key != model_key:
-            self._load(*model_key)
+            self._load(model_path, adapter_path, draft_model_path)
 
         return self.model, self.tokenizer
 
@@ -435,6 +441,21 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
         {"id": i, "token": s, "logprob": g}
         for i, s, g in zip(top_indices, txts, top_probs)
     )
+
+
+def _make_timings(started_at, first_token_at, end_at, prompt_n, predicted_n):
+    first_token_at = first_token_at or end_at
+    prompt_time = first_token_at - started_at
+    predicted_time = end_at - first_token_at
+    prompt_per_second = prompt_n / prompt_time if prompt_time > 0 else 0
+    predicted_per_second = predicted_n / predicted_time if predicted_time > 0 else 0
+
+    return {
+        "prompt_per_second": prompt_per_second,
+        "predicted_per_second": predicted_per_second,
+        "prompt_n": prompt_n,
+        "predicted_n": predicted_n,
+    }
 
 
 class ResponseGenerator:
@@ -683,7 +704,11 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and not self.cli_args.mtp
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -942,16 +967,6 @@ class ResponseGenerator:
             )
             sm_state = sm.make_state()
 
-            # Start the generation context
-            ctx = GenerationContext(
-                has_thinking=tokenizer.has_thinking,
-                has_tool_calling=tokenizer.has_tool_calling,
-                tool_parser=tokenizer.tool_parser,
-                sequences=sequences,
-                prompt=prompt,
-            )
-            rqueue.put(ctx)
-
             # Seed if requested
             if args.seed is not None:
                 mx.random.seed(args.seed)
@@ -965,12 +980,33 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
+            prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
+                if self.cli_args.mtp and hasattr(
+                    self.model_provider.model, "make_mtp_cache"
+                ):
+                    cache += self.model_provider.model.make_mtp_cache()
+                elif self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            xtc_special_tokens = tokenizer.encode("\n")
+            if hasattr(tokenizer, "eos_token_ids"):
+                xtc_special_tokens += list(tokenizer.eos_token_ids)
+            elif tokenizer.eos_token_id is not None:
+                xtc_special_tokens.append(tokenizer.eos_token_id)
+
+            # Start the generation context
+            ctx = GenerationContext(
+                has_thinking=tokenizer.has_thinking,
+                has_tool_calling=tokenizer.has_tool_calling,
+                tool_parser=tokenizer.tool_parser,
+                sequences=sequences,
+                prompt=prompt,
+                prompt_cache_count=prompt_cache_count,
+            )
+            rqueue.put(ctx)
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -985,6 +1021,15 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                mtp=self.cli_args.mtp,
+                mtp_no_bonus=self.cli_args.mtp_no_bonus,
+                temp=args.sampling.temperature,
+                top_p=args.sampling.top_p,
+                top_k=args.sampling.top_k,
+                min_p=args.sampling.min_p,
+                xtc_probability=args.sampling.xtc_probability,
+                xtc_threshold=args.sampling.xtc_threshold,
+                xtc_special_tokens=xtc_special_tokens,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
@@ -1268,6 +1313,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
         reasoning_text: Optional[str] = None,
+        timings: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -1290,6 +1336,7 @@ class APIHandler(BaseHTTPRequestHandler):
             tokens (Optional[List[int]]): List of tokens to return with logprobs structure
             tool_calls (Optional[List[str]]): List of tool calls.
             reasoning_text (Optional[str]): The reasoning text generated by the model.
+            timings (Optional[Dict[str, Any]]): Timing metrics for the response.
 
         Returns:
             dict: A dictionary containing the response, in the same format as
@@ -1345,6 +1392,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 response["usage"]["prompt_tokens_details"] = {
                     "cached_tokens": prompt_cache_count,
                 }
+            if timings is not None:
+                response["timings"] = timings
 
         choice = response["choices"][0]
 
@@ -1450,9 +1499,17 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens = []
         token_logprobs = []
         top_tokens = []
+        first_token_at = None
+        last_token_at = None
+        include_usage = (not self.stream) or bool(
+            self.stream_options and self.stream_options.get("include_usage")
+        )
 
         try:
             for gen in response:
+                if first_token_at is None:
+                    first_token_at = gen.created_at
+                last_token_at = gen.created_at
                 logging.debug(gen.text)
 
                 # Collect the text according to our current state and state
@@ -1497,6 +1554,18 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 prev_state = gen.state
 
+            end_at = last_token_at or time.perf_counter()
+            timings = None
+            if include_usage:
+                prompt_n = len(ctx.prompt) - max(ctx.prompt_cache_count, 0)
+                timings = _make_timings(
+                    ctx.started_at,
+                    first_token_at,
+                    end_at,
+                    prompt_n,
+                    len(tokens),
+                )
+
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
                 made_tool_call = True
@@ -1513,14 +1582,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                 self.wfile.flush()
-                if (
-                    self.stream_options is not None
-                    and self.stream_options["include_usage"]
-                ):
+                if include_usage:
                     resp = self.completion_usage_response(
                         len(ctx.prompt),
                         len(tokens),
                         ctx.prompt_cache_count,
+                        timings=timings,
                     )
                     self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                     self.wfile.flush()
@@ -1538,6 +1605,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     tokens=tokens,
                     reasoning_text=reasoning_text,
                     tool_calls=tool_formatter(tool_calls),
+                    timings=timings,
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
@@ -1556,6 +1624,7 @@ class APIHandler(BaseHTTPRequestHandler):
         prompt_token_count: Optional[int] = None,
         completion_token_count: Optional[int] = None,
         prompt_cache_count: Optional[int] = None,
+        timings: Optional[Dict[str, Any]] = None,
     ):
         response = {
             "id": self.request_id,
@@ -1574,6 +1643,8 @@ class APIHandler(BaseHTTPRequestHandler):
             response["usage"]["prompt_tokens_details"] = {
                 "cached_tokens": prompt_cache_count,
             }
+        if timings is not None:
+            response["timings"] = timings
         return response
 
     def handle_chat_completions(self) -> CompletionRequest:
@@ -1787,8 +1858,20 @@ def main():
     parser.add_argument(
         "--num-draft-tokens",
         type=int,
-        help="Number of tokens to draft when using speculative decoding.",
+        help="Number of tokens to draft when using speculative decoding or --draft-mtp.",
         default=3,
+    )
+    parser.add_argument(
+        "--draft-mtp",
+        dest="mtp",
+        action="store_true",
+        help="Use native MTP layers as a speculative draft model.",
+    )
+    parser.add_argument(
+        "--draft-mtp-no-bonus",
+        dest="mtp_no_bonus",
+        action="store_true",
+        help="Disable the target-model bonus token in native MTP verification.",
     )
     parser.add_argument(
         "--trust-remote-code",

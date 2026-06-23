@@ -46,18 +46,15 @@ def make_sampler(
     if temp == 0:
         return lambda x: mx.argmax(x, axis=-1)
 
-    # Create sampler chain
-    sampling_methods = []
-    if top_p > 0 and top_p < 1.0:
-        sampling_methods.append(lambda x: apply_top_p(x, top_p))
-    if min_p != 0.0:
-        sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
-    if xtc_probability > 0.0:
-        sampling_methods.append(
-            lambda x: apply_xtc(x, xtc_probability, xtc_threshold, xtc_special_tokens)
-        )
-    if top_k > 0:
-        sampling_methods.append(lambda x: apply_top_k(x, top_k))
+    sampling_methods = make_sampler_filters(
+        top_p=top_p,
+        min_p=min_p,
+        min_tokens_to_keep=min_tokens_to_keep,
+        top_k=top_k,
+        xtc_probability=xtc_probability,
+        xtc_threshold=xtc_threshold,
+        xtc_special_tokens=xtc_special_tokens,
+    )
 
     # Apply the sampling methods
     def sampler(logprobs):
@@ -65,6 +62,73 @@ def make_sampler(
             logprobs = method(logprobs)
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
+
+    return sampler
+
+
+def make_sampler_filters(
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: List[int] = [],
+) -> List[Callable[[mx.array], mx.array]]:
+    sampling_methods = []
+    if top_p > 0 and top_p < 1.0:
+        sampling_methods.append(lambda x, draw=None: apply_top_p(x, top_p))
+    if min_p != 0.0:
+        sampling_methods.append(
+            lambda x, draw=None: apply_min_p(x, min_p, min_tokens_to_keep)
+        )
+    if xtc_probability > 0.0:
+        sampling_methods.append(
+            lambda x, draw=None: apply_xtc(
+                x, xtc_probability, xtc_threshold, xtc_special_tokens, draw=draw
+            )
+        )
+    if top_k > 0:
+        sampling_methods.append(lambda x, draw=None: apply_top_k(x, top_k))
+    return sampling_methods
+
+
+def make_sampler_with_logprobs(
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: List[int] = [],
+) -> Callable[[mx.array, Optional[mx.array]], mx.array]:
+    """
+    Make a sampler that also returns the filtered sampling distribution.
+
+    This is useful for speculative acceptance where both the target and draft
+    distributions must be compared after applying the same sampling filters.
+    """
+    sampling_methods = make_sampler_filters(
+        top_p=top_p,
+        min_p=min_p,
+        min_tokens_to_keep=min_tokens_to_keep,
+        top_k=top_k,
+        xtc_probability=xtc_probability,
+        xtc_threshold=xtc_threshold,
+        xtc_special_tokens=xtc_special_tokens,
+    )
+
+    def sampler(logprobs, xtc_draw=None):
+        if temp == 0:
+            return mx.argmax(logprobs, axis=-1), logprobs
+        for method in sampling_methods:
+            logprobs = method(logprobs, xtc_draw)
+        sample_logprobs = logprobs * (1 / temp)
+        sample_logprobs = sample_logprobs - mx.logsumexp(
+            sample_logprobs, axis=-1, keepdims=True
+        )
+        return mx.random.categorical(sample_logprobs), sample_logprobs
 
     return sampler
 
@@ -243,6 +307,7 @@ def apply_xtc(
     xtc_probability: float,
     xtc_threshold: float,
     xtc_special_tokens: List[int],
+    draw: Optional[mx.array] = None,
 ) -> mx.array:
     """
     Apply XTC sampling to the logits.
@@ -267,8 +332,11 @@ def apply_xtc(
     if xtc_special_tokens:
         mask[..., xtc_special_tokens] = False
 
+    if draw is None:
+        draw = mx.random.uniform(0, 1)
+
     return mx.where(
-        mx.random.uniform(0, 1) > xtc_probability,
+        draw > xtc_probability,
         logits,
         mx.where(mask, -mx.inf, logits),
     )
