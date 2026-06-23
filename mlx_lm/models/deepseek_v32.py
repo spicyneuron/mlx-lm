@@ -23,6 +23,27 @@ from .switch_layers import SwitchGLU
 ABSORB_MAX_L = 64
 
 
+def absorbed_attention(q, kv_latent, scale, mask, single, cache=None):
+    """Attention in the MLA latent space, where k == v == kv_latent.
+
+    For a single query (decode) the fused SDPA kernel is exact and fast. For
+    L > 1 (MTP verify) the sparse topk mask puts thousands of ``finfo.min``
+    additive entries in ``mask``; the fused kernel mishandles that at the wide
+    absorbed head_dim (kv_lora_rank) and diverges from the per-token decode
+    path, so an explicit softmax is used instead -- it equals decode by
+    construction. Verify chains are short, so the unfused cost is small and
+    still far below the un-absorbed full-KV up-projection.
+    """
+    if single:
+        return scaled_dot_product_attention(
+            q, kv_latent, kv_latent, cache=cache, scale=scale, mask=mask
+        )
+    scores = (q * scale) @ kv_latent.swapaxes(-1, -2)
+    scores = scores + mask  # mask is additive: rope scores, finfo.min at masked
+    weights = mx.softmax(scores, axis=-1, precise=True)
+    return weights @ kv_latent
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "deepseek_v32"
@@ -257,18 +278,18 @@ class DeepseekV32Attention(nn.Module):
             # (MTP verify) kv_latent stays full but the per-query topk set is
             # masked into pe_scores. Either way we never up-project the full KV.
             q_nope = self.embed_q(q_nope)
-            k = v = kv_latent
+            output = absorbed_attention(
+                q_nope, kv_latent, self.scale, pe_scores, single=L == 1, cache=cache
+            )
+            output = self.unembed_out(output)
         else:
             # Un-absorbed: amortizes the full-KV up-projection over a long query
             # (prefill). Cheaper than absorbed only when L is large.
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
-
-        output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-        )
-        if absorb:
-            output = self.unembed_out(output)
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)

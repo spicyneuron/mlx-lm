@@ -12,6 +12,7 @@ from .deepseek_v32 import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
     DeepseekV32Model,
+    absorbed_attention,
 )
 from .deepseek_v32 import Model as DSV32Model
 
@@ -166,16 +167,16 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             # never up-project the full KV. Exact for any L; the win over the
             # un-absorbed path grows with context (see ABSORB_MAX_L note).
             q_nope = self.embed_q(q_nope)
-            k = v = kv_latent
+            output = absorbed_attention(
+                q_nope, kv_latent, self.scale, pe_scores, single=L == 1, cache=cache
+            )
+            output = self.unembed_out(output)
         else:
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
-
-        output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-        )
-        if absorb:
-            output = self.unembed_out(output)
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output), topk_indices
