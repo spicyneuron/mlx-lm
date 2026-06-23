@@ -629,7 +629,16 @@ class Model(nn.Module):
         )
         logits = self.model.mtp.compute_logits(mtp_hidden, self.lm_head, spec_step_idx)
         if return_hidden:
-            return logits, mtp_hidden
+            # Recycle the POST-final-norm hidden into the next draft step (vLLM /
+            # SGLang parity, deepseek_mtp.py:122-127): compute_logits already
+            # applies shared_head for the logits path, and we apply it here for
+            # the recurrence, so each path takes exactly one final norm. Recycling
+            # the raw pre-norm hidden (prior behavior) feeds the next MTP step an
+            # unnormed state it was never trained on; harmless at D1 (no reuse) but
+            # compounds across D2+ drafts and worsens with context.
+            layer_idx = spec_step_idx % len(self.model.mtp.layers)
+            recycled = self.model.mtp.layers[layer_idx].shared_head(mtp_hidden)
+            return logits, recycled
         return logits
 
     def make_mtp_cache(self):
