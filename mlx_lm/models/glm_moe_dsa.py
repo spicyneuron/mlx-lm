@@ -8,6 +8,7 @@ import mlx.core as mx
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
 from .deepseek_v32 import (
+    ABSORB_MAX_L,
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
     DeepseekV32Model,
@@ -159,7 +160,11 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorb = L <= ABSORB_MAX_L
+        if absorb:
+            # MLA-absorbed verify/decode: attend in the kv_lora latent space and
+            # never up-project the full KV. Exact for any L; the win over the
+            # un-absorbed path grows with context (see ABSORB_MAX_L note).
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
@@ -169,7 +174,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
-        if L == 1:
+        if absorb:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
