@@ -15,6 +15,14 @@ attention, same as single-token decode. Verify at 4096 dropped from ~566 ms to
 ~89 ms (**6.3×**) and is now ~flat with context. Validated **lossless for greedy**
 (100% argmax agreement vs sequential decode on real text at 3k/6k/12k).
 
+**Verdict (greedy):** with Phase 1, the right drafter precision, and the right
+depth, native MTP is a **net win at both short and long context** — D2 +
+bf16-MTP-head gives **+16% at 512** and **+7.8% at 4096**. The two things that
+looked fatal (verify cost scaling, long-context acceptance collapse) are both
+solved. Operating point: **`num_draft_tokens=2`, MTP head kept in bf16**. Open
+risk: margins are greedy; **sampling (temp>0) is unmeasured and may erode the
+4096 win** (stochastic acceptance is lower than greedy exact-match).
+
 ## Before: the original loss
 
 | prompt | config | gen tps | ms/tok | accept | draft ms/tok | verify ms/tok |
@@ -93,18 +101,64 @@ The residual `rel` sits **below the model's own quant noise** (the absorbed-vs-
 un-absorbed `orient-delta` is ~0.18). Conclusion: **lossless on token choice for
 greedy** at all tested contexts.
 
-## Status
-- **Greedy MTP:** Phase 1 is correct and a large verify speedup. Ship it.
-- **Sampling (temp>0):** the ~0.04–0.07 logit jitter slightly perturbs acceptance
-  probabilities (still within quant noise). Not a correctness problem; not bit-exact.
+## End-to-end throughput: the bf16-head unlock
+Phase 1 made verify flat, but the end-to-end win then became **acceptance-bound**
+at long context. Characterize (`mtp_characterize.sh`, temp=0, gen=256), 4-bit head
+(`lm-01`), baselines 18.20 tps (512) / 16.96 tps (4096):
 
-## Phase 2 (optional, only if bit-exactness wanted)
+| context | D1 | D2 |
+|--------:|----|----|
+| 512  | 17.24 (96.9%) | **21.10 (92.2%)  +16%** |
+| 4096 | 13.75 (66.7%) | 14.97 (60.6%)  **loss** |
+
+Verify was no longer the problem (flat ~50–60 ms/tok); **MTP-head acceptance
+collapsed at long context** (92% → 61% at D2). Root cause: the MTP head is a
+**single layer quantized to 4-bit** — almost no redundancy to absorb quant error,
+and at long context it does its hardest job (sparse topk retrieval + long-range
+extrapolation in one layer). Requantizing with the **MTP head kept in bf16**
+(`--q-override 'model\.mtp\.=bfloat16'`, ckpt `lm-01-mtp`) recovers it. 4096:
+
+| depth | 4-bit head | bf16 head |
+|------:|-----------|-----------|
+| D1 | 66.7%, 13.75 | 74.7%, 13.86 |
+| **D2** | 60.6%, 14.97 | **91.2%, 18.28  +7.8%** |
+| D3 | — | 62.2%, 15.44 |
+
+Keeping one layer in bf16 swung D2 acceptance **+30 points** and flipped 4096 from
+loss to win. Cost: peak memory +3% (446 vs 431), draft +~1 ms/tok. Depth story:
+**D1** is verify-cost-capped (can't beat baseline even at 100% accept); **D2** is
+the sweet spot; **D3** overshoots — the 3rd autoregressive draft compounds error,
+acceptance crashes to 62%, the longer cycle (188 ms) sinks it.
+
+(Curiosity, non-blocking: bf16 D2 accepts *more* per token than D1, 91% vs 75% —
+backwards from the usual depth penalty, likely a block-alignment artifact over the
+same greedy sequence; worth a glance that the D1 path isn't leaving tokens on the
+table.)
+
+## Status
+- **Greedy MTP:** correct (lossless on token choice) and a **net throughput win at
+  512 and 4096** with D2 + bf16 head. Ship it at that operating point.
+- **Sampling (temp>0): UNRESOLVED and the key risk.** Two effects compound: the
+  ~0.04–0.07 absorbed-verify logit jitter (within quant noise), and — more
+  importantly — stochastic acceptance is lower than greedy exact-match, so the
+  **+7.8% at 4096 could shrink to break-even or a loss**. Must measure with
+  `--temp 1.0 --top-p 0.95` before claiming a sampling win. 512's +16% has more
+  headroom and is the safer bet.
+- **Upper context bound:** 16k pending — determines whether the win is unconditional
+  or needs a context-length gate.
+
+## Phase 2 (optional, only if sampling bit-exactness wanted)
 **Per-query topk gather** for `L>1`: gather each query's 2048 topk *before*
 attention and reduce over exactly those (like decode), instead of masking the full
-KV. This makes verify **bit-match** decode (removes the fp accumulation) and is
-also faster at long context (reduce over 2048, not full KV). Effort: medium —
-per-query gather + batched latent attention. Only warranted if strict faithfulness
-for sampling becomes a requirement; greedy does not need it.
+KV. Makes verify **bit-match** decode and is faster at very long context (reduce
+over 2048, not full KV).
+
+**It does NOT help acceptance/throughput.** `mtp_phase1_accept.py` measured
+`vg==vm = 100%` — the mask path picks the identical verify token as gather at every
+position, so it costs zero acceptance (an earlier hypothesis that the ~6pt
+bonus-vs-no-bonus gap was a mask penalty was wrong; that gap was trajectory noise).
+So Phase 2 is purely a **sampling-faithfulness** lever — only warranted if the
+temp>0 measurement shows the jitter matters. Greedy does not need it.
 
 ## Convert-side note
 `_tools` (conversion) originally *stripped* MTP weights in
@@ -112,6 +166,15 @@ for sampling becomes a requirement; greedy does not need it.
 porting the MTP classes + remapping `sanitize` (and `num_nextn_predict_layers` in
 both `ModelArgs`) so convert preserves/quantizes `model.mtp.layers.0.*`. Both
 convert and serve must be on the MTP-aware code.
+
+**Requant recipe (the operating point):** quantize the body at 4-bit but keep the
+MTP head in bf16 — it's one extra layer (~3% memory) and worth +30 acceptance
+points at long context:
+```
+--q-override 'model\.mtp\.=bfloat16'
+```
+`model.mtp.` matches every MTP submodule (`…mtp_block.*`, `…eh_proj`,
+`…shared_head.norm`) and nothing in the backbone.
 
 ## Deploy / run notes
 - Model edits ship via `git checkout`; **`uv run --with .` caches a non-editable
