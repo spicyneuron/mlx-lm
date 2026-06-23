@@ -41,6 +41,8 @@ def main():
     p.add_argument("--prompt-file", default=None)
     p.add_argument("--min-context", type=int, default=3000)
     p.add_argument("--width", type=int, default=16, help="verify positions to compare")
+    p.add_argument("--temp", type=float, default=1.0, help="temperature for KL/nucleus check")
+    p.add_argument("--top-p", type=float, default=0.95, help="nucleus threshold")
     args = p.parse_args()
 
     model, tok = load(args.model)
@@ -87,15 +89,45 @@ def main():
     rel = (mx.max(diff, axis=-1) / scale)
     mx.eval(rel)
 
-    print(f"argmax agreement: {n_agree}/{n} = {n_agree / n:6.2%}")
-    print(f"per-position rel logit diff: mean={rel.mean().item():.2e}  max={rel.max().item():.2e}")
+    print(f"[greedy]   argmax agreement: {n_agree}/{n} = {n_agree / n:6.2%}")
+    print(f"           per-position rel logit diff: mean={rel.mean().item():.2e}  max={rel.max().item():.2e}")
     if n_agree < n:
         flips = [i for i in range(n) if not bool(agree[i].item())]
-        print(f"disagreeing positions: {flips}")
+        print(f"           disagreeing positions: {flips}")
+
+    # --- sampling faithfulness: KL(decode || verify) and top_p nucleus overlap ---
+    g, c = gold[0] / args.temp, cand[0] / args.temp  # [n, vocab]
+    logp = g - mx.logsumexp(g, axis=-1, keepdims=True)
+    logq = c - mx.logsumexp(c, axis=-1, keepdims=True)
+    p = mx.exp(logp)
+    kl = (p * (logp - logq)).sum(axis=-1)  # [n], KL(decode || verify), nats
+
+    def nucleus_mask(probs):  # bool [n, vocab]: smallest set with cumprob >= top_p
+        order = mx.argsort(-probs, axis=-1)
+        cum = mx.cumsum(mx.take_along_axis(probs, order, axis=-1), axis=-1)
+        keep_sorted = (cum - mx.take_along_axis(probs, order, axis=-1)) < args.top_p
+        mask = mx.zeros(probs.shape, dtype=mx.bool_)
+        return mx.put_along_axis(mask, order, keep_sorted, axis=-1)
+
+    q = mx.exp(logq)
+    nd, nv = nucleus_mask(p), nucleus_mask(q)
+    inter = (nd & nv).sum(axis=-1)
+    union = (nd | nv).sum(axis=-1)
+    jacc = inter / mx.maximum(union, 1)
+    mx.eval(kl, jacc, nd, nv)
+
+    print(
+        f"\n[sampling] temp={args.temp} top_p={args.top_p}\n"
+        f"           KL(decode||verify): mean={kl.mean().item():.2e}  max={kl.max().item():.2e} nats\n"
+        f"           top_p nucleus Jaccard: mean={jacc.mean().item():6.2%}  min={jacc.min().item():6.2%}\n"
+        f"           nucleus size (decode): mean={nd.sum(-1).mean().item():.0f}  "
+        f"(verify): mean={nv.sum(-1).mean().item():.0f}"
+    )
     print()
     print(
-        "100% agreement on real text => mask path is fine for greedy MTP.\n"
-        "Frequent disagreement => per-query topk gather needed for faithfulness."
+        "Greedy: 100% argmax agreement => faithful for temp=0 MTP.\n"
+        "Sampling: tiny KL (<~1e-3) + high nucleus Jaccard (>~0.95) => faithful as a\n"
+        "  sampling target. Large KL / low Jaccard => Phase 2 (per-query gather) warranted."
     )
 
 
