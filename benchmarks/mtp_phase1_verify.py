@@ -80,54 +80,85 @@ def make_ids(vocab, n, width, seed=0):
     return ids[:, :n], ids[:, n:]
 
 
-def run_context(model, vocab, context, width, trials, skip_perf):
-    """Prefill once per code path, then derive parity + timing from that cache.
+def prefill(model, ctx):
+    cache = make_prompt_cache(model)
+    if ctx.shape[1] > 0:
+        model(ctx, cache=cache)
+        mx.eval([c.state for c in cache])
+    return cache
 
-    Prefill (esp. at long context) dominates wall time, so each setting is
-    prefilled exactly once. The first verify step's logits feed the parity
-    check; the remaining steps are timed.
+
+def verify_once(model, ctx, step):
+    """Batched: the L draft tokens scored in a single forward (the verify path)."""
+    cache = prefill(model, ctx)
+    out = model(step, cache=cache)
+    mx.eval(out)
+    return out
+
+
+def decode_seq(model, ctx, step):
+    """Reference: the same L tokens fed one at a time (the L==1 decode path).
+
+    This is the spec-decode correctness gold standard -- verifying L tokens at
+    once must equal decoding them sequentially. Both use the absorbed
+    (transpose=True) orientation, so on a quantized model they should still
+    agree to ~fp noise (unlike absorbed-vs-unabsorbed, which differ by the
+    weight's quant orientation).
     """
+    cache = prefill(model, ctx)
+    outs = [model(step[:, i : i + 1], cache=cache) for i in range(step.shape[1])]
+    mx.eval(outs)
+    return mx.concatenate(outs, axis=1)
+
+
+def rel_diff(a, b):
+    max_abs = mx.max(mx.abs(a - b)).item()
+    return max_abs, max_abs / max(mx.max(mx.abs(b)).item(), 1e-6)
+
+
+def run_context(model, vocab, context, width, trials, skip_perf):
     ctx, step = make_ids(vocab, context, width)
-    logits = {}
-    ms = {}
-    for label, max_l in (("absorb", FORCE_ABSORB), ("unabsorb", FORCE_UNABSORB)):
-        set_absorb(max_l)
-        cache = make_prompt_cache(model)
-        if context > 0:
-            model(ctx, cache=cache)
-            mx.eval([c.state for c in cache])
-        first = model(step, cache=cache)  # captured for parity
-        mx.eval(first)
-        logits[label] = first
-        if not skip_perf:
+
+    # --- correctness: batched absorbed verify vs sequential decode (same orient) ---
+    set_absorb(FORCE_ABSORB)
+    gold = decode_seq(model, ctx, step)
+    cand = verify_once(model, ctx, step)
+    c_max, c_rel = rel_diff(cand, gold)
+    toks_match = bool((mx.argmax(cand, -1) == mx.argmax(gold, -1)).all().item())
+    if c_max == 0.0:
+        status, ok = "INERT (toggle did nothing)", False
+    elif c_rel < 2e-2 and toks_match:
+        status, ok = "OK", True
+    else:
+        status, ok = "MISMATCH", False
+    print(
+        f"[verify==decode] context={context:>6} width={width}  "
+        f"max_abs={c_max:.4e}  rel={c_rel:.2e}  argmax_match={toks_match}  {status}"
+    )
+
+    # --- informational: quant-orientation delta (absorbed verify vs un-absorbed) ---
+    set_absorb(FORCE_UNABSORB)
+    unabs = verify_once(model, ctx, step)
+    o_max, o_rel = rel_diff(cand, unabs)
+    print(
+        f"[orient-delta]   context={context:>6} width={width}  "
+        f"max_abs={o_max:.4e}  rel={o_rel:.2e}  "
+        f"(expected nonzero on quantized weights; fp16 ~0)"
+    )
+
+    # --- perf: absorbed vs un-absorbed verify step ---
+    if not skip_perf:
+        ms = {}
+        for label, max_l in (("absorb", FORCE_ABSORB), ("unabsorb", FORCE_UNABSORB)):
+            set_absorb(max_l)
+            cache = prefill(model, ctx)
             mx.eval(model(step, cache=cache))  # warmup / graph build
             t0 = time.perf_counter()
             for _ in range(trials):
                 mx.eval(model(step, cache=cache))
             ms[label] = (time.perf_counter() - t0) / trials * 1e3
-
-    la, lu = logits["absorb"], logits["unabsorb"]
-    max_abs = mx.max(mx.abs(la - lu)).item()
-    rel = max_abs / max(mx.max(mx.abs(lu)).item(), 1e-6)
-    tok_a = mx.argmax(la[:, -1], axis=-1).item()
-    tok_u = mx.argmax(lu[:, -1], axis=-1).item()
-    # Exact 0.0 is NOT a pass: the two paths use different matmul orders, so a
-    # working toggle yields small fp noise. Bit-identical means the same graph
-    # ran both times -> the toggle never switched.
-    if max_abs == 0.0:
-        status, ok = "INERT (toggle did nothing)", False
-    elif rel < 1e-2 and tok_a == tok_u:
-        status, ok = "OK", True
-    else:
-        status, ok = "MISMATCH", False
-    print(
-        f"[parity] context={context:>6} width={width}  "
-        f"max_abs={max_abs:.4e}  rel={rel:.2e}  "
-        f"argmax={tok_a}/{tok_u}  {status}"
-    )
-    if not skip_perf:
         print(
-            f"[perf]   context={context:>6} width={width}  "
+            f"[perf]           context={context:>6} width={width}  "
             f"absorb={ms['absorb']:7.2f} ms  unabsorb={ms['unabsorb']:7.2f} ms  "
             f"speedup={ms['unabsorb'] / ms['absorb']:4.1f}x"
         )
@@ -148,14 +179,16 @@ def main():
     contexts = [int(c) for c in args.contexts.split(",") if c]
     model, _ = load(args.model)
     vocab = model.model.embed_tokens.weight.shape[0]
-    print(f"loaded {args.model}  vocab={vocab}  width={args.width}\n")
+    embed_q = model.model.layers[-1].self_attn.embed_q
+    quant = "quantized" if hasattr(embed_q, "bits") else "fp"
+    print(f"loaded {args.model}  vocab={vocab}  width={args.width}  weights={quant}\n")
 
     all_ok = True
     for ctx in contexts:
         all_ok &= run_context(model, vocab, ctx, args.width, args.trials, args.skip_perf)
 
     print()
-    print("PARITY: " + ("ALL OK" if all_ok else "FAILED -- see status above"))
+    print("CORRECTNESS: " + ("ALL OK" if all_ok else "FAILED -- see status above"))
 
 
 if __name__ == "__main__":
