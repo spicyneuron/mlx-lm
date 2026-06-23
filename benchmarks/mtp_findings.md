@@ -16,12 +16,13 @@ attention, same as single-token decode. Verify at 4096 dropped from ~566 ms to
 (100% argmax agreement vs sequential decode on real text at 3k/6k/12k).
 
 **Verdict (greedy):** with Phase 1, the right drafter precision, and the right
-depth, native MTP is a **net win at both short and long context** — D2 +
-bf16-MTP-head gives **+16% at 512** and **+7.8% at 4096**. The two things that
-looked fatal (verify cost scaling, long-context acceptance collapse) are both
-solved. Operating point: **`num_draft_tokens=2`, MTP head kept in bf16**. Open
-risk: margins are greedy; **sampling (temp>0) is unmeasured and may erode the
-4096 win** (stochastic acceptance is lower than greedy exact-match).
+depth, native MTP is a **net win up to ~4k context** — D2 + bf16-MTP-head gives
+**+16% at 512** and **+7.8% at 4096**. It **crosses back to a loss by 16k**
+(acceptance collapses 91%→50%), so the win is **bounded and needs a context-length
+gate** (~4–8k). Operating point: **`num_draft_tokens=2`, MTP head kept in bf16,
+gated by context**. Open risks: (1) margins are greedy — **sampling (temp>0) is
+unmeasured and may erode the 4096 win**; (2) exact gate crossover (8k) not yet
+pinned.
 
 ## Before: the original loss
 
@@ -135,6 +136,21 @@ backwards from the usual depth penalty, likely a block-alignment artifact over t
 same greedy sequence; worth a glance that the D1 path isn't leaving tokens on the
 table.)
 
+### The win is bounded: it crosses back at long context
+D2 + bf16, greedy, by context:
+
+| context | D2 acceptance | gen tps | vs baseline |
+|--------:|--------------:|--------:|:-----------:|
+| 512   | 92.2% (4-bit) | 21.10 | +16% |
+| 4096  | 91.2% | 18.28 | +7.8% |
+| 16384 | **50.2%** | 11.56 | **loss** (baseline pending, but well below the 4096 base) |
+
+Acceptance holds ~91% through 4k then **falls off a cliff by 16k**. The cliff is
+well above the 2048 sparsity threshold, so it's the 1-layer head's long-range
+capacity giving out in the 4k–16k band — bf16 raised the ceiling (4-bit crashed at
+4k; bf16 holds to 4k) but didn't remove it. **Operating envelope: gate MTP on below
+~4–8k, fall back to plain decode above.** Crossover not yet pinned (8k pending).
+
 ## Status
 - **Greedy MTP:** correct (lossless on token choice) and a **net throughput win at
   512 and 4096** with D2 + bf16 head. Ship it at that operating point.
@@ -144,8 +160,9 @@ table.)
   **+7.8% at 4096 could shrink to break-even or a loss**. Must measure with
   `--temp 1.0 --top-p 0.95` before claiming a sampling win. 512's +16% has more
   headroom and is the safer bet.
-- **Upper context bound:** 16k pending — determines whether the win is unconditional
-  or needs a context-length gate.
+- **Upper context bound:** win is **bounded** — D2+bf16 wins ≤4k, loses by 16k
+  (acceptance 50%). Needs a **context-length gate** (~4–8k); exact crossover pending
+  an 8k point + a 16k baseline.
 
 ## Phase 2 (optional, only if sampling bit-exactness wanted)
 **Per-query topk gather** for `L>1`: gather each query's 2048 topk *before*
