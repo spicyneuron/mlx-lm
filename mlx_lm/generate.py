@@ -694,6 +694,7 @@ def mtp_generate_step(
     xtc_special_tokens: List[int] = [],
     mtp_stats_callback: Optional[Callable[[dict], None]] = None,
     mtp_no_bonus: bool = False,
+    mtp_full_accept_catchup: bool = True,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     Single-sequence generation with native MTP drafting.
@@ -883,6 +884,9 @@ def mtp_generate_step(
     verify_tokens = 0
     next_from_draft = False
     next_yielded = False
+    # Steady state is 1 (model_cache leads mtp_cache by the initial _target_step).
+    # If it climbs, the mtp_cache is dropping committed tokens -> RoPE drift.
+    max_cache_skew = 0
     logger.info(
         "MTP enabled: num_draft_tokens=%d, mtp_layers=%d, no_bonus=%s",
         max_draft_tokens,
@@ -902,7 +906,8 @@ def mtp_generate_step(
         logger.info(
             "MTP %s: accepted %d/%d draft tokens (%.1f%%), "
             "full draft blocks %d/%d (%.1f%%), "
-            "draft %.2f ms/token, verify %.2f ms/token, cycle %.2f ms/block",
+            "draft %.2f ms/token, verify %.2f ms/token, cycle %.2f ms/block, "
+            "max cache skew %d",
             label,
             accepted_total,
             proposed,
@@ -913,6 +918,7 @@ def mtp_generate_step(
             draft_ms,
             verify_ms,
             block_ms,
+            max_cache_skew,
         )
         if mtp_stats_callback is not None:
             mtp_stats_callback(
@@ -933,11 +939,15 @@ def mtp_generate_step(
                     "draft_ms_per_token": draft_ms,
                     "verify_ms_per_token": verify_ms,
                     "cycle_ms_per_block": block_ms,
+                    "max_cache_skew": max_cache_skew,
                 }
             )
 
     try:
         while n != max_tokens:
+            skew = model_cache[0][0].offset - mtp_cache[0][0].offset
+            max_cache_skew = max(max_cache_skew, skew)
+
             confirmed = next_y.astype(mx.uint32)
             confirmed_logprobs = next_logprobs
             confirmed_from_draft = next_from_draft
@@ -1040,6 +1050,20 @@ def mtp_generate_step(
                     next_from_draft = True
                     next_yielded = True
                 else:
+                    if mtp_full_accept_catchup:
+                        # The bonus path jumps to target_y[n_draft], skipping the
+                        # last accepted draft token (_draft_block produced it but
+                        # never fed it back). Feed it through the MTP now so
+                        # mtp_cache stays aligned with model_cache; otherwise its
+                        # offset drifts -1 per full-accept block, skewing the draft
+                        # head's RoPE positions and depressing acceptance. Mirrors
+                        # the "include the last draft token" step in standard
+                        # speculative decoding (see _draft_generate above).
+                        _mtp_step(
+                            target_hidden[:, n_draft - 1 : n_draft, :],
+                            draft_tokens[n_draft - 1 : n_draft].astype(mx.uint32),
+                            update_only=True,
+                        )
                     prev_hidden = target_hidden[:, n_draft : n_draft + 1, :]
                     next_y = target_y[n_draft : n_draft + 1].astype(mx.uint32)
                     next_logprobs = target_logprobs[n_draft]
@@ -1122,6 +1146,7 @@ def stream_generate(
     mtp = kwargs.pop("mtp", False)
     mtp_stats_callback = kwargs.pop("mtp_stats_callback", None)
     mtp_no_bonus = kwargs.pop("mtp_no_bonus", False)
+    mtp_full_accept_catchup = kwargs.pop("mtp_full_accept_catchup", True)
     sampling_kwargs = {
         "temp": kwargs.pop("temp", DEFAULT_TEMP),
         "top_p": kwargs.pop("top_p", DEFAULT_TOP_P),
@@ -1156,6 +1181,7 @@ def stream_generate(
                 num_draft_tokens=num_draft_tokens,
                 mtp_stats_callback=mtp_stats_callback,
                 mtp_no_bonus=mtp_no_bonus,
+                mtp_full_accept_catchup=mtp_full_accept_catchup,
                 **kwargs,
                 **sampling_kwargs,
             )
