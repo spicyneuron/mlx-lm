@@ -22,23 +22,22 @@ from mlx_lm.utils import load
 from mlx_lm.generate import stream_generate
 
 
-def measure(model, tokenizer, prompt, n_draft, prefill_step_size):
+def run(model, tokenizer, prompt, mtp, n_draft, prefill_step_size):
+    """Generate 256 tokens; return (acceptance, generation_tps). mtp=False = baseline."""
     stats = {}
-    for _ in stream_generate(
-        model,
-        tokenizer,
-        prompt,
-        max_tokens=256,
-        prefill_step_size=prefill_step_size,
-        mtp=True,
-        num_draft_tokens=n_draft,
-        mtp_stats_callback=lambda s: (stats.clear(), stats.update(s)),
-        temp=0.0,
-    ):
+    kw = dict(max_tokens=256, prefill_step_size=prefill_step_size, temp=0.0)
+    if mtp:
+        kw.update(
+            mtp=True,
+            num_draft_tokens=n_draft,
+            mtp_stats_callback=lambda s: (stats.clear(), stats.update(s)),
+        )
+    last = None
+    for last in stream_generate(model, tokenizer, prompt, **kw):
         pass
-    acc = stats.get("accepted", 0)
-    prop = stats.get("proposed", 0)
-    return (acc / prop if prop else 0.0), prop
+    acc, prop = stats.get("accepted", 0), stats.get("proposed", 0)
+    rate = acc / prop if prop else 0.0
+    return rate, last.generation_tps
 
 
 def main():
@@ -56,19 +55,21 @@ def main():
     contexts = [int(c) for c in args.contexts.split(",") if c]
     print(f"loaded {args.model}  doc tokens={len(ids_all)}  D{args.num_draft_tokens}\n")
 
-    print(f"{'context':>7} {'real_acc':>9} {'proposed':>9}")
+    print(f"{'context':>7} {'base_tps':>9} {'mtp_tps':>8} {'speedup':>8} {'accept':>7}")
     for C in contexts:
         if len(ids_all) < C:
             print(f"{C:>7}  SKIP (need {C} tokens, have {len(ids_all)})")
             continue
         prompt = ids_all[:C]
-        acc, prop = measure(model, tokenizer, prompt, args.num_draft_tokens, args.prefill_step_size)
-        print(f"{C:>7} {acc:>9.1%} {prop:>9}")
+        _, base_tps = run(model, tokenizer, prompt, False, args.num_draft_tokens, args.prefill_step_size)
+        acc, mtp_tps = run(model, tokenizer, prompt, True, args.num_draft_tokens, args.prefill_step_size)
+        speedup = mtp_tps / base_tps if base_tps else 0.0
+        print(f"{C:>7} {base_tps:>9.2f} {mtp_tps:>8.2f} {speedup:>7.2f}x {acc:>7.1%}")
 
     print(
-        "\nIf real_acc holds high at 16k (~vs the 91% at 4k), the random-prompt 51%\n"
-        "was an artifact and the win likely extends. If real_acc also collapses, the\n"
-        "16k limit is real on coherent text -> gate MTP at the measured crossover."
+        "\nspeedup > 1 at 16k on real text => the random-prompt 'loss' was an artifact;\n"
+        "MTP wins across the range and the context gate may be unnecessary.\n"
+        "speedup < 1 => real-text envelope is bounded; gate at the crossover."
     )
 
 
