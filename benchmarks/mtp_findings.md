@@ -198,8 +198,25 @@ text and remains `[random]`-only.)
   plumbing.
 - **Per-query gather (Phase 2)** — acceptance-neutral (§3); sampling-bit-exactness
   only. Not needed.
-- **RoPE interleave** (`indexer_rope_interleave=True`, also dropped) — not chased;
-  not implicated.
+- **RoPE interleave** (`indexer_rope_interleave=True`, also dropped) — reviewed and
+  **aligned**, not a bug: MLX `traditional=True` is the interleaved layout, which is
+  exactly what vLLM selects via `is_neox_style = not indexer_rope_interleave`
+  (`deepseek_v2.py:1034`); the main MLA rope is also `is_neox_style=False`
+  (`:505`). Latent risk only if a future checkpoint sets the flag False — add the
+  field + an assert if upstreamed.
+- **Full-accept MTP cache drift** (`mtp_catchup_ab.py`) — **real but benign; not the
+  ceiling.** On a full-accept block the bonus path jumps to `target_y[n_draft]` and
+  never feeds the last accepted draft token through the MTP, so `mtp_cache` drops one
+  position per full-accept block; its offset drifts −1 each time (`max_cache_skew`
+  climbs to 74 over 256 D2 tokens) while `model_cache` stays correct. Standard spec
+  decode handles this ("include the last draft token", `generate.py` `_draft_generate`);
+  the MTP path did not. A catch-up step (`mtp_full_accept_catchup`) closes it exactly
+  (skew → 1), but the A/B is a **deterministic net regression**: aligning the cache
+  *lowered* D2 acceptance (4096 81.4→80.1%, 16384 84.2→80.6%) and tps. So the drift
+  was tolerable-to-helpful and the ~82% ceiling is genuine head capacity, not this
+  bug — the one untested confound on the shelve decision, now ruled out. (Likely
+  cause of the regression: the catch-up writes K/V from the verify hidden, not the
+  MTP recurrent hidden the rest of the cache uses.) Toggle left OFF by default.
 
 Relevant config: `num_hidden_layers=78`, `num_nextn_predict_layers=1`,
 `index_topk=2048`, `index_topk_freq=4`, `index_skip_topk_offset=3`,
