@@ -694,7 +694,7 @@ def mtp_generate_step(
     xtc_special_tokens: List[int] = [],
     mtp_stats_callback: Optional[Callable[[dict], None]] = None,
     mtp_no_bonus: bool = False,
-    mtp_full_accept_catchup: bool = True,
+    mtp_full_accept_catchup: bool = False,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     Single-sequence generation with native MTP drafting.
@@ -1053,12 +1053,15 @@ def mtp_generate_step(
                     if mtp_full_accept_catchup:
                         # The bonus path jumps to target_y[n_draft], skipping the
                         # last accepted draft token (_draft_block produced it but
-                        # never fed it back). Feed it through the MTP now so
-                        # mtp_cache stays aligned with model_cache; otherwise its
-                        # offset drifts -1 per full-accept block, skewing the draft
-                        # head's RoPE positions and depressing acceptance. Mirrors
-                        # the "include the last draft token" step in standard
-                        # speculative decoding (see _draft_generate above).
+                        # never fed it back), so mtp_cache offset drifts -1 per
+                        # full-accept block (see max_cache_skew). This feeds it
+                        # through the MTP to keep mtp_cache aligned with
+                        # model_cache. NOTE: measured a net regression and OFF by
+                        # default -- alignment lowered D2 acceptance (-1.3pt @4k,
+                        # -3.6pt @16k, mtp_catchup_ab.py), because the K/V written
+                        # here come from the verify hidden rather than the MTP
+                        # recurrent hidden the rest of the cache uses. Kept as a
+                        # toggle so the result stays reproducible.
                         _mtp_step(
                             target_hidden[:, n_draft - 1 : n_draft, :],
                             draft_tokens[n_draft - 1 : n_draft].astype(mx.uint32),
@@ -1146,7 +1149,7 @@ def stream_generate(
     mtp = kwargs.pop("mtp", False)
     mtp_stats_callback = kwargs.pop("mtp_stats_callback", None)
     mtp_no_bonus = kwargs.pop("mtp_no_bonus", False)
-    mtp_full_accept_catchup = kwargs.pop("mtp_full_accept_catchup", True)
+    mtp_full_accept_catchup = kwargs.pop("mtp_full_accept_catchup", False)
     sampling_kwargs = {
         "temp": kwargs.pop("temp", DEFAULT_TEMP),
         "top_p": kwargs.pop("top_p", DEFAULT_TOP_P),
